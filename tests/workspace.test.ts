@@ -5,14 +5,17 @@ import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, utime
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { artifactDigest, reserveWorkspace } from "../src/workspace.js";
+import { artifactDigest, reserveWorkspace as reserveWorkspaceInRegistry } from "../src/workspace.js";
 
 const exec = promisify(execFile);
 let root: string;
 let cwd: string;
+let registryDir: string;
+const reserveWorkspace = (path: string, attemptId: string) => reserveWorkspaceInRegistry(path, attemptId, registryDir);
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "taskctl-workspace-"));
   cwd = join(root, "workspace");
+  registryDir = join(root, "registry");
   await mkdir(cwd);
 });
 afterEach(async () => { await rm(root, { recursive: true, force: true }); });
@@ -58,22 +61,104 @@ describe("reserveWorkspace", () => {
   it("coordinates separate processes and retains a crashed holder's reservation", async () => {
     const fixture = fileURLToPath(new URL("./workspace/reserve-child.ts", import.meta.url));
     const results = await Promise.all(Array.from({ length: 4 }, (_, i) =>
-      exec(process.execPath, ["--import", "tsx", fixture, cwd, `child-${i}`])));
+      exec(process.execPath, ["--import", "tsx", fixture, cwd, `child-${i}`, registryDir])));
     expect(results.map(({ stdout }) => stdout.trim()).sort()).toEqual(["busy", "busy", "busy", "won"]);
     expect(await reserveWorkspace(cwd, "after-exit")).toBeNull();
+  }, 30_000);
+
+  it("coordinates overlapping parent/child paths across separate processes", async () => {
+    const nested = join(cwd, "nested");
+    await mkdir(nested);
+    const fixture = fileURLToPath(new URL("./workspace/reserve-child.ts", import.meta.url));
+    const results = await Promise.all([cwd, nested].map((path, i) =>
+      exec(process.execPath, ["--import", "tsx", fixture, path, `child-${i}`, registryDir])));
+    expect(results.map(({ stdout }) => stdout.trim()).sort()).toEqual(["busy", "won"]);
   }, 30_000);
 
   it("leaves a replaced reservation untouched even with the same attempt ID", async () => {
     const first = await reserveWorkspace(cwd, "same-attempt");
     const lock = join(cwd, ".taskctl-workspace.lock");
     await rename(lock, join(cwd, ".taskctl-old.lock"));
-    const replacement = await reserveWorkspace(cwd, "same-attempt");
+    await mkdir(lock);
+    await writeFile(join(lock, "foreign.json"), "foreign reservation");
     const before = await readdir(lock);
     await first!.release();
     expect(await readdir(lock)).toEqual(before);
     expect(await reserveWorkspace(cwd, "third")).toBeNull();
-    await replacement!.release();
+    expect(await reserveWorkspace(cwd, "same-attempt")).toBeNull();
   });
+
+  it("keeps a canonical path reserved when git init changes its repository topology", async () => {
+    const first = await reserveWorkspace(cwd, "nongit");
+    await git("init");
+    expect(await reserveWorkspace(cwd, "git")).toBeNull();
+    await first!.release();
+    const next = await reserveWorkspace(cwd, "after-release");
+    expect(next).not.toBeNull();
+    await next!.release();
+  }, 20_000);
+
+  it("serializes overlapping non-Git parent/child paths in both acquisition orders", async () => {
+    const nested = join(cwd, "nested");
+    await mkdir(nested);
+    const parent = await reserveWorkspace(cwd, "parent");
+    expect(await reserveWorkspace(nested, "child")).toBeNull();
+    await parent!.release();
+    const child = await reserveWorkspace(nested, "child");
+    expect(child).not.toBeNull();
+    expect(await reserveWorkspace(cwd, "parent")).toBeNull();
+    await child!.release();
+  }, 20_000);
+
+  it("retains the durable registry record if the local marker is deleted", async () => {
+    const reservation = await reserveWorkspace(cwd, "owner");
+    await rm(join(cwd, ".taskctl-workspace.lock"), { recursive: true });
+    expect(await reserveWorkspace(cwd, "other")).toBeNull();
+    await reservation!.release();
+    expect(await reserveWorkspace(cwd, "after-release")).toBeNull();
+  });
+
+  it("fails closed on a corrupted or missing initialized registry", async () => {
+    const reservation = await reserveWorkspace(cwd, "owner");
+    await reservation!.release();
+    const state = join(registryDir, "reservations.json");
+    await writeFile(state, "{corrupt");
+    await expect(reserveWorkspace(cwd, "corrupt")).rejects.toThrow();
+    await rm(state);
+    await expect(reserveWorkspace(cwd, "missing")).rejects.toThrow();
+  });
+
+  it("rejects malformed registry records instead of silently dropping them", async () => {
+    const reservation = await reserveWorkspace(cwd, "owner");
+    await reservation!.release();
+    await writeFile(join(registryDir, "reservations.json"), JSON.stringify([{ token: "unknown", cwd: "relative" }]));
+    await expect(reserveWorkspace(cwd, "invalid")).rejects.toThrow();
+  });
+
+  it("does not release a local marker after its registry ownership token is replaced", async () => {
+    const reservation = await reserveWorkspace(cwd, "owner");
+    const state = join(registryDir, "reservations.json");
+    const records = JSON.parse(await readFile(state, "utf8"));
+    records[0].token = "foreign-owner";
+    await writeFile(state, JSON.stringify(records));
+    const before = await readdir(join(cwd, ".taskctl-workspace.lock"));
+    await reservation!.release();
+    expect(await readdir(join(cwd, ".taskctl-workspace.lock"))).toEqual(before);
+    expect(await reserveWorkspace(cwd, "next")).toBeNull();
+  });
+
+  it("does not reinitialize a registry directory containing unknown state", async () => {
+    await mkdir(registryDir);
+    await writeFile(join(registryDir, "unknown-state"), "unknown ownership");
+    await expect(reserveWorkspace(cwd, "unknown")).rejects.toThrow(/registry/i);
+  });
+
+  it("never steals an old registry mutex", async () => {
+    await mkdir(join(registryDir, "mutex"), { recursive: true });
+    await utimes(join(registryDir, "mutex"), new Date(0), new Date(0));
+    await expect(reserveWorkspace(cwd, "blocked")).rejects.toThrow(/mutex.*busy/i);
+    expect(await readdir(join(registryDir, "mutex"))).toEqual([]);
+  }, 15_000);
 
   it("does not delete a foreign file replacing the lock directory", async () => {
     const reservation = await reserveWorkspace(cwd, "owner");
@@ -203,19 +288,22 @@ describe("artifactDigest", () => {
     expect(await artifactDigest(cwd, [".", ".."])).toBe(before);
   });
 
-  it("does not traverse outside-root directory links or cycles, but fingerprints link targets", async () => {
+  it("rejects outside-root links and fingerprints internal links without traversing cycles", async () => {
     const outside = join(root, "outside");
     await mkdir(outside);
     await writeFile(join(outside, "secret"), "first");
     const link = join(cwd, "link");
     await symlink(outside, link, process.platform === "win32" ? "junction" : "dir");
     await symlink(cwd, join(cwd, "cycle"), process.platform === "win32" ? "junction" : "dir");
-    const before = await artifactDigest(cwd);
-    await writeFile(join(outside, "secret"), "changed");
-    expect(await artifactDigest(cwd)).toBe(before);
+    await expect(artifactDigest(cwd)).rejects.toThrow(/outside|escaped/i);
     await rm(link);
-    await symlink(root, link, process.platform === "win32" ? "junction" : "dir");
+    const inside = join(cwd, "inside");
+    await mkdir(inside);
+    await symlink(inside, link, process.platform === "win32" ? "junction" : "dir");
+    const before = await artifactDigest(cwd);
+    await rm(link);
+    await symlink(cwd, link, process.platform === "win32" ? "junction" : "dir");
     expect(await artifactDigest(cwd)).not.toBe(before);
-    expect(await readFile(join(outside, "secret"), "utf8")).toBe("changed");
+    expect(await readFile(join(outside, "secret"), "utf8")).toBe("first");
   });
 });
