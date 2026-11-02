@@ -47,9 +47,13 @@ describe("runAcceptance", () => {
     await expect(readFile(join(cwd, "cwd-marker.txt"), "utf8")).resolves.toContain("hi");
   });
 
-  it("skips (and passes) when no acceptance command is configured", async () => {
+  it("skips without passing when no acceptance command is configured", async () => {
     // 无 acceptance 字段 → 调用方传空串；告警日志是调用方的职责（ADR-0006）
-    await expect(runAcceptance("", cwd)).resolves.toEqual({ passed: true, skipped: true });
+    await expect(runAcceptance("", cwd)).resolves.toEqual({ passed: false, skipped: true });
+  });
+
+  it("does not execute whitespace-only acceptance commands", async () => {
+    await expect(runAcceptance(" \t\r\n ", cwd)).resolves.toEqual({ passed: false, skipped: true });
   });
 
   it("reports a spawn failure as not passed with a null exit code", async () => {

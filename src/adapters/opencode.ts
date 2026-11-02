@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import type { AgentAdapter } from "./types.js";
+import { processExecution, type Execution } from "../execution.js";
 
 /** One prompt() turn — the execution-plane call and its result. */
 type PromptArgs = Parameters<AgentAdapter["prompt"]>[0];
@@ -46,6 +47,10 @@ export class OpenCodeAdapter implements AgentAdapter {
 
   /** Run one agent turn and collect the session id, final text and exit code. */
   prompt(args: PromptArgs): Promise<PromptResult> {
+    return this.start(args).result;
+  }
+
+  start(args: PromptArgs): Execution<PromptResult> {
     const model = args.model ? `${args.model}${args.effort ? `#${args.effort}` : ""}` : undefined;
     const argv = [
       "run",
@@ -57,9 +62,11 @@ export class OpenCodeAdapter implements AgentAdapter {
       "--auto",
       args.text,
     ];
-    const child = spawn(this.bin, [...this.binArgsPrefix, ...argv], { cwd: args.cwd, shell: false });
+    const child = spawn(this.bin, [...this.binArgsPrefix, ...argv], {
+      cwd: args.cwd, shell: false, detached: process.platform !== "win32",
+    });
 
-    return new Promise<PromptResult>((resolve, reject) => {
+    const result = new Promise<PromptResult>((resolve, reject) => {
       // The whole message rides in argv; never let the agent block on stdin.
       child.stdin?.end();
 
@@ -118,6 +125,7 @@ export class OpenCodeAdapter implements AgentAdapter {
         resolve({ sessionId, exitCode: code ?? -1, text: code === 0 ? text : withStderr(text, stderr) });
       });
     });
+    return processExecution(child, result, true);
   }
 
   /**

@@ -1,3 +1,5 @@
+import type { Execution } from "../execution.js";
+
 /**
  * The agent control surface taskctl drives (v0.1: OpenCode only). The
  * execution plane is `prompt` — one full agent turn; the control plane is
@@ -12,6 +14,7 @@ export interface AgentAdapter {
     title?: string;
     cwd: string;
   }): Promise<{ sessionId: string; exitCode: number; text: string }>;
+  start?(args: Parameters<AgentAdapter["prompt"]>[0]): Execution<Awaited<ReturnType<AgentAdapter["prompt"]>>>;
   /** tokens 总量 */
   contextUsage(sessionId: string): Promise<number>;
   /** limit.context */

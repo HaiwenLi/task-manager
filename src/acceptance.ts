@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { processExecution, type Execution } from "./execution.js";
 
 /**
  * Outcome of the acceptance gate. `exitCode` is null when the command could
@@ -7,7 +8,7 @@ import { spawn } from "node:child_process";
  */
 export type AcceptanceResult =
   | { passed: boolean; exitCode: number | null; output: string; skipped: false }
-  | { passed: true; skipped: true };
+  | { passed: false; skipped: true };
 
 /**
  * Run a task's `acceptance:` shell command in `cwd`: exit 0 passes, anything
@@ -18,19 +19,30 @@ export type AcceptanceResult =
  * The command is a full shell command line, so it runs through the platform
  * shell as an explicit `spawn(file, args)` with `shell: false`. An empty
  * command (task has no `acceptance` field) skips the gate with
- * `{passed: true, skipped: true}`; logging the warning is the caller's job.
+ * `{passed: false, skipped: true}`; logging the warning is the caller's job.
  */
 export async function runAcceptance(command: string, cwd: string): Promise<AcceptanceResult> {
-  if (command.length === 0) {
-    return { passed: true, skipped: true };
+  return startAcceptance(command, cwd).result;
+}
+
+/** Start the gate immediately and expose its process lifecycle to the worker. */
+export function startAcceptance(command: string, cwd: string): Execution<AcceptanceResult> {
+  if (command.trim().length === 0) {
+    return {
+      result: Promise.resolve({ passed: false, skipped: true }),
+      inspect: () => ({ state: "exited" }),
+      cancel: async () => true,
+    };
   }
   const isWindows = process.platform === "win32";
-  const child = spawn(isWindows ? "cmd" : "sh", [isWindows ? "/c" : "-c", command], {
+  const child = spawn(isWindows ? "cmd" : "sh", isWindows ? ["/d", "/s", "/c", `"${command}"`] : ["-c", command], {
     cwd,
     shell: false,
+    detached: !isWindows,
+    windowsVerbatimArguments: isWindows,
   });
 
-  return new Promise<AcceptanceResult>((resolve) => {
+  const result = new Promise<AcceptanceResult>((resolve) => {
     // The command line is the whole program; never let it block on stdin.
     child.stdin?.end();
 
@@ -50,4 +62,5 @@ export async function runAcceptance(command: string, cwd: string): Promise<Accep
       resolve({ passed: code === 0, exitCode: code, output: output(), skipped: false });
     });
   });
+  return processExecution(child, result);
 }
