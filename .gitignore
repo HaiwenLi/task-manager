@@ -1,0 +1,7 @@
+repos/
+node_modules/
+dist/
+*.log
+ tasks/
+.taskctl/
+.superpowers/
