@@ -5,7 +5,7 @@
 - **任务即文件**：`tasks/<id>.md`（YAML frontmatter + 正文描述），状态机 `open → running → done / blocked`
 - **会话链**：上下文预算告急时收尾交接（`taskctl note` 落编号笔记 → 开新会话注入），长任务不因上下文耗尽而断
 - **验收门**：agent 只能"请求完成"（`taskctl done`），真正的 `done` 由 `acceptance:` 命令的退出码决定
-- **并发安全**：文件锁（创建即声明）+ 心跳 + 过期接管，多个 worker 可以安全共跑一个任务目录
+- **协作式并发保护**：唯一所有权代次 + 周期心跳 + 串行化状态更新；工作目录独占，不确定执行不自动重跑（不是 OS 安全隔离）
 
 ## 安装
 
@@ -40,8 +40,8 @@ npx tsx src/main.ts <子命令> [参数]
 | `effort` | string | — | 兜底努力档（如 `high`）；任务 frontmatter 的 `effort` 优先 |
 | `contextThreshold` | number | `0.8` | 上下文用量比例达到该值即触发收尾交接 |
 | `retryLimit` | number | `3` | 失败尝试（失败回合 / 收尾失败 / 验收失败）上限，达到即 `blocked` |
-| `lockTtlMs` | number | `600000` | 锁过期窗口（v0.1 预留字段） |
-| `heartbeatMs` | number | `60000` | 心跳间隔（v0.1 在回合边界续期，预留字段） |
+| `lockTtlMs` | number | `600000` | 所有权过期窗口；过期不等于旧执行已停止 |
+| `heartbeatMs` | number | `60000` | 全程续期间隔，实际不大于 TTL 的三分之一 |
 | `turnTimeoutMs` | number | `1800000` | 单个 agent 回合的超时 |
 | `acceptanceTimeoutMs` | number | `600000` | 单次验收命令的超时 |
 | `maxSessionsPerTask` | number | `20` | 一个任务全会话链的长度上限（含交接与重试） |
@@ -72,11 +72,11 @@ retries: 0
 | `status` | ✓ | 生命周期：`open`（待领取）/ `running`（有 worker 持锁执行中）/ `done`（验收通过）/ `blocked`（重试耗尽，需人工介入） |
 | `model` | | 本任务模型（`provider/model`），覆盖配置兜底 |
 | `effort` | | 本任务努力档（如 `high`），覆盖配置兜底 |
-| `acceptance` | | 验收命令（完整 shell 命令行，在 `workdir` 下执行）；退出码 0 → `done`，否则计一次失败。缺省则验收直通 |
+| `acceptance` | | 验收命令（完整 shell 命令行，在 `workdir` 下执行）；退出码 0 且所有权/任务定义/产物一致才可 `done`。缺失或空白 → `blocked` 待审，不消耗重试 |
 | `sessions` | ✓ | 会话 id 链（按时间顺序追加），由 worker 维护 |
 | `retries` | ✓ | 失败尝试计数，由 worker 维护 |
 
-辅助文件（都在 `tasks/<id>/` 目录下，由工具维护）：`lock.json`（锁与心跳）、`done.requested`（完成请求标记）、`sessions/0001-handoff.md`（编号交接笔记）。
+辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`acceptance.json`（命令、时间、输出与身份摘要）、`done.requested`（完成请求）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
 
 ## 运行
 
@@ -86,7 +86,11 @@ retries: 0
 npx tsx src/main.ts run [--config taskctl.json]
 ```
 
-按文件名顺序处理所有 `open` 任务：领锁 → `running` → 组装协议提示词（任务 + 工作规则 + 最新交接笔记）→ `opencode run` 真实会话 → 回合结束轮询 `done.requested` → 验收裁决。全过程逐事件打印单行日志 `[<id>] <状态> [详情]`（`claimed`、`running`、`turn-failed`、`handoff`、`acceptance`、`acceptance-skipped`、`done`、`blocked`、`takeover`、`ownership-lost`），事件发生即输出。任务缺少 `acceptance` 字段时以 `acceptance-skipped` 告警放行（ADR-0006）；崩溃 worker 留在 `running` 的任务在锁过期（或缺锁）后由下一个 `taskctl run` 以 `takeover` 自动接管。
+按文件名顺序处理 `open` 任务：领锁 → 独占工作目录 → 持久化执行身份 → `running` → 会话/交接 → 完成请求 → 验收。全过程打印 `[<id>] <状态> [详情]`。缺少验收时输出 `acceptance-skipped` 并阻塞待审。`running` 孤儿任务只有已确认上一执行结束才能恢复；活跃/不确定记录或缺少执行身份的旧任务会阻塞，不盲目重跑。
+
+同一实际工作目录（含路径别名）不可并行执行；共享 Git common directory 的 worktree 暂按串行处理。当前不自动创建/合并 worktree。验收前后对源码产物做摘要；验收命令改变产物会要求复核，不会把旧检查套到新版本。摘要排除 Git 内部、依赖目录及任务运行时目录；详见 `src/workspace.ts`。
+
+工作目录预留同时保存在 `<workdir>/.taskctl-workspace.lock/` 和用户临时目录 `opencode/taskctl-workspaces/reservations.json`。注册表检查父子目录及 Git 元数据路径的重叠，即使运行期间执行 `git init` / 新建 linked worktree 也不能绕过既有预留。只删本地锁不会清除不确定执行的预留。
 
 ### taskctl done — 请求完成（agent 侧）
 
@@ -119,11 +123,13 @@ npx tsx src/main.ts status [--tasks-dir <dir>]
 
 ## 排障
 
-**任务变 blocked** —— 失败尝试累计到 `retryLimit`（默认 3）。失败来源：agent 回合非零退出、收尾（写 note）失败、验收命令不通过、会话链 / 回合预算耗尽后仍需再开会话。看 `tasks/<id>/sessions/` 里最新的交接笔记与 `tasks/<id>.md` 的 `retries` 定位；修复任务或环境后，把 `status` 改回 `open`、`retries` 归零再跑。
+**任务变 blocked** —— 原因包括重试耗尽、缺少验收、任务/产物变化、工作目录被占用和执行停止未确认。先看事件日志、`attempt.json`、`acceptance.json` 与交接笔记。只有普通、已停止的失败才可修复后重开；不确定执行不能只改状态绕过。
 
-**worker 崩溃后任务卡在 running（stale 接管）** —— 崩溃的 worker 会留下 `tasks/<id>/lock.json`。锁心跳超过 TTL（默认 10 分钟）即被视为过期，下一个 `taskctl run` 的 worker 会自动接管：旧锁归档为 `lock.json.stale-<时间戳>` 并新建锁。一般无需手工处理；若想立即接管，确认无 worker 存活后直接删除 `lock.json`。
+**worker 崩溃 / 不确定执行** —— 先核实原控制器、子进程树与后端会话均已停止，再检查产物。保留证据后，人工归档旧 `attempt.json` 和对应工作目录预留，再按需重开任务。不能仅按旧 PID 杀进程、删任务锁或改 `status` 后自动重跑。互斥目录 `.mutation.lock` 若因崩溃遗留也必须先确认原操作已停止，不能按时间强抢。
 
-**回合 / 验收超时** —— 单回合默认上限 30 分钟（`turnTimeoutMs`），验收 10 分钟（`acceptanceTimeoutMs`）。挂起的回合按失败回合计、挂起的验收按失败验收计，都会消耗 `retryLimit`。注意：v0.1 无法取消底层进程，超时后原进程可能仍在后台跑；重复出现时先排查 agent 为什么挂起（模型卡死、工具等待输入等），再考虑调大上限。
+人工修改共享预留注册表之前，先停止所有使用该注册表的 taskctl 控制器；仅处理已核对身份的那条预留及其本地标记，不清空其他任务的记录。当前没有自动“强制恢复”命令。缺少验收造成的普通待审则补上验收并重开任务即可，不需要清理已正常释放的预留。
+
+**回合 / 验收超时** —— 单回合默认 30 分钟、验收 10 分钟。请求停止并确认停止后才允许计失败重试；无法确认则阻塞并保留工作目录预留。OpenCode CLI 被杀不代表其独立后端会话已停，因此 OpenCode 回合被中断按不确定处理，须人工核实。未做真实后端取消验证。
 
 **Windows 下 spawn opencode 失败** —— npm 全局安装的 `opencode` 是 `.cmd` shim，`shell:false` 无法启动。在 `taskctl.json` 里把 `opencodeBin` 指向真实 exe（见上文表格）。
 

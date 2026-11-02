@@ -66,6 +66,7 @@ export class OpenCodeAdapter implements AgentAdapter {
       cwd: args.cwd, shell: false, detached: process.platform !== "win32",
     });
 
+    let sessionId = args.sessionId ?? "";
     const result = new Promise<PromptResult>((resolve, reject) => {
       // The whole message rides in argv; never let the agent block on stdin.
       child.stdin?.end();
@@ -74,7 +75,6 @@ export class OpenCodeAdapter implements AgentAdapter {
       // multi-byte characters intact across chunk boundaries, the remainder
       // carries a line split across reads, and the final flush in `close`
       // picks up a last line without a trailing newline.
-      let sessionId = args.sessionId ?? "";
       let sawSessionId = false;
       let text = "";
       const decoder = new StringDecoder("utf8");
@@ -125,7 +125,8 @@ export class OpenCodeAdapter implements AgentAdapter {
         resolve({ sessionId, exitCode: code ?? -1, text: code === 0 ? text : withStderr(text, stderr) });
       });
     });
-    return processExecution(child, result, true);
+    const execution = processExecution(child, result, true);
+    return { ...execution, inspect: () => ({ ...execution.inspect(), ...(sessionId ? { sessionId } : {}) }) };
   }
 
   /**

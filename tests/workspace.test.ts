@@ -98,6 +98,19 @@ describe("reserveWorkspace", () => {
     await next!.release();
   }, 20_000);
 
+  it("a pre-init path reservation also excludes a newly linked worktree using its metadata", async () => {
+    const first = await reserveWorkspace(cwd, "before-init");
+    await git("init");
+    await git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "init");
+    const linked = join(root, "linked-after-init");
+    await git("worktree", "add", "-b", "new-linked", linked);
+    const conflicting = await reserveWorkspace(linked, "metadata-conflict");
+    // Clean up even on RED: the assertion must not strand a test reservation.
+    if (conflicting) await conflicting.release();
+    await first!.release();
+    expect(conflicting).toBeNull();
+  }, 20_000);
+
   it("serializes overlapping non-Git parent/child paths in both acquisition orders", async () => {
     const nested = join(cwd, "nested");
     await mkdir(nested);

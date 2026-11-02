@@ -97,6 +97,7 @@ function task(overrides: Partial<Task> = {}): Task {
     status: "open",
     sessions: [],
     retries: 0,
+    acceptance: "fixture check",
     ...overrides,
   };
 }
@@ -104,7 +105,7 @@ function task(overrides: Partial<Task> = {}): Task {
 function cfg(tasksDir: string, overrides: Partial<WorkerConfig> = {}): WorkerConfig {
   return {
     tasksDir,
-    workdir: join(tmpdir(), "taskctl-wt"),
+    workdir: join(tasksDir, "workspace"),
     agent: "opencode",
     model: "test/default",
     contextThreshold: 0.8,
@@ -121,6 +122,7 @@ let tasksDir: string;
 
 beforeEach(async () => {
   tasksDir = await mkdtemp(join(tmpdir(), "taskctl-worker-"));
+  await mkdir(join(tasksDir, "workspace"));
 });
 
 afterEach(async () => {
@@ -266,8 +268,8 @@ describe("runWorker — 队列与生命周期", () => {
     await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate });
 
     expect(locks).toHaveLength(2);
-    expect(locks[0].worker).toBe(`worker-${process.pid}`);
-    expect(locks[1].worker).toBe(`worker-${process.pid}`);
+    expect(locks[0].worker).toMatch(new RegExp(`^worker-${process.pid}-`));
+    expect(locks[1].worker).toBe(locks[0].worker);
     // 第 2 回合前的心跳晚于第 1 回合前的心跳 → 确实刷新了
     expect(locks[1].heartbeat).toBeGreaterThan(locks[0].heartbeat);
   });
@@ -459,8 +461,8 @@ describe("runWorker — 失败核算", () => {
 
     expect(result).toEqual({ done: [], blocked: ["a"] });
     expect(store.task("a").status).toBe("blocked");
-    expect(store.task("a").retries).toBe(1);
-    expect(store.task("a").sessions).toEqual([]); // 挂起的回合没有 session 可记
+    expect(store.task("a").retries).toBe(0); // uncertain shutdown is not a retryable failure
+    expect(store.task("a").sessions).toEqual([]);
     await expect(lockHeld("a")).resolves.toBe(false);
   });
 
@@ -479,7 +481,7 @@ describe("runWorker — 失败核算", () => {
     });
 
     expect(result).toEqual({ done: [], blocked: ["a"] });
-    expect(store.task("a").retries).toBe(1);
+    expect(store.task("a").retries).toBe(0); // injected legacy gate cannot prove shutdown
     await expect(lockHeld("a")).resolves.toBe(false);
   });
 });
@@ -548,7 +550,7 @@ describe("runWorker — 循环上限（binding ruling）", () => {
 });
 
 describe("runWorker — 崩溃恢复（心跳停 → 接管，controller ruling）", () => {
-  it("端到端：running + 过期锁（伪造旧心跳）→ 接管续跑至 done，旧锁归档、终态释放", async () => {
+  it("running + stale legacy lock without execution identity blocks rather than replaying", async () => {
     // README 承诺的自动恢复：崩溃 worker 留下 status=running + stale lock，
     // 下一个 taskctl run 必须接管而不是默默跳过
     const store = FakeStore.seed(
@@ -563,19 +565,20 @@ describe("runWorker — 崩溃恢复（心跳停 → 接管，controller ruling�
 
     const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, ...sink });
 
-    expect(result).toEqual({ done: ["a"], blocked: [] });
-    expect(store.task("a").status).toBe("done");
+    expect(result).toEqual({ done: [], blocked: ["a"] });
+    expect(store.task("a").status).toBe("blocked");
     // running 的账本不回退：旧 session 链保留，新 session 追加
-    expect(store.task("a").sessions).toEqual(["ses-old", "ses-new"]);
+    expect(store.task("a").sessions).toEqual(["ses-old"]);
     // 走的是接管路径：takeover 事件在最前
-    expect(sink.events[0]).toMatchObject({ type: "takeover", taskId: "a" });
+    expect(sink.events[0]).toMatchObject({ type: "blocked", taskId: "a" });
+    expect(adapter.calls).toHaveLength(0);
     // 旧锁被归档为 lock.json.stale-<ts>，终态后新锁已释放
     const aux = await readdir(join(tasksDir, "a"));
     expect(aux.some((f) => /^lock\.json\.stale-\d+$/.test(f))).toBe(true);
     await expect(lockHeld("a")).resolves.toBe(false);
   });
 
-  it("running + 锁缺席（崩溃后锁丢失）→ 同样接管续跑", async () => {
+  it("running + missing lock also requires reconciliation when execution is unknown", async () => {
     const store = FakeStore.seed(task({ status: "running", acceptance: "npm test" }));
     const adapter = new FakeAdapter(() => {
       store.requestDone("a");
@@ -585,9 +588,10 @@ describe("runWorker — 崩溃恢复（心跳停 → 接管，controller ruling�
 
     const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, ...sink });
 
-    expect(result).toEqual({ done: ["a"], blocked: [] });
-    expect(store.task("a").status).toBe("done");
-    expect(sink.events.map((e) => e.type)).toContain("takeover");
+    expect(result).toEqual({ done: [], blocked: ["a"] });
+    expect(store.task("a").status).toBe("blocked");
+    expect(sink.events.map((e) => e.type)).toContain("blocked");
+    expect(adapter.calls).toHaveLength(0);
     await expect(lockHeld("a")).resolves.toBe(false);
   });
 
@@ -637,8 +641,9 @@ describe("runWorker — 崩溃恢复（心跳停 → 接管，controller ruling�
       acceptance: passGate,
     });
 
-    expect(taken).toEqual({ done: ["a"], blocked: [] });
-    expect(store2.task("a").status).toBe("done");
+    expect(taken).toEqual({ done: [], blocked: ["a"] });
+    expect(store2.task("a").status).toBe("blocked");
+    expect(adapter2.calls).toHaveLength(0);
     await expect(lockHeld("a")).resolves.toBe(false);
   });
 });
@@ -665,8 +670,8 @@ describe("runWorker — 所有权丢失（heartbeat 布尔化，turn > TTL 场�
     // 新 owner 的锁原样保留，绝不释放别人的锁
     expect(await readLock("a")).toMatchObject({ worker: "worker-new" });
     expect(sink.events.map((e) => e.type)).toContain("ownership-lost");
-    // 丢失后的回合不追加 session：丢失检测发生在下一次心跳（prompt 之前）
-    expect(store.task("a").sessions).toEqual(["ses-a1"]);
+    // Stale generations cannot append a session, either.
+    expect(store.task("a").sessions).toEqual([]);
     expect(adapter.calls).toHaveLength(1);
   });
 
@@ -709,8 +714,8 @@ describe("runWorker — 逐事件日志（Plan Task 9 / ADR-0006 告警）", () 
     expect(sink.events[3]).toMatchObject({ type: "done", taskId: "a" });
   });
 
-  it("ADR-0006：无 acceptance 字段 → acceptance-skipped 告警事件，仍放行 done", async () => {
-    const store = FakeStore.seed(task());
+  it("missing acceptance requires review instead of silently reaching Done", async () => {
+    const store = FakeStore.seed(task({ acceptance: undefined }));
     const adapter = new FakeAdapter(() => {
       store.requestDone("a");
       return { sessionId: "ses-a1", exitCode: 0, text: "完成" };
@@ -720,9 +725,9 @@ describe("runWorker — 逐事件日志（Plan Task 9 / ADR-0006 告警）", () 
     // 不注入 acceptance seam：走真 runAcceptance，空命令返回 skipped:true
     const result = await runWorker(cfg(tasksDir), { store, adapter, ...sink });
 
-    expect(result).toEqual({ done: ["a"], blocked: [] });
-    expect(store.task("a").status).toBe("done");
-    expect(sink.events.map((e) => e.type)).toEqual(["claimed", "running", "acceptance-skipped", "done"]);
+    expect(result).toEqual({ done: [], blocked: ["a"] });
+    expect(store.task("a").status).toBe("blocked");
+    expect(sink.events.map((e) => e.type)).toEqual(["claimed", "running", "acceptance-skipped", "blocked"]);
     expect(sink.events[2]!.detail).toBeTruthy(); // 告警带说明
   });
 

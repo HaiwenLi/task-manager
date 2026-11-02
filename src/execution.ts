@@ -3,6 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 export interface ExecutionInfo {
   pid?: number;
+  sessionId?: string;
   state: "running" | "exited" | "uncertain";
 }
 
@@ -26,7 +27,12 @@ export function processExecution<T>(
   let uncertain = false;
   let cancellation: Promise<boolean> | undefined;
   child.once("close", () => { closed = true; });
-  child.once("exit", () => { exited = true; });
+  child.once("exit", (code, signal) => {
+    exited = true;
+    // An unexpectedly departed CLI cannot certify a backend session stopped,
+    // even when nobody explicitly requested cancellation.
+    if (backendMaySurvive && (code !== 0 || signal !== null)) uncertain = true;
+  });
   child.once("error", () => { if (child.pid === undefined) closed = true; });
 
   return {

@@ -152,8 +152,13 @@ export async function reserveWorkspace(
   const record: ReservationRecord = { token: randomUUID(), cwd: canonical, gitCommonDir: common };
   return withRegistryMutex(registryDir, async () => {
     const records = await readRegistry(registryDir);
-    if (records.some((other) => within(other.cwd, canonical) || within(canonical, other.cwd) ||
-        (common !== null && other.gitCommonDir !== null && pathKey(common) === pathKey(other.gitCommonDir)))) return null;
+    // Repository metadata is itself a path range: a reservation acquired before
+    // git init must exclude later worktrees sharing metadata under that path.
+    const requested = common === null ? [canonical] : [canonical, common];
+    if (records.some((other) => {
+      const held = other.gitCommonDir === null ? [other.cwd] : [other.cwd, other.gitCommonDir];
+      return requested.some(a => held.some(b => within(a, b) || within(b, a)));
+    })) return null;
     await writeRegistry(registryDir, [...records, record]);
     const lock = join(canonical, LOCK_NAME);
     try {

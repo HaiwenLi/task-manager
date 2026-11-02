@@ -128,7 +128,9 @@ function parseSessions(data: Record<string, unknown>, id: string): string[] {
   if (!Array.isArray(value) || value.some((session) => typeof session !== "string")) {
     throw new TaskFileError(`task file ${id}: field sessions must be a list of session ids`);
   }
-  return value;
+  // gray-matter caches parsed frontmatter by source text. Never hand its
+  // mutable array to a caller: equal task files must not share session chains.
+  return [...value];
 }
 
 function parseRetries(data: Record<string, unknown>, id: string): number {

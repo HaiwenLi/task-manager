@@ -5,3 +5,5 @@ dist/
  tasks/
 .taskctl/
 .superpowers/
+.vitest/
+.taskctl-workspace.lock

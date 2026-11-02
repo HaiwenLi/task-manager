@@ -274,9 +274,9 @@ describe("taskctl run", () => {
     expect(cap.lines).toHaveLength(0);
   });
 
-  it("真实 store + 标记 adapter：任务走完 done，逐事件打印 [t1] 状态 单行日志", async () => {
+  it("real store + completion request without checks blocks for review", async () => {
     await seedTask("t1");
-    const config = await writeConfig({ tasksDir });
+    const config = await writeConfig({ tasksDir, workdir: dir });
     const adapter = new DoneMarkingAdapter(tasksDir);
     const cap = capture();
 
@@ -288,10 +288,10 @@ describe("taskctl run", () => {
     expect(cap.lines).toContain("[t1] running");
     // t1 无 acceptance 字段 → ADR-0006 告警放行
     expect(cap.lines.some((line) => line.startsWith("[t1] acceptance-skipped "))).toBe(true);
-    expect(cap.lines).toContain("[t1] done");
-    expect(cap.lines.indexOf("[t1] running")).toBeLessThan(cap.lines.indexOf("[t1] done"));
+    expect(cap.lines.some(line => line.startsWith("[t1] blocked "))).toBe(true);
+    expect(cap.lines).not.toContain("[t1] done");
     const task = parseTaskFile(await readFile(join(tasksDir, "t1.md"), "utf8"), "t1");
-    expect(task.status).toBe("done");
+    expect(task.status).toBe("blocked");
     expect(task.sessions.length).toBeGreaterThanOrEqual(1);
   });
 

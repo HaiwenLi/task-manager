@@ -12,6 +12,12 @@ retries: 0
 修复登录页超时问题`;
 
 describe("parseTaskFile", () => {
+  it("does not share mutable session chains between identical Markdown parses", () => {
+    const raw = "---\ntitle: Same\nstatus: open\nsessions: []\nretries: 0\n---\nSame task";
+    const first = parseTaskFile(raw, "first");
+    first.sessions.push("belongs-only-to-first");
+    expect(parseTaskFile(raw, "second").sessions).toEqual([]);
+  });
   it("parses frontmatter and body", () => {
     const t = parseTaskFile(raw, "fix-login");
     expect(t.id).toBe("fix-login");

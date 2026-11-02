@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claim, heartbeat, isStale, lockLive, release, LOCK_TTL_MS_DEFAULT } from "../src/claim.js";
+import { claim, heartbeat, isStale, lockLive, release, withOwnership, OwnershipLostError, LOCK_TTL_MS_DEFAULT } from "../src/claim.js";
 
 const openMd = `---
 id: a
@@ -48,6 +48,27 @@ async function forgeLock(worker: string, heartbeat: number): Promise<void> {
 }
 
 describe("claim", () => {
+  it("serializes contending stale takeovers so only one generation wins", async () => {
+    await forgeLock("old", Date.now() - 60_000);
+    const results = await Promise.all(Array.from({ length: 12 }, (_, i) => claim(tasksDir, "a", `new-${i}`, 30_000)));
+    expect(results.filter(Boolean)).toHaveLength(1);
+  });
+  it("does not steal a generation while its guarded write is in progress", async () => {
+    await claim(tasksDir, "a", "old");
+    await forgeLock("old", Date.now() - 60_000);
+    let ready!: () => void, finish!: () => void;
+    const entered = new Promise<void>(r => { ready = r; });
+    const proceed = new Promise<void>(r => { finish = r; });
+    const update = withOwnership(tasksDir, "a", "old", async () => { ready(); await proceed; });
+    await entered;
+    let claimed = false;
+    const takeover = claim(tasksDir, "a", "new", 30_000).then(value => { claimed = value; });
+    await new Promise(r => setTimeout(r, 30));
+    expect(claimed).toBe(false);
+    finish(); await update; await takeover;
+    expect(claimed).toBe(true);
+    await expect(withOwnership(tasksDir, "a", "old", async () => { throw new Error("must not write"); })).rejects.toBeInstanceOf(OwnershipLostError);
+  });
   it("first claim wins, creating the lock with worker and heartbeat", async () => {
     // 辅助目录 tasks/a/ 尚不存在，claim 需自行创建
     expect(await claim(tasksDir, "a", "worker-1")).toBe(true);

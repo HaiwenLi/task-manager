@@ -1,6 +1,7 @@
 import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { join } from "node:path";
+import { withMutex } from "./mutex.js";
 
 /** Lock file name inside the per-task auxiliary directory `tasks/<id>/`. */
 const LOCK_FILE = "lock.json";
@@ -24,9 +25,10 @@ type LockState =
  * Atomically take ownership of a task by creating `tasks/<id>/lock.json`
  * ("create is claim": `open 'wx'` fails with EEXIST if anyone got there
  * first). Returns false when a live lock is held — by any worker,
- * including the caller. An expired lock (crashed worker) is taken over:
+ * including the caller. An expired lock may be taken over:
  * the old lock is archived as `lock.json.stale-<ts>` and a fresh one is
- * created; losing the resulting race just means claiming again next poll.
+ * created under the same mutex as renewal, release, and guarded writes.
+ * Ownership takeover alone does NOT authorize replay of previous execution.
  * `ttlMs` governs the staleness window (the caller passes its configured
  * `lockTtlMs`; the documented ten-minute default applies when omitted).
  */
@@ -38,25 +40,19 @@ export async function claim(
 ): Promise<boolean> {
   const auxDir = join(tasksDir, taskId);
   await mkdir(auxDir, { recursive: true });
-  const lockPath = join(auxDir, LOCK_FILE);
-  const lock: Lock = { worker: workerId, heartbeat: Date.now() };
-  if (await tryCreateLock(lockPath, lock)) {
-    return true;
-  }
-  if (!(await isStale(lockPath, ttlMs))) {
-    return false;
-  }
-  // Another worker (or a release) may remove the stale lock between our
-  // staleness read and this archive rename. ENOENT just means we lost that
-  // race — fall through and let the exclusive create decide the winner.
-  try {
-    await rename(lockPath, `${lockPath}.stale-${Date.now()}`);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw err;
+  return withMutex(join(auxDir, ".mutation.lock"), async () => {
+    const lockPath = join(auxDir, LOCK_FILE);
+    const lock: Lock = { worker: workerId, heartbeat: Date.now() };
+    if (await tryCreateLock(lockPath, lock)) return true;
+    if (!(await isStale(lockPath, ttlMs))) return false;
+    // Legacy/manual writers may still remove the file outside the protocol.
+    try {
+      await rename(lockPath, `${lockPath}.stale-${Date.now()}`);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
-  }
-  return tryCreateLock(lockPath, lock);
+    return tryCreateLock(lockPath, lock);
+  });
 }
 
 /**
@@ -69,33 +65,47 @@ export async function claim(
  * lock or keep mutating the task).
  */
 export async function heartbeat(tasksDir: string, taskId: string, workerId: string): Promise<boolean> {
-  const lockPath = join(tasksDir, taskId, LOCK_FILE);
-  const state = await readLockState(lockPath);
-  if (state.status !== "held" || state.lock.worker !== workerId) {
-    return false;
-  }
-  const tmp = `${lockPath}.tmp`;
-  await writeFile(tmp, JSON.stringify({ worker: workerId, heartbeat: Date.now() } satisfies Lock), "utf8");
-  await rename(tmp, lockPath);
-  return true;
+  if ((await readLockState(join(tasksDir, taskId, LOCK_FILE))).status === "missing") return false;
+  return withMutex(join(tasksDir, taskId, ".mutation.lock"), async () => {
+    const lockPath = join(tasksDir, taskId, LOCK_FILE);
+    const state = await readLockState(lockPath);
+    if (state.status !== "held" || state.lock.worker !== workerId) return false;
+    const tmp = `${lockPath}.tmp`;
+    await writeFile(tmp, JSON.stringify({ worker: workerId, heartbeat: Date.now() } satisfies Lock), "utf8");
+    await rename(tmp, lockPath);
+    return true;
+  });
 }
 
 /**
  * Drop the lock; releasing an absent lock is a no-op. With `expectedWorker`,
  * a lock that has since been taken over by someone else is left alone — a
- * terminal release must never delete the successor's lock (a torn/corrupt
- * lock nobody can own is still removed, mirroring claim's self-healing
- * treatment of corrupt locks).
+ * terminal release must never delete the successor's lock. With an expected
+ * generation, missing or corrupt locks are also left alone.
  */
 export async function release(tasksDir: string, taskId: string, expectedWorker?: string): Promise<void> {
-  const lockPath = join(tasksDir, taskId, LOCK_FILE);
-  if (expectedWorker !== undefined) {
-    const state = await readLockState(lockPath);
-    if (state.status === "held" && state.lock.worker !== expectedWorker) {
-      return;
+  await mkdir(join(tasksDir, taskId), { recursive: true });
+  return withMutex(join(tasksDir, taskId, ".mutation.lock"), async () => {
+    const lockPath = join(tasksDir, taskId, LOCK_FILE);
+    if (expectedWorker !== undefined) {
+      const state = await readLockState(lockPath);
+      if (state.status !== "held" || state.lock.worker !== expectedWorker) return;
     }
-  }
-  await rm(lockPath, { force: true });
+    await rm(lockPath, { force: true });
+  });
+}
+
+export class OwnershipLostError extends Error {
+  constructor() { super("task ownership generation changed"); }
+}
+
+/** The check and action share the takeover mutex; not a check-then-write. */
+export async function withOwnership<T>(tasksDir: string, taskId: string, workerId: string, action: () => Promise<T>): Promise<T> {
+  return withMutex(join(tasksDir, taskId, ".mutation.lock"), async () => {
+    const state = await readLockState(join(tasksDir, taskId, LOCK_FILE));
+    if (state.status !== "held" || state.lock.worker !== workerId) throw new OwnershipLostError();
+    return action();
+  });
 }
 
 /**

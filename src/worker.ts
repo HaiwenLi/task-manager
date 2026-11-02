@@ -1,481 +1,316 @@
-import { claim, heartbeat, lockLive, release } from "./claim.js";
+import { randomUUID } from "node:crypto";
+import { claim, heartbeat, lockLive, release, withOwnership, OwnershipLostError } from "./claim.js";
 import { latestNote, writeNote, type HandoffNote } from "./handoff.js";
-import { runAcceptance, type AcceptanceResult } from "./acceptance.js";
+import { startAcceptance, type AcceptanceResult } from "./acceptance.js";
 import { buildWorkerPrompt } from "./protocol.js";
 import type { TaskStore } from "./task-store.js";
 import type { Task } from "./task-file.js";
 import type { AgentAdapter } from "./adapters/types.js";
+import type { Execution } from "./execution.js";
+import { reserveWorkspace, artifactDigest, type WorkspaceReservation } from "./workspace.js";
+import { definitionDigest, readAttempt, writeRuntime, type AttemptRecord } from "./runtime.js";
 
-/** Ceiling for one agent turn when `turnTimeoutMs` is not configured (30 min). */
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
-
-/** Ceiling for one acceptance run when `acceptanceTimeoutMs` is not configured (10 min). */
 export const ACCEPTANCE_TIMEOUT_MS_DEFAULT = 10 * 60_000;
-
-/** Default ceiling on sessions in one task's chain when `maxSessionsPerTask` is unset. */
 export const MAX_SESSIONS_PER_TASK_DEFAULT = 20;
-
-/** Default ceiling on work turns within one session when `maxTurnsPerSession` is unset. */
 export const MAX_TURNS_PER_SESSION_DEFAULT = 40;
+export const WRAP_UP_INSTRUCTION = "上下文预算告急。请立即运行一次 taskctl note（详尽记录进展），然后只回复 HANDOFF_READY";
 
-/**
- * The fixed wrap-up instruction (ADR-0003): when the Context Budget nears
- * exhaustion the orchestrator sends this to the SAME session, the agent runs
- * `taskctl note` and replies HANDOFF_READY, and the loop opens a fresh
- * session with the note injected. The copy is spec-fixed — the worker
- * protocol (task 7) tells agents to expect the "上下文预算告急" signal.
- */
-export const WRAP_UP_INSTRUCTION =
-  "上下文预算告急。请立即运行一次 taskctl note（详尽记录进展），然后只回复 HANDOFF_READY";
-
-/** Worker configuration (resolved from `taskctl.json` by the CLI). */
 export type WorkerConfig = {
-  /** Absolute tasks directory: locks, notes and markers live under it. */
-  tasksDir: string;
-  /** Working directory every agent session runs in. */
-  workdir: string;
-  /** Agent backend name (v0.1: "opencode"); the CLI picks the adapter, the loop stays adapter-agnostic. */
-  agent: string;
-  /** Fallback model; a task's own `model` frontmatter wins. */
-  model?: string;
-  /** Fallback effort variant; a task's own `effort` frontmatter wins. */
-  effort?: string;
-  /** `contextUsage / contextLimit` ratio at which a handoff is triggered (e.g. 0.8). */
-  contextThreshold: number;
-  /** Failed attempts (failed turns, failed wrap-ups, failed acceptances) before a task is blocked. */
-  retryLimit: number;
-  /** Lock staleness window: governs claim's takeover test and the running-task liveness check. */
-  lockTtlMs: number;
-  /** Reserved for a background heartbeat timer; v0.1 refreshes at turn boundaries instead. */
-  heartbeatMs: number;
-  /** Ceiling for one `adapter.prompt` call; a hung turn counts as a failed turn. */
-  turnTimeoutMs?: number;
-  /** Ceiling for one acceptance run; a hung gate counts as a failed acceptance. */
-  acceptanceTimeoutMs?: number;
-  /**
-   * Ceiling on sessions in one task's chain (handoffs and retries included).
-   * Opening another session once the chain is full counts as a failed attempt,
-   * so `retryLimit` eventually blocks a task that never concludes. Default 20.
-   */
-  maxSessionsPerTask?: number;
-  /**
-   * Ceiling on work turns within one session; spending it without concluding
-   * the task counts as a failed attempt and the loop opens a fresh session.
-   * Default 40.
-   */
-  maxTurnsPerSession?: number;
+  tasksDir: string; workdir: string; agent: string; model?: string; effort?: string;
+  contextThreshold: number; retryLimit: number; lockTtlMs: number; heartbeatMs: number;
+  turnTimeoutMs?: number; acceptanceTimeoutMs?: number;
+  maxSessionsPerTask?: number; maxTurnsPerSession?: number;
 };
-
-/**
- * The TaskStore surface the worker drives. `TaskStore` satisfies it; tests
- * fake it with an in-memory Map — the worker never depends on the filesystem
- * through the store seam (locks and notes still go through their modules).
- */
-export type WorkerStore = Pick<
-  TaskStore,
-  "list" | "setStatus" | "appendSession" | "incRetries" | "readDoneMarker" | "clearDoneMarker"
->;
-
-/** Injection seam: the store, the agent adapter, (optionally) the acceptance gate, and (optionally) per-event logging. */
+export type WorkerStore = Pick<TaskStore, "list" | "setStatus" | "appendSession" | "incRetries" | "readDoneMarker" | "clearDoneMarker">;
 export type WorkerDeps = {
-  store: WorkerStore;
-  adapter: AgentAdapter;
-  /** Defaults to {@link runAcceptance} when omitted. */
+  store: WorkerStore; adapter: AgentAdapter;
   acceptance?: (command: string, cwd: string) => Promise<AcceptanceResult>;
-  /**
-   * Per-event single-line logging (Plan Task 9: "逐事件打印 [task] 状态").
-   * The CLI wires this to `console.log`; the worker never prints on its own.
-   */
   onEvent?: (evt: WorkerEvent) => void;
 };
-
-/**
- * Lifecycle events one task run emits, in order. `claimed` opens a fresh
- * run; `takeover` opens one by recovering an orphaned `running` task
- * ("心跳停 → 接管"); `ownership-lost` aborts a run without touching the
- * task further (a successor took the lock over mid-run).
- */
-export type WorkerEventType =
-  | "claimed"
-  | "takeover"
-  | "running"
-  | "handoff"
-  | "turn-failed"
-  | "acceptance"
-  | "acceptance-skipped"
-  | "done"
-  | "blocked"
-  | "ownership-lost";
-
-/** One event: the task it belongs to and an optional single-line detail. */
+export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "acceptance" | "acceptance-skipped" | "done" | "blocked" | "ownership-lost";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
-
-/**
- * Terminal outcome of one task run; "skipped" means the lock is — or
- * became — someone else's (never claimed, or ownership lost mid-run: the
- * worker stops without retrying, releasing, or marking anything).
- */
 export type TaskOutcome = "done" | "blocked" | "skipped";
+export class WorkerTimeoutError extends Error {}
+class UncertainExecutionError extends Error {}
+class ReviewRequiredError extends Error {}
 
-/** Raised when a turn or an acceptance run exceeds its configured timeout. */
-export class WorkerTimeoutError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "WorkerTimeoutError";
+type Run = {
+  cfg: WorkerConfig; deps: WorkerDeps; task: Task; owner: string; definition: string;
+  record: AttemptRecord; lost: boolean; notifyLost: () => void; loss: Promise<void>;
+  execution?: Execution<unknown>;
+};
+const emit = (r: Run, type: WorkerEventType, detail?: string) => r.deps.onEvent?.({ type, taskId: r.task.id, detail });
+const owned = <T>(r: Run, fn: () => Promise<T>) => withOwnership(r.cfg.tasksDir, r.task.id, r.owner, fn);
+
+export async function runWorker(cfg: WorkerConfig, deps: WorkerDeps): Promise<{ done: string[]; blocked: string[] }> {
+  const result = { done: [] as string[], blocked: [] as string[] };
+  for (const task of await deps.store.list()) {
+    if (task.status !== "open" && task.status !== "running") continue;
+    if (task.status === "running" && await lockLive(cfg.tasksDir, task.id, cfg.lockTtlMs)) continue;
+    const outcome = await runTask(cfg, deps, task, `worker-${process.pid}-${randomUUID()}`);
+    if (outcome === "done") result.done.push(task.id);
+    if (outcome === "blocked") result.blocked.push(task.id);
   }
+  return result;
 }
 
-/**
- * Drain the queue: every `open` task runs through {@link runTask} in
- * filename order. A `running` task whose lock is live is being worked by
- * someone else and is skipped; one whose lock is missing or stale is an
- * orphan left by a crashed worker and is taken over (claim archives the
- * stale lock and re-owns the task — the README's automatic recovery).
- * Terminal statuses (`done`/`blocked`) are ignored. `store.list()` failing
- * loud (e.g. a corrupt `.md`) propagates — that is the agreed design, not
- * an oversight.
- */
-export async function runWorker(
-  cfg: WorkerConfig,
-  deps: WorkerDeps,
-): Promise<{ done: string[]; blocked: string[] }> {
-  const workerId = `worker-${process.pid}`;
-  const tasks = await deps.store.list();
-  const done: string[] = [];
-  const blocked: string[] = [];
-  for (const task of tasks) {
-    if (task.status === "running") {
-      // 心跳停 → 接管（controller ruling）：锁缺席/过期 = 孤儿任务。
-      // 活锁说明原 worker 仍存活 → 跳过；竞态由 runTask 内的 claim 原子裁决。
-      if (await lockLive(cfg.tasksDir, task.id, cfg.lockTtlMs)) {
-        continue;
-      }
-    } else if (task.status !== "open") {
-      continue;
-    }
-    const outcome = await runTask(cfg, deps, task, workerId);
-    if (outcome === "done") {
-      done.push(task.id);
-    } else if (outcome === "blocked") {
-      blocked.push(task.id);
-    }
-  }
-  return { done, blocked };
-}
-
-/**
- * The single-task execution sequence: `claim` → `setStatus running` → turn
- * loop { `buildWorkerPrompt`(inject latestNote) → `adapter.prompt` →
- * `appendSession` → done marker breaks out to acceptance; otherwise the
- * Context Budget check may trigger a wrap-up handoff to a fresh session } →
- * acceptance decides `done` vs retry vs `blocked`. Loop caps
- * (`maxTurnsPerSession`, `maxSessionsPerTask`) and every failure route
- * through `failAttempt`, so `retryLimit` bounds a task that never concludes.
- * Terminal states always `release` the lock (ownership-guarded). Losing the
- * lock mid-run is the one non-terminal exit: the worker stops immediately —
- * no retry is counted, nothing is marked or released; the task stays
- * exactly as the new owner finds it.
- */
-export async function runTask(
-  cfg: WorkerConfig,
-  deps: WorkerDeps,
-  task: Task,
-  workerId: string,
-): Promise<TaskOutcome> {
-  if (!(await claim(cfg.tasksDir, task.id, workerId, cfg.lockTtlMs))) {
-    return "skipped";
-  }
-  // claim 成功即接管：open 是新领取；running 说明前任已停跳（孤儿任务恢复）
-  if (task.status === "running") {
-    emit(deps, "takeover", task.id, "stale or absent lock recovered");
-  } else {
-    emit(deps, "claimed", task.id);
-  }
-  await deps.store.setStatus(task.id, "running");
-  emit(deps, "running", task.id);
-
-  // `undefined` opens a fresh session; a known id continues that session.
-  let sessionId: string | undefined;
-  // Last id already appended to the chain — the wrap-up turn reuses the same
-  // session and must not append a duplicate entry.
-  let recordedSession = "";
-  // Loop guards: sessions in the chain so far, work turns in this session.
-  let sessionsUsed = 0;
-  let turnsInSession = 0;
-
-  for (;;) {
-    const note = await latestNote(cfg.tasksDir, task.id);
-    const prompt = buildWorkerPrompt(task, {
-      handoff: note?.markdown,
-      workdir: cfg.workdir,
-      tasksDir: cfg.tasksDir,
-    });
-    const result = await runTurn(cfg, deps, task, workerId, { sessionId, text: prompt });
-    if (result.lostOwnership) {
-      return ownershipLost(deps, task);
-    }
-
-    if (result.sessionId !== "" && result.sessionId !== recordedSession) {
-      await deps.store.appendSession(task.id, result.sessionId);
-      recordedSession = result.sessionId;
-      sessionId = result.sessionId;
-      sessionsUsed += 1;
-    }
-    turnsInSession += 1;
-
-    // 本回合是否以"开新 session"收场；terminal 状态直接 return。
-    let opensNewSession = false;
-
-    // 若 readDoneMarker → 跳出验收（brief 的循环序列：marker 检查紧跟 appendSession；
-    // 验收关才是信任边界，失败回合留下的 marker 也交给客观命令裁决）
-    if (await deps.store.readDoneMarker(task.id)) {
-      // marker 已消费：重试必须重新挣得一次 taskctl done，而不是空转验收
-      await deps.store.clearDoneMarker(task.id);
-      const verdict = await runAcceptanceGate(cfg, deps, task, workerId);
-      if (verdict === "lost") {
-        return ownershipLost(deps, task);
-      }
-      if (verdict !== "retry") {
-        return verdict;
-      }
-      opensNewSession = true; // 验收失败 → 重新开 session 继续
-    } else if (turnsInSession >= (cfg.maxTurnsPerSession ?? MAX_TURNS_PER_SESSION_DEFAULT)) {
-      // 同 session 回合预算耗尽（任务未结、无 marker）：计一次失败并换新 session
-      if (await failAttempt(cfg, deps, task, workerId)) {
-        return "blocked";
-      }
-      opensNewSession = true;
-    } else if (result.exitCode !== 0) {
-      // A failed turn (non-zero exit, timeout) is a *result*: it counts as one
-      // failed attempt instead of rejecting the whole run.
-      emit(deps, "turn-failed", task.id, result.timedOut ? "turn timed out" : `exit ${result.exitCode}`);
-      if (await failAttempt(cfg, deps, task, workerId)) {
-        return "blocked";
-      }
-      // 重试本回合：同 session 续跑（opensNewSession 保持 false）
-    } else if (await overBudget(cfg, deps, task, sessionId)) {
-      const seqBefore = note?.seq ?? 0;
-      const wrapUp = await runTurn(cfg, deps, task, workerId, { sessionId, text: WRAP_UP_INSTRUCTION });
-      if (wrapUp.lostOwnership) {
-        return ownershipLost(deps, task);
-      }
-      const after = await latestNote(cfg.tasksDir, task.id);
-      if (after !== null && after.seq > seqBefore) {
-        emit(deps, "handoff", task.id, sessionId ?? "");
-        opensNewSession = true; // 交接笔记已落盘 → 开新 session 继续任务
-      } else {
-        // 回合已结束（无论 exitCode；只有挂起超时才算未结束）却没有 note
-        // → 编排器自写兜底笔记，积累的上下文不随 session 丢失
-        if (!wrapUp.timedOut) {
-          await writeNote(cfg.tasksDir, fallbackNote(task, seqBefore, wrapUp.text));
+export async function runTask(cfg: WorkerConfig, deps: WorkerDeps, task: Task, workerId: string): Promise<TaskOutcome> {
+  // Even callers reusing a worker label get a distinct fencing generation.
+  const owner = `${workerId}:${randomUUID()}`;
+  if (!await claim(cfg.tasksDir, task.id, owner, cfg.lockTtlMs)) return "skipped";
+  let notifyLost!: () => void;
+  const loss = new Promise<void>(resolve => { notifyLost = resolve; });
+  const now = new Date().toISOString();
+  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss,
+    record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing" } };
+  let reservation: WorkspaceReservation | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let renewal: Promise<void> | undefined;
+  let stopping = false;
+  const tick = () => {
+    timer = setTimeout(() => {
+      renewal = (async () => {
+        try {
+          if (!await heartbeat(cfg.tasksDir, task.id, owner)) throw new OwnershipLostError();
+          const active = r.execution;
+          if (active) await owned(r, async () => {
+            if (r.execution !== active) return;
+            const info = active.inspect();
+            r.record.pid = info.pid; r.record.sessionId = info.sessionId;
+            await writeRuntime(cfg.tasksDir, task.id, "attempt.json", r.record);
+          });
         }
-        emit(deps, "handoff", task.id, sessionId ?? "");
-        if (await failAttempt(cfg, deps, task, workerId)) {
-          return "blocked";
-        }
-        opensNewSession = true; // 视为一次失败后仍开新 session（兜底笔记注入）
-      }
-    }
-
-    if (opensNewSession) {
-      if (sessionsUsed >= (cfg.maxSessionsPerTask ?? MAX_SESSIONS_PER_TASK_DEFAULT)) {
-        // 链条已满还要再开：计一次失败，重试额度耗尽即 blocked
-        if (await failAttempt(cfg, deps, task, workerId)) {
-          return "blocked";
-        }
-      }
-      sessionId = undefined;
-      turnsInSession = 0;
-    }
-    // 回合结束、无 marker、预算未告急、预算未耗尽 → 同 session 下一回合
-  }
-}
-
-/** One agent turn as seen by the loop (a timed-out turn normalizes to this shape). */
-type TurnResult = { sessionId: string; exitCode: number; text: string; timedOut: boolean; lostOwnership?: true };
-
-/**
- * Heartbeat (ruling 1: refresh immediately before every prompt — no
- * background timer in v0.1) followed by `adapter.prompt` under the turn
- * timeout. A heartbeat that comes back false means the lock was taken over
- * (turn outlived the lock TTL); the turn never starts and the caller must
- * abort the task without touching it further. A timed-out turn is a failed
- * turn (`timedOut: true`, exitCode -1); the adapter interface cannot cancel
- * the underlying process, so it may still be running — v0.1 accepts that
- * risk. A non-timeout rejection (spawn failure) propagates: fail loud.
- */
-async function runTurn(
-  cfg: WorkerConfig,
-  deps: WorkerDeps,
-  task: Task,
-  workerId: string,
-  args: { sessionId?: string; text: string },
-): Promise<TurnResult> {
-  if (!(await heartbeat(cfg.tasksDir, task.id, workerId))) {
-    return { sessionId: "", exitCode: -1, text: "", timedOut: false, lostOwnership: true };
-  }
-  const prompt = deps.adapter.prompt({
-    sessionId: args.sessionId,
-    text: args.text,
-    model: task.model ?? cfg.model,
-    effort: task.effort ?? cfg.effort,
-    title: task.title,
-    cwd: cfg.workdir,
-  });
+        catch { r.lost = true; notifyLost(); }
+        if (!stopping && !r.lost) tick();
+      })();
+    }, Math.max(1, Math.min(cfg.heartbeatMs, cfg.lockTtlMs / 3)));
+  };
   try {
-    return { ...(await withTimeout(prompt, cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT, "agent turn")), timedOut: false };
-  } catch (err) {
-    if (err instanceof WorkerTimeoutError) {
-      return { sessionId: "", exitCode: -1, text: "", timedOut: true };
+    // Re-read after claim: a queued snapshot is not authority to reopen a terminal task.
+    const current = await owned(r, async () => (await deps.store.list()).find(t => t.id === task.id));
+    if (!current || (current.status !== "open" && current.status !== "running")) return "skipped";
+    r.task = structuredClone(current); r.definition = definitionDigest(current);
+    const previous = await readAttempt(cfg.tasksDir, task.id);
+    if ((previous && previous.phase !== "settled") || (!previous && current.status === "running")) {
+      return await block(r, "interrupted execution requires operator reconciliation; not replayed");
     }
+    reservation = await reserveWorkspace(cfg.workdir, owner);
+    if (!reservation) return await block(r, "workspace reserved by another or uncertain execution; reconcile before retry");
+    r.record.workspace = reservation.cwd;
+    r.cfg = { ...cfg, workdir: reservation.cwd };
+    emit(r, task.status === "running" ? "takeover" : "claimed");
+    await owned(r, async () => {
+      await writeRuntime(cfg.tasksDir, task.id, "attempt.json", r.record);
+      await deps.store.clearDoneMarker(task.id); // do not consume a predecessor's completion request
+      await deps.store.setStatus(task.id, "running");
+    });
+    tick(); emit(r, "running");
+    const outcome = await loop(r);
+    // The entire run stays active between operations, including telemetry/handoffs.
+    await checkpoint(r, "settled", "finished");
+    return outcome;
+  } catch (err) {
+    if (err instanceof OwnershipLostError || r.lost) {
+      emit(r, "ownership-lost", "ownership generation changed; execution reconciles before replay");
+      return "skipped";
+    }
+    if (err instanceof UncertainExecutionError) {
+      await checkpoint(r, "uncertain", r.record.operation, err.message);
+      return await block(r, err.message);
+    }
+    if (err instanceof ReviewRequiredError) {
+      await checkpoint(r, "settled", "review-required", err.message);
+      return await block(r, err.message);
+    }
+    // Unexpected errors can occur after dispatch. Preserve active record/reservation.
+    if (reservation) await checkpoint(r, "uncertain", r.record.operation, String(err)).catch(() => {});
     throw err;
+  } finally {
+    stopping = true; if (timer) clearTimeout(timer); await renewal;
+    if (reservation && r.record.phase === "settled") await reservation.release();
+    // An uncertain reservation/record survives even though the task lock is released.
+    await release(cfg.tasksDir, task.id, owner);
   }
 }
 
-/**
- * The acceptance gate (ADR-0006). The heartbeat first keeps the lock alive
- * across a gate that may itself run as long as the lock TTL — and proves
- * the worker still owns it (a false heartbeat aborts with "lost" before
- * anything is judged or released). A passed gate marks the task done; a
- * failed one burns a retry — under the limit the loop reopens a session,
- * at the limit the task is blocked. Either way the lock is released on
- * the terminal states (ownership-guarded, so a successor's lock survives).
- */
-async function runAcceptanceGate(
-  cfg: WorkerConfig,
-  deps: WorkerDeps,
-  task: Task,
-  workerId: string,
-): Promise<"done" | "blocked" | "retry" | "lost"> {
-  if (!(await heartbeat(cfg.tasksDir, task.id, workerId))) {
-    return "lost";
+async function checkpoint(r: Run, phase: AttemptRecord["phase"], operation: string, reason?: string): Promise<void> {
+  await owned(r, async () => {
+    const next = { ...r.record, phase, operation, reason, updatedAt: new Date().toISOString() };
+    await writeRuntime(r.cfg.tasksDir, r.task.id, "attempt.json", next);
+    r.record = next;
+  });
+}
+async function block(r: Run, reason: string): Promise<"blocked"> {
+  await owned(r, () => r.deps.store.setStatus(r.task.id, "blocked"));
+  emit(r, "blocked", reason); return "blocked";
+}
+async function fail(r: Run): Promise<boolean> {
+  return owned(r, async () => {
+    const retries = await r.deps.store.incRetries(r.task.id);
+    if (retries < r.cfg.retryLimit) return false;
+    await r.deps.store.setStatus(r.task.id, "blocked");
+    emit(r, "blocked", "retry limit reached"); return true;
+  });
+}
+
+/** A cooperative legacy adapter can complete normally, but cannot prove cancellation. */
+function legacyExecution<T>(fn: () => Promise<T>): Execution<T> {
+  let state: "running" | "exited" = "running";
+  const result = Promise.resolve().then(fn).finally(() => { state = "exited"; });
+  return { result, inspect: () => ({ state }), cancel: async () => false };
+}
+
+async function controlled<T>(r: Run, label: string, ms: number, start: () => Execution<T>): Promise<T> {
+  if (!await heartbeat(r.cfg.tasksDir, r.task.id, r.owner)) throw new OwnershipLostError();
+  await checkpoint(r, "active", label);
+  let execution: Execution<T> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    // Generation cannot be taken over between the ownership check and dispatch.
+    await owned(r, async () => {
+      execution = start();
+      r.execution = execution;
+      execution.result.catch(() => {});
+      r.record.pid = execution.inspect().pid;
+      r.record.sessionId = execution.inspect().sessionId;
+      await writeRuntime(r.cfg.tasksDir, r.task.id, "attempt.json", r.record);
+    });
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new WorkerTimeoutError(`${label} timed out after ${ms}ms`)), ms);
+    });
+    const lost = r.loss.then(() => { throw new OwnershipLostError(); });
+    const value = await Promise.race([execution!.result, timeout, lost]);
+    if (execution!.inspect().state !== "exited") throw new UncertainExecutionError(`${label}: execution termination is uncertain`);
+    return value;
+  } catch (err) {
+    if (!execution) throw err;
+    r.record.sessionId = execution.inspect().sessionId;
+    if (!(err instanceof WorkerTimeoutError) && !(err instanceof OwnershipLostError) && !r.lost && execution.inspect().state === "exited") throw err;
+    // Never wait indefinitely for a broken cancellation implementation.
+    let stopTimer: ReturnType<typeof setTimeout> | undefined;
+    let stopped = false;
+    try {
+      stopped = await Promise.race([execution.cancel(), new Promise<false>(resolve => { stopTimer = setTimeout(() => resolve(false), 2_000); })]);
+      stopped = stopped && execution.inspect().state === "exited";
+    } catch { /* failed cancellation is uncertain */ }
+    finally { if (stopTimer) clearTimeout(stopTimer); }
+    if (err instanceof OwnershipLostError || r.lost) throw new OwnershipLostError();
+    if (!stopped) throw new UncertainExecutionError(`${label}: shutdown unconfirmed; automatic retry prohibited`);
+    throw err;
+  } finally { r.execution = undefined; if (timer) clearTimeout(timer); }
+}
+
+async function turn(r: Run, text: string, sessionId?: string) {
+  const args = { sessionId, text, model: r.task.model ?? r.cfg.model, effort: r.task.effort ?? r.cfg.effort, title: r.task.title, cwd: r.cfg.workdir };
+  try {
+    return { ...await controlled(r, "agent turn", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT,
+      () => r.deps.adapter.start ? r.deps.adapter.start(args) : legacyExecution(() => r.deps.adapter.prompt(args))), timedOut: false };
+  } catch (err) {
+    if (!(err instanceof WorkerTimeoutError)) throw err;
+    // Only reached if cancellation was positively confirmed.
+    await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
+    return { sessionId: "", text: "", exitCode: -1, timedOut: true };
   }
-  const gate = deps.acceptance ?? runAcceptance;
+}
+
+async function loop(r: Run): Promise<"done" | "blocked"> {
+  let sessionId: string | undefined;
+  let recordedSession = "", sessionsUsed = r.task.sessions.length, turns = 0;
+  for (;;) {
+    const note = await latestNote(r.cfg.tasksDir, r.task.id);
+    const prompt = buildWorkerPrompt(r.task, { handoff: note?.markdown, workdir: r.cfg.workdir, tasksDir: r.cfg.tasksDir });
+    const result = await turn(r, prompt, sessionId);
+    await owned(r, async () => {
+      if (result.sessionId && result.sessionId !== recordedSession) {
+        await r.deps.store.appendSession(r.task.id, result.sessionId);
+        recordedSession = sessionId = result.sessionId; sessionsUsed++;
+      }
+    });
+    turns++;
+    let fresh = false;
+    // A failed/aborted turn cannot submit successful completion even if it wrote a marker.
+    if (result.exitCode !== 0) {
+      await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
+      emit(r, "turn-failed", result.timedOut ? "turn timed out; shutdown confirmed" : `exit ${result.exitCode}`);
+      if (await fail(r)) return "blocked";
+    } else if (await owned(r, () => r.deps.store.readDoneMarker(r.task.id))) {
+      await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
+      const verdict = await accept(r);
+      if (verdict !== "retry") return verdict;
+      fresh = true;
+    } else if (turns >= (r.cfg.maxTurnsPerSession ?? MAX_TURNS_PER_SESSION_DEFAULT)) {
+      if (await fail(r)) return "blocked";
+      fresh = true;
+    } else if (await overBudget(r, sessionId)) {
+      const wrap = await turn(r, WRAP_UP_INSTRUCTION, sessionId);
+      const after = await latestNote(r.cfg.tasksDir, r.task.id);
+      if (!after || after.seq <= (note?.seq ?? 0)) {
+        if (!wrap.timedOut) await owned(r, () => writeNote(r.cfg.tasksDir, fallbackNote(r.task, note?.seq ?? 0, wrap.text)));
+        emit(r, "handoff", sessionId);
+        if (await fail(r)) return "blocked";
+      } else emit(r, "handoff", sessionId);
+      fresh = true;
+    }
+    if (fresh) {
+      if (sessionsUsed >= (r.cfg.maxSessionsPerTask ?? MAX_SESSIONS_PER_TASK_DEFAULT) && await fail(r)) return "blocked";
+      sessionId = undefined; turns = 0;
+    }
+  }
+}
+
+async function accept(r: Run): Promise<"done" | "blocked" | "retry"> {
+  const command = r.task.acceptance?.trim();
+  if (!command) { emit(r, "acceptance-skipped", "missing acceptance requires review"); throw new ReviewRequiredError("missing acceptance criteria; review required"); }
+  const artifactBefore = await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir]);
+  const startedAt = new Date().toISOString();
   let result: AcceptanceResult;
   try {
-    result = await withTimeout(
-      gate(task.acceptance ?? "", cfg.workdir),
-      cfg.acceptanceTimeoutMs ?? ACCEPTANCE_TIMEOUT_MS_DEFAULT,
-      "acceptance",
-    );
+    result = await controlled(r, "acceptance", r.cfg.acceptanceTimeoutMs ?? ACCEPTANCE_TIMEOUT_MS_DEFAULT,
+      () => r.deps.acceptance ? legacyExecution(() => r.deps.acceptance!(command, r.cfg.workdir)) : startAcceptance(command, r.cfg.workdir));
   } catch (err) {
-    if (!(err instanceof WorkerTimeoutError)) {
-      throw err;
+    if (!(err instanceof WorkerTimeoutError)) throw err;
+    result = { passed: false, skipped: false, exitCode: null, output: err.message };
+  }
+  const artifactAfter = await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir]);
+  // All controller writers use the same mutex as takeover for final validation/write.
+  return owned(r, async () => {
+    const current = (await r.deps.store.list()).find(t => t.id === r.task.id);
+    const definitionMatches = !!current && current.status === "running" && definitionDigest(current) === r.definition;
+    const evidence = { attemptId: r.owner, definitionDigest: r.definition, artifactBefore, artifactAfter, command,
+      startedAt, finishedAt: new Date().toISOString(), ...result, definitionMatches };
+    await writeRuntime(r.cfg.tasksDir, r.task.id, "acceptance.json", evidence);
+    if (!definitionMatches || artifactBefore !== artifactAfter || result.skipped) throw new ReviewRequiredError("acceptance evidence invalidated by definition/artifact drift or skipped check");
+    emit(r, "acceptance", result.passed ? "passed" : `failed (exit ${result.exitCode ?? "null"})`);
+    if (result.passed) {
+      await r.deps.store.setStatus(r.task.id, "done"); emit(r, "done"); return "done";
     }
-    result = { passed: false, exitCode: null, output: err.message, skipped: false };
-  }
-  if (result.skipped) {
-    // ADR-0006：无 acceptance 字段 → 告警放行（告警是调用方的职责）
-    emit(deps, "acceptance-skipped", task.id, "no acceptance field — passed with warning (ADR-0006)");
-  } else {
-    emit(deps, "acceptance", task.id, result.passed ? "passed" : `failed (exit ${result.exitCode ?? "null"})`);
-  }
-  if (result.passed) {
-    await deps.store.setStatus(task.id, "done");
-    emit(deps, "done", task.id);
-    await release(cfg.tasksDir, task.id, workerId);
-    return "done";
-  }
-  if (await failAttempt(cfg, deps, task, workerId)) {
-    return "blocked";
-  }
-  return "retry";
-}
-
-/**
- * Context Budget check (ADR-0003): objective telemetry only. Needs a live
- * session and a resolvable model; an unknown model or control-plane hiccup
- * rejects inside the adapter and simply disables the check for this turn —
- * the loop must keep working when telemetry is unavailable.
- */
-async function overBudget(cfg: WorkerConfig, deps: WorkerDeps, task: Task, sessionId: string | undefined): Promise<boolean> {
-  const model = task.model ?? cfg.model;
-  if (sessionId === undefined || model === undefined) {
-    return false;
-  }
-  try {
-    const usage = await deps.adapter.contextUsage(sessionId);
-    const limit = await deps.adapter.contextLimit(model);
-    return limit > 0 && usage / limit >= cfg.contextThreshold;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Count one failed attempt. Returns true when the task just hit the retry
- * limit and was moved to `blocked` (with the lock released, ownership-
- * guarded so a mid-run successor's lock is never deleted).
- */
-async function failAttempt(cfg: WorkerConfig, deps: WorkerDeps, task: Task, workerId: string): Promise<boolean> {
-  const retries = await deps.store.incRetries(task.id);
-  if (retries < cfg.retryLimit) {
-    return false;
-  }
-  await deps.store.setStatus(task.id, "blocked");
-  emit(deps, "blocked", task.id, "retry limit reached");
-  await release(cfg.tasksDir, task.id, workerId);
-  return true;
-}
-
-/**
- * The ownership-lost exit: a successor took the lock over mid-run. Emit the
- * event and bow out with "skipped" — no retry counted, nothing terminal
- * marked, nothing released; the task is left exactly as its new owner
- * finds it.
- */
-function ownershipLost(deps: WorkerDeps, task: Task): TaskOutcome {
-  emit(deps, "ownership-lost", task.id, "lock taken over by another worker");
-  return "skipped";
-}
-
-/** Emit a lifecycle event when the caller wired the seam. */
-function emit(deps: WorkerDeps, type: WorkerEventType, taskId: string, detail?: string): void {
-  deps.onEvent?.({ type, taskId, detail });
-}
-
-/**
- * The orchestrator-written fallback note (Step 3 note of the brief): when the
- * wrap-up turn ENDED — any exit code; only a hang (timeout) hasn't ended —
- * but no note appeared, the next session still needs something to inherit.
- * `done`/`next` quote the task and the first 500 characters of the wrap-up
- * turn's output.
- */
-function fallbackNote(task: Task, seqBefore: number, turnText: string): HandoffNote {
-  const summary = truncate(`任务 ${task.id}（${task.title}）上回合输出：${turnText}`, 500);
-  return {
-    task: task.id,
-    seq: seqBefore + 1,
-    status: "orchestrator-fallback",
-    done: summary,
-    found: "agent 未按收尾指令写 note；本笔记由编排器兜底生成",
-    next: summary,
-    files: [],
-  };
-}
-
-/** First `max` characters — no ellipsis, so the 500-character cap is exact. */
-function truncate(text: string, max: number): string {
-  return text.length <= max ? text : text.slice(0, max);
-}
-
-/**
- * Race `work` against a timer. On timeout the underlying work keeps running
- * (nothing here can cancel it) but the caller sees a
- * {@link WorkerTimeoutError}; a late settlement is swallowed by the race.
- */
-function withTimeout<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new WorkerTimeoutError(`${label} timed out after ${ms}ms`)), ms);
-    work.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (err) => {
-        clearTimeout(timer);
-        reject(err);
-      },
-    );
+    const retries = await r.deps.store.incRetries(r.task.id);
+    if (retries >= r.cfg.retryLimit) {
+      await r.deps.store.setStatus(r.task.id, "blocked"); emit(r, "blocked", "retry limit reached"); return "blocked";
+    }
+    return "retry";
   });
+}
+
+async function overBudget(r: Run, sessionId?: string): Promise<boolean> {
+  const model = r.task.model ?? r.cfg.model;
+  if (!sessionId || !model) return false;
+  // Telemetry is not allowed to hang indefinitely outside the lease/cancel boundary.
+  try {
+    const usage = await controlled(r, "context telemetry", 10_000, () => legacyExecution(async () => {
+      const used = await r.deps.adapter.contextUsage(sessionId);
+      const limit = await r.deps.adapter.contextLimit(model);
+      return limit > 0 && used / limit >= r.cfg.contextThreshold;
+    }));
+    return usage;
+  } catch (err) {
+    if (err instanceof OwnershipLostError || err instanceof UncertainExecutionError) throw err;
+    return false;
+  }
+}
+function fallbackNote(task: Task, seq: number, text: string): HandoffNote {
+  const summary = `任务 ${task.id}（${task.title}）上回合输出：${text}`.slice(0, 500);
+  return { task: task.id, seq: seq + 1, status: "orchestrator-fallback", done: summary,
+    found: "agent 未按收尾指令写 note；本笔记由编排器兜底生成", next: summary, files: [] };
 }
