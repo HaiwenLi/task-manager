@@ -1,0 +1,9 @@
+{
+  "tasksDir": "tasks",
+  "workdir": ".",
+  "agent": "opencode",
+  "contextThreshold": 0.8,
+  "retryLimit": 3,
+  "lockTtlMs": 600000,
+  "heartbeatMs": 60000
+}

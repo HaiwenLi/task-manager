@@ -1,0 +1,27 @@
+{
+  "name": "taskctl",
+  "version": "0.1.0",
+  "description": "Multi-agent task orchestrator with Markdown task files as the source of truth",
+  "type": "module",
+  "bin": {
+    "taskctl": "dist/main.js"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "dev": "tsx"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "gray-matter": "^4.0.3",
+    "js-yaml": "^5.4.3"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.4"
+  }
+}
