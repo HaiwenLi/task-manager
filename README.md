@@ -15,8 +15,9 @@
 - 本机已安装并登录 [opencode](https://opencode.ai) CLI（`opencode` 可用、模型已配置）
 
 ```bash
-git clone <本仓库> && cd task-manager
-npm install
+git clone <repository-url>
+cd task-manager
+npm ci
 ```
 
 v0.1 从源码运行，CLI 入口是：
@@ -46,7 +47,7 @@ npx tsx src/main.ts <子命令> [参数]
 | `acceptanceTimeoutMs` | number | `600000` | 单次验收命令的超时 |
 | `maxSessionsPerTask` | number | `20` | 一个任务全会话链的长度上限（含交接与重试） |
 | `maxTurnsPerSession` | number | `40` | 单会话内工作回合数上限 |
-| `opencodeBin` | string | `opencode` | opencode 可执行文件。**Windows 下 npm 全局装的是 `.cmd` shim，无法被 `shell:false` 直接 spawn**，需指向真实 `.exe`（填本机实际的 .exe 路径，不要提交） |
+| `opencodeBin` | string | `opencode` | opencode 可执行文件。**Windows 下 `.cmd` shim 无法被 `shell:false` 直接启动**，应在本地配置实际 `.exe`，不要提交机器专属路径 |
 
 ## 任务文件
 
@@ -137,10 +138,19 @@ npx tsx src/main.ts status [--tasks-dir <dir>]
 
 ```bash
 npm test                # 全部单元/集成测试（不碰真实 opencode）
+npx tsc --noEmit         # TypeScript 检查
 TASKCTL_E2E=1 npx vitest run tests/e2e.smoke.test.ts   # E2E 冒烟（真实 opencode）
 ```
 
 E2E 前置：本机 opencode 已安装并登录；Windows 下测试会自动解析 npm 全局 opencode 背后的真实 `.exe`（也可用环境变量 `TASKCTL_OPENCODE_BIN` 覆盖）。它会在临时目录里发起真实 agent 会话并消耗模型额度。
+
+## 凭据与隐私
+
+- 通过 agent CLI 在本地配置模型凭据；不要把 API key、访问令牌或认证头写进任务、示例或仓库配置。
+- 示例使用相对路径；机器专属可执行文件路径仅保存在本地，不提交到 Git。
+- `.env`、密钥文件、私人记忆和实际任务运行数据默认忽略；`tasks/example.md` 是公开示例，不含真实任务记录。
+- `attempt.json`、`acceptance.json`、交接笔记和模型输出可能含任务内容、运行路径或敏感数据；提交附件或共享日志前另行检查。`.gitignore` 不会清除已经提交的历史。
+- 当前验证为离线测试，不代表真实后端取消、科学有效性或生产部署已经验证；中断恢复见 [ADR-0007](docs/adr/0007-fenced-execution-and-evidence.md)。
 
 ## 设计文档
 

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildWorkerPrompt } from "../src/protocol.js";
 import type { Task } from "../src/task-file.js";
+import { resolve } from "node:path";
 
 function task(overrides: Partial<Task> = {}): Task {
   return {
@@ -14,7 +15,7 @@ function task(overrides: Partial<Task> = {}): Task {
   };
 }
 
-const ctx = { workdir: "C:\\wt\\protocol-a", tasksDir: "C:\\repo\\tasks" };
+const ctx = { workdir: resolve("fixture-workspaces", "protocol-a"), tasksDir: resolve("fixture-tasks") };
 
 /** The protocol is spec-fixed copy; the first-session render is pinned verbatim. */
 const FIRST_SESSION_PROMPT = `# 任务：组装任务协议
@@ -22,9 +23,9 @@ const FIRST_SESSION_PROMPT = `# 任务：组装任务协议
 把工作规则与交接笔记拼进 Worker 提示词。
 
 ## 工作规则
-- 工作目录：C:\\wt\\protocol-a；只在此目录内改动
-- 完成全部要求后，运行：taskctl done --task protocol-a --tasks-dir "C:\\repo\\tasks"
-- 阶段性发现请随时运行：taskctl note --task protocol-a --tasks-dir "C:\\repo\\tasks" --status <一句话状态> --done <已完成> --found <关键发现> --next <下一步> --files <逗号分隔文件>
+- 工作目录：${ctx.workdir}；只在此目录内改动
+- 完成全部要求后，运行：taskctl done --task protocol-a --tasks-dir "${ctx.tasksDir}"
+- 阶段性发现请随时运行：taskctl note --task protocol-a --tasks-dir "${ctx.tasksDir}" --status <一句话状态> --done <已完成> --found <关键发现> --next <下一步> --files <逗号分隔文件>
 - 若收到"上下文预算告急"的收尾指令：立即运行一次 taskctl note（尽量详尽，同上参数），然后只回复 HANDOFF_READY
 
 ## 上一段会话的交接笔记
@@ -50,21 +51,22 @@ describe("buildWorkerPrompt", () => {
   });
 
   it("interpolates title, description, id, workdir and tasksDir", () => {
+    const workdir = resolve("fixture-workspaces", "z-9"), tasksDir = resolve("fixture-tasks");
     const prompt = buildWorkerPrompt(
       task({ id: "z-9", title: "深路径插值", description: "多行描述第一行\n多行描述第二行" }),
-      { workdir: "/srv/wt/z-9", tasksDir: "/srv/tasks" },
+      { workdir, tasksDir },
     );
 
     expect(prompt).toContain("# 任务：深路径插值\n\n多行描述第一行\n多行描述第二行\n\n## 工作规则");
-    expect(prompt).toContain('- 工作目录：/srv/wt/z-9；只在此目录内改动');
-    expect(prompt).toContain('taskctl done --task z-9 --tasks-dir "/srv/tasks"');
-    expect(prompt).toContain('taskctl note --task z-9 --tasks-dir "/srv/tasks" --status');
+    expect(prompt).toContain(`- 工作目录：${workdir}；只在此目录内改动`);
+    expect(prompt).toContain(`taskctl done --task z-9 --tasks-dir "${tasksDir}"`);
+    expect(prompt).toContain(`taskctl note --task z-9 --tasks-dir "${tasksDir}" --status`);
   });
 
   it("double-quotes the absolute tasks dir on every taskctl invocation", () => {
     const prompt = buildWorkerPrompt(task(), ctx);
     // done 与 note 两处都要带双引号绝对路径（Worker 的 cwd 是 workdir）
-    expect(prompt.match(/--tasks-dir "C:\\repo\\tasks"/g)).toHaveLength(2);
+    expect(prompt.split(`--tasks-dir "${ctx.tasksDir}"`)).toHaveLength(3);
   });
 
   it("leaks no unescaped braces down either path", () => {

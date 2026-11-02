@@ -92,4 +92,4 @@ adapter 接口: createSession / prompt / subscribeEvents / contextUsage / fork /
 ## 附：克隆清单（repos/）
 
 rove · ordewell · NEEDLE · sortie · ralphex · sub-agents-skills · agent-toolkit · awesome-agent-orchestrators
-（obra/superpowers 已在本地克隆）
+（superpowers 可作为独立的工作流参考；无需依赖本地固定目录。）

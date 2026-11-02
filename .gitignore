@@ -2,8 +2,19 @@ repos/
 node_modules/
 dist/
 *.log
- tasks/
+/tasks/*
+!/tasks/example.md
 .taskctl/
 .superpowers/
 .vitest/
 .taskctl-workspace.lock
+.env
+.env.*
+!.env.example
+secrets/
+memory/
+MEMORY.md
+USER.md
+SOUL.md
+*.pem
+*.key
