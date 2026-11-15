@@ -192,6 +192,15 @@ TASKCTL_E2E=1 npx vitest run tests/e2e.smoke.test.ts   # E2E 冒烟（真实 ope
 
 E2E 前置：本机 opencode 已安装并登录；Windows 下测试会自动解析 npm 全局 opencode 背后的真实 `.exe`（也可用环境变量 `TASKCTL_OPENCODE_BIN` 覆盖）。它会在临时目录里发起真实 agent 会话并消耗模型额度。
 
+整条流水线的真实冒烟（临时项目、自带 taskctl shim、跑完打印 report）：
+
+```powershell
+.\scripts\smoke.ps1          # 只准备环境，不调模型
+.\scripts\smoke.ps1 -Live    # 真跑一次，通过时打印 SMOKE PASS
+```
+
+它会验证：agent 在真实会话里干活 → 验收命令 → 独立复核 → `done`。2026-11-16 在本机 opencode 2.3.0 上跑通。
+
 ## 凭据与隐私
 
 - 通过 agent CLI 在本地配置模型凭据；不要把 API key、访问令牌或认证头写进任务、示例或仓库配置。
