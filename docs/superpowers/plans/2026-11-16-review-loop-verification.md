@@ -7,8 +7,8 @@
 
 ```
 $ node node_modules/vitest/vitest.mjs run --reporter=dot
-      Tests  223 passed | 1 skipped (224)
-   Duration  14.95s
+      Tests  230 passed | 1 skipped (231)
+   Duration  17.32s
 $ npx tsc --noEmit
 (无输出，退出码 0)
 ```
@@ -17,16 +17,17 @@ $ npx tsc --noEmit
 
 ## 2. CLI 端到端（确定性适配器，真实进程内链路）
 
-`tests/pipeline-e2e.test.ts` 走完整命令链 `add → approve → run → done`，以及复核失败
-`add → approve → run → blocked`：
+`tests/pipeline-e2e.test.ts` 走完整命令链 `add → approve → run → done`，以及复核持续失败
+`add → approve → run → blocked`（一轮 `run` 内连续返工直到轮次上限）：
 
 ```
-✓ add → approve → run → done, with the board updated at each step
-✓ a failing review sends the task back to open instead of done
+✓ add → approve → run → done, with the acceptance gate, review and board
+✓ a failing review spends a round and ends blocked at the limit
 ```
 
-覆盖的真实代码路径：任务文件读写、澄清会话落 spec 与 criteria、draft 关卡、调度器领任务、
-工作区独占、验收命令、复核会话与 verdict 解析、journal、board 重写、report。
+覆盖的真实代码路径：任务文件读写、澄清会话落 spec 与 criteria、draft 关卡、调度器多轮领取、
+工作区独占与 git 仓库级串行、验收命令（断言被调用一次）、复核会话与 verdict 解析、返工循环、
+journal、board 重写、report。
 
 适配器是脚本化的（按提示词内容判断是澄清/执行/复核），不是真实模型。
 
