@@ -29,6 +29,8 @@ export type WorkerConfig = {
   maxReviewRounds?: number;
   /** Optional separate model/effort for the reviewer session. */
   reviewerModel?: string; reviewerEffort?: string;
+  /** How many tasks the scheduler may run at once (default 2). */
+  parallel?: number;
 };
 export type WorkerStore = Pick<TaskStore, "list" | "setStatus" | "appendSession" | "incRetries" | "readDoneMarker" | "clearDoneMarker" | "incReviewRounds">;
 export type WorkerDeps = {
