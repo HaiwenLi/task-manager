@@ -50,3 +50,29 @@ export async function readAudits(tasksDir: string): Promise<AuditRecord[]> {
   }
   return records;
 }
+
+/**
+ * Which stage keeps failing. This is the learning signal: a reviewer that keeps
+ * being overruled, or a worker that keeps needing rework, is the thing to fix.
+ */
+export function summarizeAudits(records: AuditRecord[], tasks: Array<{ reviewRounds: number }>): string[] {
+  const stages: AuditStage[] = ["clarify", "worker", "reviewer", "none"];
+  const counts = new Map(stages.map((stage) => [stage, { fail: 0, total: 0 }]));
+  for (const record of records) {
+    const bucket = counts.get(record.stage) ?? counts.get("none")!;
+    bucket.total += 1;
+    if (record.verdict === "fail") bucket.fail += 1;
+  }
+  const highlighted = records.filter((record) => record.verdict === "pass" && record.highlight === true).length;
+  const reworked = tasks.filter((task) => task.reviewRounds > 0).length;
+  const rate = tasks.length === 0 ? 0 : Math.round((reworked / tasks.length) * 100);
+  return [
+    `audits  ${records.length}`,
+    ...stages.map((stage) => {
+      const bucket = counts.get(stage)!;
+      return `${stage}  ${bucket.fail} fail / ${bucket.total}`;
+    }),
+    `highlight  ${highlighted}`,
+    `返工率  ${rate}%  (${reworked}/${tasks.length})`,
+  ];
+}

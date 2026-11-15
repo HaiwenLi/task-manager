@@ -11,7 +11,7 @@ import { extractCriteria, readSpec, writeSpec } from "./spec.js";
 import { appendJournal } from "./journal.js";
 import { renderBoardMarkdown, renderBoardTable, writeBoard } from "./board.js";
 import { buildReport } from "./report.js";
-import { readAudits } from "./audit.js";
+import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
 
 /** Injection seams for tests: adapter (for `run`), clock (for `done`), output. */
 export type CliDeps = {
@@ -38,6 +38,10 @@ const USAGE = [
   "  taskctl status [--tasks-dir <dir>]",
   "  taskctl board [--all] [--json] [--tasks-dir <dir>]",
   "  taskctl report --task <id> [--tasks-dir <dir>]",
+  "  taskctl accept --task <id> [--tasks-dir <dir>]",
+  "  taskctl reject --task <id> --reason \"…\" [--stage clarify|worker|reviewer] [--tasks-dir <dir>]",
+  "  taskctl audit --task <id> --verdict pass|fail [--stage …] [--note \"…\"] [--tasks-dir <dir>]",
+  "  taskctl metrics [--tasks-dir <dir>]",
 ].join("\n");
 
 /** Marker file the `done` subcommand writes; mirrors task-store's DONE_MARKER. */
@@ -110,6 +114,18 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "report":
       checkFlags(command, flags, ["task", "tasks-dir"], ["task"]);
       return reportCommand(flags, log);
+    case "accept":
+      checkFlags(command, flags, ["task", "tasks-dir"], ["task"]);
+      return acceptCommand(flags, log);
+    case "reject":
+      checkFlags(command, flags, ["task", "reason", "stage", "tasks-dir"], ["task", "reason"]);
+      return rejectCommand(flags, log);
+    case "audit":
+      checkFlags(command, flags, ["task", "verdict", "stage", "note", "tasks-dir"], ["task", "verdict"]);
+      return auditCommand(flags, log);
+    case "metrics":
+      checkFlags(command, flags, ["tasks-dir"], []);
+      return metricsCommand(flags, log);
     default:
       throw new UsageError(`unknown command "${command}"`);
   }
@@ -352,6 +368,87 @@ async function reportCommand(flags: Map<string, string>, log: (line: string) => 
     log(line);
   }
   return 0;
+}
+
+/** `taskctl accept --task <id>` — a human signs off a reviewed task. */
+async function acceptCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const id = flags.get("task")!;
+  const store = new TaskStore(tasksDir);
+  const task = await store.get(id);
+  if (task.status !== "awaiting-human") {
+    throw new Error(`task ${id} is ${task.status}, expected awaiting-human`);
+  }
+  await store.setStatus(id, "done");
+  await appendJournal(tasksDir, id, { stage: "human", event: "accepted" });
+  await appendAudit(tasksDir, { task: id, at: new Date().toISOString(), verdict: "pass", stage: "none", highlight: true });
+  log(`${id}  done  accepted`);
+  return 0;
+}
+
+/** `taskctl reject --task <id> --reason …` — a human sends work back and names the failing stage. */
+async function rejectCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const id = flags.get("task")!;
+  const reason = flags.get("reason")!;
+  const stage = parseStage(flags.get("stage") ?? "reviewer");
+  const store = new TaskStore(tasksDir);
+  const task = await store.get(id);
+  if (task.status !== "awaiting-human") {
+    throw new Error(`task ${id} is ${task.status}, expected awaiting-human`);
+  }
+  const seq = ((await latestNote(tasksDir, id))?.seq ?? 0) + 1;
+  await writeNote(tasksDir, { task: id, seq, status: "rejected", done: "人工放行未通过", found: reason, next: reason, files: [] });
+  await store.setStatus(id, "open");
+  await appendJournal(tasksDir, id, { stage: "human", event: "rejected", detail: `stage=${stage} ${reason}` });
+  await appendAudit(tasksDir, { task: id, at: new Date().toISOString(), verdict: "fail", stage, note: reason });
+  log(`${id}  open  rejected (stage=${stage})`);
+  return 0;
+}
+
+/** `taskctl audit --task <id> --verdict pass|fail` — a spot check; it never changes task status. */
+async function auditCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const id = flags.get("task")!;
+  const verdict = flags.get("verdict");
+  if (verdict !== "pass" && verdict !== "fail") {
+    throw new UsageError(`--verdict must be pass or fail`);
+  }
+  const store = new TaskStore(tasksDir);
+  const task = await store.get(id);
+  if (task.status !== "done") {
+    throw new Error(`task ${id} is ${task.status}, only done tasks can be audited`);
+  }
+  const stage = parseStage(flags.get("stage") ?? (verdict === "pass" ? "none" : "reviewer"));
+  const note = flags.get("note");
+  await appendAudit(tasksDir, {
+    task: id,
+    at: new Date().toISOString(),
+    verdict,
+    stage,
+    ...(note === undefined ? {} : { note }),
+    ...(verdict === "pass" ? { highlight: true } : {}),
+  });
+  log(`${id}  audit ${verdict}  stage=${stage}`);
+  return 0;
+}
+
+/** `taskctl metrics` — which stage keeps failing. */
+async function metricsCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasks = await new TaskStore(tasksDir).list();
+  for (const line of summarizeAudits(await readAudits(tasksDir), tasks)) {
+    log(line);
+  }
+  return 0;
+}
+
+function parseStage(value: string): AuditStage {
+  const allowed: AuditStage[] = ["clarify", "worker", "reviewer", "none"];
+  if (!allowed.includes(value as AuditStage)) {
+    throw new UsageError(`unknown stage "${value}" (expected one of: ${allowed.join(", ")})`);
+  }
+  return value as AuditStage;
 }
 
 /** `--flag value` tokens into a map; bare tokens become positionals. */
