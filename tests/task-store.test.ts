@@ -122,3 +122,26 @@ describe("done marker", () => {
     await expect(store.clearDoneMarker("a")).resolves.toBeUndefined();
   });
 });
+
+describe("pipeline mutations", () => {
+  it("incReviewRounds increments and persists", async () => {
+    await writeFile(
+      join(tasksDir, "c.md"),
+      "---\ntitle: C\nstatus: review\nreview_rounds: 1\nsessions: []\nretries: 0\n---\n",
+      "utf8",
+    );
+    const store = new TaskStore(tasksDir);
+    await expect(store.incReviewRounds("c")).resolves.toBe(2);
+    expect((await store.get("c")).reviewRounds).toBe(2);
+  });
+
+  it("updateFields patches only the listed keys and keeps criteria order", async () => {
+    const store = new TaskStore(tasksDir);
+    await store.updateFields("a", { status: "draft", criteria: ["C1 甲", "C2 乙"] });
+    const task = await store.get("a");
+    expect(task.status).toBe("draft");
+    expect(task.criteria).toEqual(["C1 甲", "C2 乙"]);
+    expect(task.title).toBe("任务A");
+    expect(task.sessions).toEqual([]);
+  });
+});

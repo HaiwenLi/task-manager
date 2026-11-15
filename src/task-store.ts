@@ -6,6 +6,11 @@ import type { Task, TaskStatus } from "./task-file.js";
 /** Marker file (in `tasks/<id>/`) written by `taskctl done`, polled by the worker. */
 const DONE_MARKER = "done.requested";
 
+/** The pipeline fields a caller may patch in one guarded write. */
+export type TaskFieldsPatch = Partial<
+  Pick<Task, "status" | "criteria" | "workdir" | "complexity" | "risk" | "humanCheck" | "dependsOn">
+>;
+
 /**
  * Filesystem store over a `tasks/` directory. Task files live at
  * `tasks/<id>.md`; per-task side files (locks, notes, markers) live in the
@@ -55,6 +60,26 @@ export class TaskStore {
       task.retries += 1;
     });
     return retries;
+  }
+
+  /** Increment the failed-review counter and return the new value. */
+  async incReviewRounds(id: string): Promise<number> {
+    const { reviewRounds } = await this.update(id, (task) => {
+      task.reviewRounds += 1;
+    });
+    return reviewRounds;
+  }
+
+  /** Patch a fixed set of pipeline fields; keys absent from `patch` stay unchanged. */
+  async updateFields(id: string, patch: TaskFieldsPatch): Promise<Task> {
+    return this.update(id, (task) => {
+      for (const key of Object.keys(patch) as Array<keyof TaskFieldsPatch>) {
+        const value = patch[key];
+        if (value !== undefined) {
+          (task as unknown as Record<string, unknown>)[key] = value;
+        }
+      }
+    });
   }
 
   /** True once `tasks/<id>/done.requested` exists. */
