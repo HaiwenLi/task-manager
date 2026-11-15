@@ -2,8 +2,18 @@ import matter from "gray-matter";
 import type { GrayMatterFile } from "gray-matter";
 import { dump } from "js-yaml";
 
-/** Lifecycle of a task as it moves through the orchestrator. */
-export type TaskStatus = "open" | "running" | "done" | "blocked";
+/**
+ * Lifecycle of a task as it moves through the pipeline.
+ * `draft` and `awaiting-human` are human gates: the orchestrator parks a task
+ * there and only a human command moves it out.
+ */
+export type TaskStatus = "draft" | "open" | "running" | "review" | "awaiting-human" | "done" | "blocked";
+
+/** How much clarification a task gets before execution starts. */
+export type TaskComplexity = "simple" | "complex";
+
+/** `high` tasks never finish on the reviewer's verdict alone. */
+export type TaskRisk = "normal" | "high";
 
 /**
  * A task as stored in `tasks/<id>.md`: YAML frontmatter + markdown body.
@@ -23,6 +33,18 @@ export type Task = {
   effort?: string;
   /** Command that must pass before a task may be marked done. */
   acceptance?: string;
+  /** Numbered acceptance criteria (`C1 …`); the reviewer judges exactly these. */
+  criteria: string[];
+  complexity: TaskComplexity;
+  risk: TaskRisk;
+  /** Workspace for this task, relative to the configured workdir. */
+  workdir?: string;
+  /** Tasks that must be `done` before this one may be claimed. */
+  dependsOn: string[];
+  /** Explicit human sign-off regardless of risk. */
+  humanCheck: boolean;
+  /** How many review rounds have failed so far. */
+  reviewRounds: number;
   /** Session ids that have worked on this task, oldest first. */
   sessions: string[];
   /** Number of failed attempts so far. */
@@ -37,7 +59,9 @@ export class TaskFileError extends Error {
   }
 }
 
-const STATUSES: readonly TaskStatus[] = ["open", "running", "done", "blocked"];
+const STATUSES: readonly TaskStatus[] = ["draft", "open", "running", "review", "awaiting-human", "done", "blocked"];
+const COMPLEXITIES: readonly TaskComplexity[] = ["simple", "complex"];
+const RISKS: readonly TaskRisk[] = ["normal", "high"];
 
 /**
  * Parse the contents of `tasks/<id>.md`. `id` comes from the filename, not the
@@ -70,6 +94,13 @@ export function parseTaskFile(raw: string, id: string): Task {
     model: optionalString(data, "model", id),
     effort: optionalString(data, "effort", id),
     acceptance: optionalString(data, "acceptance", id),
+    criteria: parseCriteria(data, id),
+    complexity: parseEnum(data, "complexity", COMPLEXITIES, "complex", id),
+    risk: parseEnum(data, "risk", RISKS, "normal", id),
+    workdir: optionalString(data, "workdir", id),
+    dependsOn: parseDependsOn(data, id),
+    humanCheck: parseHumanCheck(data, id),
+    reviewRounds: parseReviewRounds(data, id),
     sessions: parseSessions(data, id),
     retries: parseRetries(data, id),
   };
@@ -88,8 +119,15 @@ export function serializeTaskFile(task: Task): string {
     ...(task.model !== undefined && { model: task.model }),
     ...(task.effort !== undefined && { effort: task.effort }),
     ...(task.acceptance !== undefined && { acceptance: task.acceptance }),
+    ...(task.criteria.length > 0 && { criteria: task.criteria }),
+    complexity: task.complexity,
+    ...(task.risk === "high" && { risk: task.risk }),
+    ...(task.workdir !== undefined && { workdir: task.workdir }),
+    ...(task.dependsOn.length > 0 && { depends_on: task.dependsOn }),
+    ...(task.humanCheck && { human_check: task.humanCheck }),
     sessions: task.sessions,
     retries: task.retries,
+    review_rounds: task.reviewRounds,
   };
   return `---\n${dump(frontmatter, { lineWidth: -1 })}---\n${task.description}`;
 }
@@ -119,6 +157,72 @@ function optionalString(data: Record<string, unknown>, key: string, id: string):
   }
   if (typeof value !== "string") {
     throw new TaskFileError(`task file ${id}: field ${key} must be a string`);
+  }
+  return value;
+}
+
+function parseEnum<T extends string>(
+  data: Record<string, unknown>,
+  key: string,
+  allowed: readonly T[],
+  fallback: T,
+  id: string,
+): T {
+  const value = data[key];
+  if (value === undefined) {
+    return fallback;
+  }
+  if (typeof value !== "string" || !allowed.includes(value as T)) {
+    throw new TaskFileError(
+      `task file ${id}: field ${key} must be one of: ${allowed.join(", ")}`,
+    );
+  }
+  return value as T;
+}
+
+function parseCriteria(data: Record<string, unknown>, id: string): string[] {
+  const value = data.criteria;
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.length === 0)) {
+    throw new TaskFileError(`task file ${id}: field criteria must be a list of non-empty strings`);
+  }
+  return [...value];
+}
+
+function parseDependsOn(data: Record<string, unknown>, id: string): string[] {
+  const value = data.depends_on;
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.length === 0)) {
+    throw new TaskFileError(`task file ${id}: field depends_on must be a list of task ids`);
+  }
+  if (value.includes(id)) {
+    throw new TaskFileError(`task file ${id}: depends_on must not include itself`);
+  }
+  return [...value];
+}
+
+function parseHumanCheck(data: Record<string, unknown>, id: string): boolean {
+  const value = data.human_check;
+  if (value === undefined) {
+    return false;
+  }
+  if (typeof value !== "boolean") {
+    throw new TaskFileError(`task file ${id}: field human_check must be a boolean`);
+  }
+  return value;
+}
+
+function parseReviewRounds(data: Record<string, unknown>, id: string): number {
+  const value = data.review_rounds;
+  if (value === undefined) {
+    return 0;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new TaskFileError(`task file ${id}: field review_rounds must be a non-negative integer`);
   }
   return value;
 }

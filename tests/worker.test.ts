@@ -89,12 +89,26 @@ class FakeAdapter implements AgentAdapter {
   }
 }
 
+/** Fixture reviewer: every task passes review unless a test overrides it. */
+const passReview = async () => ({
+  verdict: "pass" as const,
+  criteria: [{ id: "C1", pass: true, evidence: "fixture" }],
+  defects: [],
+  summary: "ok",
+});
+
 function task(overrides: Partial<Task> = {}): Task {
   return {
     id: "a",
     title: "任务A",
     description: "A 的正文",
     status: "open",
+    criteria: ["C1 fixture"],
+    complexity: "complex",
+    risk: "normal",
+    dependsOn: [],
+    humanCheck: false,
+    reviewRounds: 0,
     sessions: [],
     retries: 0,
     acceptance: "fixture check",
@@ -166,7 +180,7 @@ describe("runWorker — 队列与生命周期", () => {
     const acceptance = vi.fn(passGate);
     const c = cfg(tasksDir);
 
-    const result = await runWorker(c, { store, adapter, acceptance });
+    const result = await runWorker(c, { store, adapter, acceptance, review: passReview });
 
     expect(result).toEqual({ done: ["a"], blocked: [] });
     expect(store.task("a").status).toBe("done");
@@ -196,7 +210,7 @@ describe("runWorker — 队列与生命周期", () => {
       return { sessionId: "ses-a1", exitCode: 0, text: "第二回合完成" };
     });
 
-    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate });
+    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview });
 
     expect(result).toEqual({ done: ["a"], blocked: [] });
     expect(store.task("a").status).toBe("done");
@@ -218,7 +232,7 @@ describe("runWorker — 队列与生命周期", () => {
       return { sessionId: `ses-${id}`, exitCode: 0, text: "ok" };
     });
 
-    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate });
+    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview });
 
     expect(result).toEqual({ done: ["a", "b"], blocked: [] });
     expect(store.task("a").status).toBe("done");
@@ -234,7 +248,7 @@ describe("runWorker — 队列与生命周期", () => {
       throw new Error("must not prompt");
     });
 
-    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate });
+    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview });
 
     expect(result).toEqual({ done: [], blocked: [] });
     expect(store.task("a").status).toBe("open");
@@ -265,7 +279,7 @@ describe("runWorker — 队列与生命周期", () => {
       return { sessionId: "ses-a1", exitCode: 0, text: "ok" };
     });
 
-    await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate });
+    await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview });
 
     expect(locks).toHaveLength(2);
     expect(locks[0].worker).toMatch(new RegExp(`^worker-${process.pid}-`));
@@ -300,7 +314,7 @@ describe("runWorker — R4 会话链交接", () => {
       return { sessionId: "ses-B", exitCode: 0, text: "第二回合完成" };
     });
 
-    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate });
+    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview });
 
     expect(result).toEqual({ done: ["a"], blocked: [] });
     // 收尾指令：固定文案、发给同一个 session
@@ -333,7 +347,7 @@ describe("runWorker — R4 会话链交接", () => {
       return { sessionId: "ses-B", exitCode: 0, text: "续接完成" };
     });
 
-    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate });
+    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview });
 
     expect(result).toEqual({ done: ["a"], blocked: [] });
     expect(store.task("a").retries).toBe(1); // 视为一次失败
@@ -363,7 +377,7 @@ describe("runWorker — R4 会话链交接", () => {
       return { sessionId: "ses-A", exitCode: 0, text: "没写 note 的收尾" };
     });
 
-    const result = await runWorker(cfg(tasksDir, { retryLimit: 1 }), { store, adapter, acceptance: passGate });
+    const result = await runWorker(cfg(tasksDir, { retryLimit: 1 }), { store, adapter, acceptance: passGate, review: passReview });
 
     expect(result).toEqual({ done: [], blocked: ["a"] });
     expect(store.task("a").status).toBe("blocked");
@@ -387,7 +401,7 @@ describe("runWorker — R4 会话链交接", () => {
       return { sessionId: "ses-B", exitCode: 0, text: "续接完成" };
     });
 
-    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate });
+    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview });
 
     expect(result).toEqual({ done: ["a"], blocked: [] });
     expect(store.task("a").retries).toBe(1); // 仍计一次失败
@@ -417,7 +431,7 @@ describe("runWorker — 失败核算", () => {
     }));
     const c = cfg(tasksDir, { retryLimit: 3 });
 
-    const result = await runWorker(c, { store, adapter, acceptance });
+    const result = await runWorker(c, { store, adapter, acceptance, review: passReview });
 
     expect(result).toEqual({ done: [], blocked: ["a"] });
     expect(store.task("a").status).toBe("blocked");
@@ -440,7 +454,7 @@ describe("runWorker — 失败核算", () => {
       return { sessionId: "ses-a1", exitCode: 0, text: "恢复后完成" };
     });
 
-    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate });
+    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview });
 
     expect(result).toEqual({ done: ["a"], blocked: [] });
     expect(store.task("a").retries).toBe(1);
@@ -456,7 +470,7 @@ describe("runWorker — 失败核算", () => {
     const result = await runWorker(cfg(tasksDir, { retryLimit: 1, turnTimeoutMs: 25 }), {
       store,
       adapter,
-      acceptance: passGate,
+      acceptance: passGate, review: passReview,
     });
 
     expect(result).toEqual({ done: [], blocked: ["a"] });
@@ -513,7 +527,7 @@ describe("runWorker — 循环上限（binding ruling）", () => {
     const result = await runWorker(cfg(tasksDir, { maxSessionsPerTask: 2, retryLimit: 3 }), {
       store,
       adapter,
-      acceptance: passGate,
+      acceptance: passGate, review: passReview,
     });
 
     expect(result).toEqual({ done: [], blocked: ["a"] });
@@ -536,7 +550,7 @@ describe("runWorker — 循环上限（binding ruling）", () => {
     const result = await runWorker(cfg(tasksDir, { maxTurnsPerSession: 3, retryLimit: 3 }), {
       store,
       adapter,
-      acceptance: passGate,
+      acceptance: passGate, review: passReview,
     });
 
     expect(result).toEqual({ done: [], blocked: ["a"] });
@@ -563,7 +577,7 @@ describe("runWorker — 崩溃恢复（心跳停 → 接管，controller ruling�
     });
     const sink = eventSink();
 
-    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, ...sink });
+    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview, ...sink });
 
     expect(result).toEqual({ done: [], blocked: ["a"] });
     expect(store.task("a").status).toBe("blocked");
@@ -586,7 +600,7 @@ describe("runWorker — 崩溃恢复（心跳停 → 接管，controller ruling�
     });
     const sink = eventSink();
 
-    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, ...sink });
+    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview, ...sink });
 
     expect(result).toEqual({ done: [], blocked: ["a"] });
     expect(store.task("a").status).toBe("blocked");
@@ -603,7 +617,7 @@ describe("runWorker — 崩溃恢复（心跳停 → 接管，controller ruling�
     });
     const sink = eventSink();
 
-    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, ...sink });
+    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview, ...sink });
 
     expect(result).toEqual({ done: [], blocked: [] });
     expect(adapter.calls).toHaveLength(0);
@@ -621,7 +635,7 @@ describe("runWorker — 崩溃恢复（心跳停 → 接管，controller ruling�
       throw new Error("must not prompt");
     });
 
-    const skipped = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate });
+    const skipped = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview });
 
     expect(skipped).toEqual({ done: [], blocked: [] });
     expect(adapter.calls).toHaveLength(0);
@@ -638,7 +652,7 @@ describe("runWorker — 崩溃恢复（心跳停 → 接管，controller ruling�
     const taken = await runWorker(cfg(tasksDir, { lockTtlMs: 1_000 }), {
       store: store2,
       adapter: adapter2,
-      acceptance: passGate,
+      acceptance: passGate, review: passReview,
     });
 
     expect(taken).toEqual({ done: [], blocked: ["a"] });
@@ -706,15 +720,17 @@ describe("runWorker — 逐事件日志（Plan Task 9 / ADR-0006 告警）", () 
     });
     const sink = eventSink();
 
-    await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, ...sink });
+    await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview, ...sink });
 
-    expect(sink.events.map((e) => e.type)).toEqual(["claimed", "running", "acceptance", "done"]);
+    expect(sink.events.map((e) => e.type)).toEqual(["claimed", "running", "acceptance", "reviewing", "reviewed", "done"]);
     expect(sink.events[0]).toMatchObject({ type: "claimed", taskId: "a" });
     expect(sink.events[2]).toMatchObject({ type: "acceptance", taskId: "a", detail: "passed" });
-    expect(sink.events[3]).toMatchObject({ type: "done", taskId: "a" });
+    expect(sink.events[3]).toMatchObject({ type: "reviewing", taskId: "a" });
+    expect(sink.events[4]).toMatchObject({ type: "reviewed", taskId: "a", detail: "pass" });
+    expect(sink.events[5]).toMatchObject({ type: "done", taskId: "a" });
   });
 
-  it("missing acceptance requires review instead of silently reaching Done", async () => {
+  it("missing acceptance goes to the reviewer instead of silently reaching Done", async () => {
     const store = FakeStore.seed(task({ acceptance: undefined }));
     const adapter = new FakeAdapter(() => {
       store.requestDone("a");
@@ -722,12 +738,19 @@ describe("runWorker — 逐事件日志（Plan Task 9 / ADR-0006 告警）", () 
     });
     const sink = eventSink();
 
-    // 不注入 acceptance seam：走真 runAcceptance，空命令返回 skipped:true
-    const result = await runWorker(cfg(tasksDir), { store, adapter, ...sink });
+    // 不注入 acceptance seam：空命令返回 skipped，由复核判定（本 fixture 全绿）
+    const result = await runWorker(cfg(tasksDir), { store, adapter, review: passReview, ...sink });
 
-    expect(result).toEqual({ done: [], blocked: ["a"] });
-    expect(store.task("a").status).toBe("blocked");
-    expect(sink.events.map((e) => e.type)).toEqual(["claimed", "running", "acceptance-skipped", "blocked"]);
+    expect(result).toEqual({ done: ["a"], blocked: [] });
+    expect(store.task("a").status).toBe("done");
+    expect(sink.events.map((e) => e.type)).toEqual([
+      "claimed",
+      "running",
+      "acceptance-skipped",
+      "reviewing",
+      "reviewed",
+      "done",
+    ]);
     expect(sink.events[2]!.detail).toBeTruthy(); // 告警带说明
   });
 
@@ -742,7 +765,7 @@ describe("runWorker — 逐事件日志（Plan Task 9 / ADR-0006 告警）", () 
     });
     const sink = eventSink();
 
-    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, ...sink });
+    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview, ...sink });
 
     expect(result).toEqual({ done: ["a"], blocked: [] });
     expect(sink.events.map((e) => e.type)).toEqual([
@@ -750,6 +773,8 @@ describe("runWorker — 逐事件日志（Plan Task 9 / ADR-0006 告警）", () 
       "running",
       "turn-failed",
       "acceptance",
+      "reviewing",
+      "reviewed",
       "done",
     ]);
     expect(sink.events[2]).toMatchObject({ type: "turn-failed", detail: "exit 1" });
@@ -779,10 +804,10 @@ describe("runWorker — 逐事件日志（Plan Task 9 / ADR-0006 告警）", () 
     });
     const sink = eventSink();
 
-    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, ...sink });
+    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview, ...sink });
 
     expect(result).toEqual({ done: ["a"], blocked: [] });
-    expect(sink.events.map((e) => e.type)).toEqual(["claimed", "running", "handoff", "acceptance", "done"]);
+    expect(sink.events.map((e) => e.type)).toEqual(["claimed", "running", "handoff", "acceptance", "reviewing", "reviewed", "done"]);
     expect(sink.events[2]).toMatchObject({ type: "handoff", taskId: "a", detail: "ses-A" });
   });
 

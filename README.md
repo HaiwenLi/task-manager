@@ -47,6 +47,10 @@ npx tsx src/main.ts <子命令> [参数]
 | `acceptanceTimeoutMs` | number | `600000` | 单次验收命令的超时 |
 | `maxSessionsPerTask` | number | `20` | 一个任务全会话链的长度上限（含交接与重试） |
 | `maxTurnsPerSession` | number | `40` | 单会话内工作回合数上限 |
+| `parallel` | number | `2` | 同时执行的任务数；同一工作目录仍只跑一个 |
+| `maxReviewRounds` | number | `2` | 复核失败几轮后 `blocked` |
+| `reviewerModel` | string | 同 `model` | 复核会话单独用的模型，想省钱可以换小的 |
+| `reviewerEffort` | string | 同 `effort` | 复核会话的努力档 |
 | `opencodeBin` | string | `opencode` | opencode 可执行文件。**Windows 下 `.cmd` shim 无法被 `shell:false` 直接启动**，应在本地配置实际 `.exe`，不要提交机器专属路径 |
 
 ## 任务文件
@@ -70,14 +74,45 @@ retries: 0
 | --- | --- | --- |
 | `id` | ✓ | 任务标识；以文件名为准（`tasks/<id>.md` 的 stem），frontmatter 里的副本不作数 |
 | `title` | ✓ | 标题；同时用作 opencode 会话标题 |
-| `status` | ✓ | 生命周期：`open`（待领取）/ `running`（有 worker 持锁执行中）/ `done`（验收通过）/ `blocked`（重试耗尽，需人工介入） |
+| `status` | ✓ | 生命周期：`draft`（等签字）/ `open`（待领取）/ `running`（执行中）/ `review`（复核中）/ `awaiting-human`（等放行）/ `done`（完成）/ `blocked`（需人工介入） |
 | `model` | | 本任务模型（`provider/model`），覆盖配置兜底 |
 | `effort` | | 本任务努力档（如 `high`），覆盖配置兜底 |
-| `acceptance` | | 验收命令（完整 shell 命令行，在 `workdir` 下执行）；退出码 0 且所有权/任务定义/产物一致才可 `done`。缺失或空白 → `blocked` 待审，不消耗重试 |
+| `acceptance` | | 验收命令（完整 shell 命令行，在 `workdir` 下执行）；退出码 0 且所有权/任务定义/产物一致才进入复核。缺失但有 `criteria` 时跳过命令、由复核判定（记录 `acceptance-skipped`）；两者都缺 → `blocked` |
+| `criteria` | | 验收标准列表，`C1 …` 编号；复核逐条判定，这是复核的唯一判据 |
+| `complexity` | | `simple`（不停下等签字）或 `complex`（默认，出稿等签字） |
+| `risk` | | `high` 时复核通过也要人工 `accept` |
+| `workdir` | | 本任务的工作目录（相对配置里的 `workdir`）；同一目录同时只跑一个任务 |
+| `depends_on` | | 依赖的任务 id；全部 `done` 才会被领取，成环直接报错 |
+| `human_check` | | `true` 时无论风险都要人工放行 |
+| `review_rounds` | ✓ | 复核失败次数，由 worker 维护 |
 | `sessions` | ✓ | 会话 id 链（按时间顺序追加），由 worker 维护 |
 | `retries` | ✓ | 失败尝试计数，由 worker 维护 |
 
 辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`acceptance.json`（命令、时间、输出与身份摘要）、`done.requested`（完成请求）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
+
+## 复核流水线
+
+一条任务从想法到可信结果的完整路径（设计见 [ADR-0008](docs/adr/0008-review-stage-and-human-attribution.md)）：
+
+```
+taskctl add "<意图>"        澄清会话出 spec + criteria；complex 停在 draft 等签字
+taskctl spec --task <id>    看稿
+taskctl approve --task <id> 签字 → open
+taskctl run                 并发执行 → 验收命令 → 独立复核 → done / 返工 / 等放行
+taskctl board               总台账（同时重写 .taskctl/board.md，可用浏览器打开）
+taskctl report --task <id>  单任务证据页
+taskctl accept|reject       人工放行或打回（reject 要说明是哪个环节的问题）
+taskctl audit --verdict …   抽查已完成的
+taskctl metrics             哪个环节在拖后腿
+```
+
+要点：
+
+- **复杂度**：意图里明说「简单任务」或加 `--simple` 才会跳过签字；不说就按复杂处理。简单任务同样出 spec，只是不等签字。
+- **复核是独立会话**：新会话、不给执行者的对话，只给 spec、验收命令与结果、产物摘要、交接笔记、日志尾部。输出必须是 JSON；解析不了按 `unclear` 转人工，不会当成失败去重跑。
+- **返工**：复核不过会写一条 `review-failed` 笔记并回到 `open`；连续 `maxReviewRounds` 轮（默认 2）后 `blocked`。
+- **人工节点**：`risk: high`、`human_check: true`、以及复核无法判定的任务停在 `awaiting-human`，只有 `accept` 能放行。
+- **归因**：`reject`/`audit` 都会记录问题出在 `clarify`（标准本身错）、`worker`（没做到）、还是 `reviewer`（漏判），`metrics` 按环节汇总。
 
 ## 运行
 

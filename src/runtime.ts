@@ -29,6 +29,16 @@ export async function readAttempt(tasksDir: string, id: string): Promise<Attempt
   }
 }
 
+/** Read one runtime record; a missing file reads as null. */
+export async function readRuntime<T>(tasksDir: string, id: string, name: string): Promise<T | null> {
+  try {
+    return JSON.parse(await readFile(join(tasksDir, id, name), "utf8")) as T;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
 export async function writeRuntime(tasksDir: string, id: string, name: string, record: unknown): Promise<void> {
   const file = join(tasksDir, id, name);
   const tmp = `${file}.${randomUUID()}.tmp`;
@@ -39,5 +49,8 @@ export async function writeRuntime(tasksDir: string, id: string, name: string, r
 /** Definition only: orchestrator-owned lifecycle fields do not change intent. */
 export function definitionDigest(task: Task): string {
   return createHash("sha256").update(JSON.stringify({ id: task.id, title: task.title,
-    description: task.description, acceptance: task.acceptance, model: task.model, effort: task.effort })).digest("hex");
+    description: task.description, acceptance: task.acceptance, model: task.model, effort: task.effort,
+    // Criteria and the human gate are part of what "done" means: changing them
+    // mid-run must invalidate the acceptance, not silently grandfather it in.
+    criteria: task.criteria, risk: task.risk, humanCheck: task.humanCheck, dependsOn: task.dependsOn })).digest("hex");
 }

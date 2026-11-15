@@ -27,7 +27,7 @@ afterEach(async () => {
 });
 
 async function seed(acceptance?: string) {
-  await writeFile(join(tasks, "a.md"), `---\ntitle: Safe task\nstatus: open\nsessions: []\nretries: 0\n${acceptance === undefined ? "" : `acceptance: ${JSON.stringify(acceptance)}\n`}---\nDo work\n`);
+  await writeFile(join(tasks, "a.md"), `---\ntitle: Safe task\nstatus: open\ncriteria:\n  - C1 ok\nsessions: []\nretries: 0\n${acceptance === undefined ? "" : `acceptance: ${JSON.stringify(acceptance)}\n`}---\nDo work\n`);
 }
 function config(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
   return { tasksDir: tasks, workdir: cwd, agent: "fixture", contextThreshold: .8,
@@ -39,6 +39,15 @@ function adapter(turn: () => Promise<void>): AgentAdapter {
 }
 async function done() { await mkdir(join(tasks, "a"), { recursive: true }); await writeFile(join(tasks, "a", "done.requested"), "done"); }
 const pass = async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "observed" });
+/** Fixture reviewer: every task passes review unless a test overrides it. */
+const passReview = async () => ({
+  verdict: "pass" as const,
+  criteria: [{ id: "C1", pass: true, evidence: "fixture" }],
+  defects: [],
+  summary: "ok",
+});
+/** Every call gets the fixture reviewer; the tests here are about ownership, not review. */
+const run = (c: WorkerConfig, deps: Parameters<typeof runWorker>[1]) => runWorker(c, { review: passReview, ...deps });
 
 describe("review lifecycle safety regressions", () => {
   it("unexpected OpenCode CLI death blocks instead of retrying a possibly surviving backend", async () => {
@@ -47,7 +56,7 @@ describe("review lifecycle safety regressions", () => {
     process.env.TASKCTL_FIXTURE_EXIT = "1";
     const backend = new OpenCodeAdapter({ bin: process.execPath,
       binArgsPrefix: [fileURLToPath(new URL("./fixtures/offline-agent.mjs", import.meta.url))] });
-    expect(await runWorker(config({ lockTtlMs: 5_000, heartbeatMs: 200 }), { store, adapter: backend })).toEqual({ done: [], blocked: ["a"] });
+    expect(await run(config({ lockTtlMs: 5_000, heartbeatMs: 200 }), { store, adapter: backend })).toEqual({ done: [], blocked: ["a"] });
     expect(await readFile(join(cwd, "starts.txt"), "utf8")).toBe("started\n");
     expect((await store.get("a")).retries).toBe(0);
     const record = JSON.parse(await readFile(join(tasks, "a", "attempt.json"), "utf8"));
@@ -59,14 +68,16 @@ describe("review lifecycle safety regressions", () => {
     process.env.TASKCTL_FIXTURE_MARKER = join(tasks, "a", "done.requested");
     const backend = new OpenCodeAdapter({ bin: process.execPath,
       binArgsPrefix: [fileURLToPath(new URL("./fixtures/offline-agent.mjs", import.meta.url))] });
-    expect(await runWorker(config({ lockTtlMs: 5_000, heartbeatMs: 200 }), { store, adapter: backend })).toEqual({ done: ["a"], blocked: [] });
+    expect(await run(config({ lockTtlMs: 5_000, heartbeatMs: 200 }), { store, adapter: backend })).toEqual({ done: ["a"], blocked: [] });
     expect((await store.get("a")).sessions).toEqual(["offline-session"]);
     expect(JSON.parse(await readFile(join(tasks, "a", "attempt.json"), "utf8")).phase).toBe("settled");
   });
-  it("T4: absent acceptance blocks for review instead of accepting", async () => {
+  it("T4: absent acceptance is judged by the reviewer instead of being auto-accepted", async () => {
     await seed();
-    expect(await runWorker(config(), { store, adapter: adapter(done) })).toEqual({ done: [], blocked: ["a"] });
+    expect(await run(config(), { store, adapter: adapter(done) })).toEqual({ done: ["a"], blocked: [] });
     expect((await store.get("a")).retries).toBe(0);
+    const evidence = JSON.parse(await readFile(join(tasks, "a", "acceptance.json"), "utf8"));
+    expect(evidence.skipped).toBe(true);
   });
   it("T3: replacement owner during acceptance prevents Done and all stale mutations", async () => {
     await seed("check");
@@ -74,7 +85,7 @@ describe("review lifecycle safety regressions", () => {
       await writeFile(join(tasks, "a", "lock.json"), JSON.stringify({ worker: "successor", heartbeat: Date.now() }));
       return pass();
     };
-    expect(await runWorker(config(), { store, adapter: adapter(done), acceptance })).toEqual({ done: [], blocked: [] });
+    expect(await run(config(), { store, adapter: adapter(done), acceptance })).toEqual({ done: [], blocked: [] });
     expect((await store.get("a")).status).toBe("running");
     expect(JSON.parse(await readFile(join(tasks, "a", "lock.json"), "utf8")).worker).toBe("successor");
   });
@@ -86,33 +97,33 @@ describe("review lifecycle safety regressions", () => {
       duplicate = await claim(tasks, "a", "contender", 100);
       await done();
     });
-    expect(await runWorker(config(), { store, adapter: a, acceptance: pass })).toEqual({ done: ["a"], blocked: [] });
+    expect(await run(config(), { store, adapter: a, acceptance: pass })).toEqual({ done: ["a"], blocked: [] });
     expect(duplicate).toBe(false);
   });
   it("T2: an uncancellable timed-out turn is never retried, including after restart", async () => {
     await seed("check");
     let calls = 0;
     const a = adapter(async () => { calls++; await new Promise<void>(() => {}); });
-    expect(await runWorker(config({ turnTimeoutMs: 20 }), { store, adapter: a })).toEqual({ done: [], blocked: ["a"] });
+    expect(await run(config({ turnTimeoutMs: 20 }), { store, adapter: a })).toEqual({ done: [], blocked: ["a"] });
     expect(calls).toBe(1);
     await store.setStatus("a", "open");
-    expect(await runWorker(config(), { store, adapter: a })).toEqual({ done: [], blocked: ["a"] });
+    expect(await run(config(), { store, adapter: a })).toEqual({ done: [], blocked: ["a"] });
     expect(calls).toBe(1);
   });
   it("definition drift during acceptance invalidates completion", async () => {
     await seed("check");
     const acceptance = async () => { const f = join(tasks, "a.md"); await writeFile(f, (await readFile(f, "utf8")).replace("Do work", "Different work")); return pass(); };
-    expect(await runWorker(config(), { store, adapter: adapter(done), acceptance })).toEqual({ done: [], blocked: ["a"] });
+    expect(await run(config(), { store, adapter: adapter(done), acceptance })).toEqual({ done: [], blocked: ["a"] });
     expect((await store.get("a")).description).toContain("Different work");
   });
   it("artifact mutation during acceptance invalidates completion", async () => {
     await seed("check");
     const acceptance = async () => { await writeFile(join(cwd, "changed.txt"), "new"); return pass(); };
-    expect(await runWorker(config(), { store, adapter: adapter(done), acceptance })).toEqual({ done: [], blocked: ["a"] });
+    expect(await run(config(), { store, adapter: adapter(done), acceptance })).toEqual({ done: [], blocked: ["a"] });
   });
   it("persists successful check evidence bound to an attempt and artifact", async () => {
     await seed("check");
-    expect(await runWorker(config(), { store, adapter: adapter(done), acceptance: pass })).toEqual({ done: ["a"], blocked: [] });
+    expect(await run(config(), { store, adapter: adapter(done), acceptance: pass })).toEqual({ done: ["a"], blocked: [] });
     const evidence = JSON.parse(await readFile(join(tasks, "a", "acceptance.json"), "utf8"));
     expect(evidence).toMatchObject({ command: "check", passed: true, output: "observed" });
     expect(evidence.attemptId).toBeTruthy();
@@ -137,7 +148,7 @@ describe("review lifecycle safety regressions", () => {
         } };
       },
     };
-    expect(await runWorker(config({ turnTimeoutMs: 40 }), { store, adapter: a, acceptance: pass })).toEqual({ done: ["a"], blocked: [] });
+    expect(await run(config({ turnTimeoutMs: 40 }), { store, adapter: a, acceptance: pass })).toEqual({ done: ["a"], blocked: [] });
     expect(calls).toBe(2); expect(maxActive).toBe(1); expect(active).toBe(0);
     expect((await store.get("a")).retries).toBe(1);
   });
@@ -145,7 +156,7 @@ describe("review lifecycle safety regressions", () => {
     await seed("check"); await mkdir(join(tasks, "a"));
     await writeFile(join(tasks, "a", "attempt.json"), JSON.stringify({ attemptId: "interrupted", phase: "active", operation: "agent turn", workspace: cwd, backend: "fixture" }));
     let calls = 0;
-    expect(await runWorker(config(), { store, adapter: adapter(async () => { calls++; }) })).toEqual({ done: [], blocked: ["a"] });
+    expect(await run(config(), { store, adapter: adapter(async () => { calls++; }) })).toEqual({ done: [], blocked: ["a"] });
     expect(calls).toBe(0);
   });
   it("lease loss cancels an active turn and prevents session/retry/final writes", async () => {
@@ -164,7 +175,7 @@ describe("review lifecycle safety regressions", () => {
         } };
       },
     };
-    expect(await runWorker(config(), { store, adapter: a, acceptance: pass })).toEqual({ done: [], blocked: [] });
+    expect(await run(config(), { store, adapter: a, acceptance: pass })).toEqual({ done: [], blocked: [] });
     expect(cancelled).toBe(true);
     expect(await store.get("a")).toMatchObject({ status: "running", sessions: [], retries: 0 });
     expect(JSON.parse(await readFile(join(tasks, "a", "lock.json"), "utf8")).worker).toBe("successor");

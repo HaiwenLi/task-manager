@@ -4,12 +4,21 @@ import { LOCK_TTL_MS_DEFAULT } from "./claim.js";
 import { latestNote, writeNote } from "./handoff.js";
 import { TaskStore } from "./task-store.js";
 import { runWorker, type WorkerConfig } from "./worker.js";
+import { runScheduler } from "./scheduler.js";
 import { OpenCodeAdapter } from "./adapters/opencode.js";
 import type { AgentAdapter } from "./adapters/types.js";
+import { serializeTaskFile, type Task } from "./task-file.js";import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, type TaskType } from "./intake.js";
+import { extractCriteria, readSpec, writeSpec } from "./spec.js";
+import { appendJournal } from "./journal.js";
+import type { AcceptanceResult } from "./acceptance.js";
+import { renderBoardMarkdown, renderBoardTable, writeBoard } from "./board.js";
+import { buildReport } from "./report.js";
+import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
 
-/** Injection seams for tests: adapter (for `run`), clock (for `done`), output. */
+/** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
 export type CliDeps = {
   adapter?: AgentAdapter;
+  acceptance?: (command: string, cwd: string) => Promise<AcceptanceResult>;
   now?: () => Date;
   log?: (line: string) => void;
   err?: (line: string) => void;
@@ -23,10 +32,19 @@ class UsageError extends Error {}
 
 const USAGE = [
   "usage:",
+  "  taskctl add \"<意图>\" [--type code|office|research|design] [--simple] [--id <id>] [--config taskctl.json]",
+  "  taskctl spec --task <id> [--tasks-dir <dir>]",
+  "  taskctl approve --task <id> [--tasks-dir <dir>]",
   "  taskctl run [--config taskctl.json]",
   "  taskctl done --task <id> [--tasks-dir <dir>]",
   "  taskctl note --task <id> --status <s> --done <d> --found <f> --next <n> [--files <a,b>] [--tasks-dir <dir>]",
   "  taskctl status [--tasks-dir <dir>]",
+  "  taskctl board [--all] [--json] [--tasks-dir <dir>]",
+  "  taskctl report --task <id> [--tasks-dir <dir>]",
+  "  taskctl accept --task <id> [--tasks-dir <dir>]",
+  "  taskctl reject --task <id> --reason \"…\" [--stage clarify|worker|reviewer] [--tasks-dir <dir>]",
+  "  taskctl audit --task <id> --verdict pass|fail [--stage …] [--note \"…\"] [--tasks-dir <dir>]",
+  "  taskctl metrics [--tasks-dir <dir>]",
 ].join("\n");
 
 /** Marker file the `done` subcommand writes; mirrors task-store's DONE_MARKER. */
@@ -34,6 +52,15 @@ const DONE_MARKER = "done.requested";
 
 /** Default `--tasks-dir` for the agent-facing subcommands (matches the protocol copy). */
 const TASKS_DIR_DEFAULT = "tasks";
+
+/** `--tasks-dir`, else `taskctl.json`'s `tasksDir`, else `tasks`. */
+async function tasksDirFor(flags: Map<string, string>): Promise<string> {
+  const explicit = flags.get("tasks-dir");
+  if (explicit !== undefined) {
+    return explicit;
+  }
+  return resolveConfig(await readConfig(flags.get("config") ?? "taskctl.json"), "taskctl.json").tasksDir;
+}
 
 /**
  * Parse argv and run one subcommand. Hand-rolled `--flag value` parsing —
@@ -62,18 +89,27 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
   if (command === undefined) {
     throw new UsageError("missing command");
   }
-  if (positionals.length > 0) {
+  if (positionals.length > 0 && command !== "add") {
     throw new UsageError(`unexpected argument "${positionals[0]}"`);
   }
   switch (command) {
+    case "add":
+      checkFlags(command, flags, ["type", "simple", "id", "config", "risk", "workdir", "tasks-dir", "acceptance"], []);
+      return addCommand(positionals, flags, deps, log);
+    case "spec":
+      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
+      return specCommand(flags, log);
+    case "approve":
+      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
+      return approveCommand(flags, log);
     case "run":
       checkFlags(command, flags, ["config"], []);
       return runCommand(flags, deps, log);
     case "done":
-      checkFlags(command, flags, ["task", "tasks-dir"], ["task"]);
+      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return doneCommand(flags, deps, log);
     case "note":
-      checkFlags(command, flags, ["task", "status", "done", "found", "next", "files", "tasks-dir"], [
+      checkFlags(command, flags, ["task", "status", "done", "found", "next", "files", "tasks-dir", "config"], [
         "task",
         "status",
         "done",
@@ -82,8 +118,26 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
       ]);
       return noteCommand(flags, log);
     case "status":
-      checkFlags(command, flags, ["tasks-dir"], []);
+      checkFlags(command, flags, ["tasks-dir", "config"], []);
       return statusCommand(flags, log);
+    case "board":
+      checkFlags(command, flags, ["tasks-dir", "config", "all", "json"], []);
+      return boardCommand(flags, log);
+    case "report":
+      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
+      return reportCommand(flags, log);
+    case "accept":
+      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
+      return acceptCommand(flags, log);
+    case "reject":
+      checkFlags(command, flags, ["task", "reason", "stage", "tasks-dir", "config"], ["task", "reason"]);
+      return rejectCommand(flags, log);
+    case "audit":
+      checkFlags(command, flags, ["task", "verdict", "stage", "note", "tasks-dir", "config"], ["task", "verdict"]);
+      return auditCommand(flags, log);
+    case "metrics":
+      checkFlags(command, flags, ["tasks-dir", "config"], []);
+      return metricsCommand(flags, log);
     default:
       throw new UsageError(`unknown command "${command}"`);
   }
@@ -95,19 +149,163 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   const cfg = resolveConfig(await readConfig(configPath), configPath);
   const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
   const store = new TaskStore(cfg.tasksDir);
+  // The board is rewritten on every event, so a browser watching board.md sees
+  // tasks move while the run is still going. Writes are chained, never racing.
+  let boardJob: Promise<unknown> = Promise.resolve();
+  const refreshBoard = (): void => {
+    boardJob = boardJob.then(() => refreshBoardFile(cfg.tasksDir)).catch(() => {});
+  };
+  refreshBoard();
   // Plan Task 9：逐事件打印 [task] 状态 单行日志 —— 事件发生即输出，
   // 而不是整队跑完再补一份总结
-  await runWorker(cfg, {
+  await runScheduler(cfg, {
     store,
     adapter,
-    onEvent: (evt) => log(`[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`),
+    ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
+    onEvent: (evt) => {
+      log(`[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`);
+      refreshBoard();
+    },
   });
+  refreshBoard();
+  await boardJob;
+  return 0;
+}
+
+/** Rewrite the board from disk state; safe to call at any point. */
+async function refreshBoardFile(tasksDir: string): Promise<void> {
+  const tasks = await new TaskStore(tasksDir).list();
+  const notes = await boardNotes(tasksDir, tasks);
+  const highlighted = new Set(
+    (await readAudits(tasksDir)).filter((record) => record.verdict === "pass" && record.highlight === true).map((record) => record.task),
+  );
+  await writeBoard(tasksDir, renderBoardMarkdown(tasks, { all: false, notes, highlighted, now: new Date() }));
+}
+
+/** `taskctl add "<intent>"` — capture the intent, draft the spec, gate the state. */
+async function addCommand(
+  positionals: string[],
+  flags: Map<string, string>,
+  deps: CliDeps,
+  log: (line: string) => void,
+): Promise<number> {
+  const intent = positionals.join(" ").trim();
+  if (intent.length === 0) {
+    throw new UsageError("add requires the intent as an argument");
+  }
+  const configPath = flags.get("config") ?? "taskctl.json";
+  const cfg = resolveConfig(await readConfig(configPath), configPath);
+  const tasksDir = flags.get("tasks-dir") ? resolve(flags.get("tasks-dir")!) : cfg.tasksDir;
+  await mkdir(tasksDir, { recursive: true });
+  const store = new TaskStore(tasksDir);
+  const id = flags.get("id") ?? (await nextTaskId(tasksDir, intent));
+  const type = parseType(flags.get("type") ?? detectType(intent));
+  const complexity = flags.has("simple") ? "simple" : detectComplexity(intent);
+  const workdir = flags.get("workdir");
+  const acceptance = flags.get("acceptance");
+  const task: Task = {
+    id,
+    title: firstLine(intent).slice(0, 80),
+    description: intent,
+    status: "draft",
+    criteria: [],
+    complexity,
+    risk: flags.get("risk") === "high" ? "high" : "normal",
+    ...(workdir !== undefined && { workdir }),
+    ...(acceptance !== undefined && { acceptance }),
+    dependsOn: [],
+    humanCheck: false,
+    reviewRounds: 0,
+    sessions: [],
+    retries: 0,
+  };
+  await writeFile(join(tasksDir, `${id}.md`), serializeTaskFile(task), { encoding: "utf8", flag: "wx" });
+
+  const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+  const prompt = buildClarifyPrompt({ task, type, profile: null });
+  const result = await adapter.prompt({
+    text: prompt,
+    cwd: cfg.workdir,
+    model: cfg.model,
+    effort: cfg.effort,
+    title: task.title,
+  });
+  if (result.exitCode !== 0) {
+    await appendJournal(tasksDir, id, { stage: "clarify", event: "clarify-failed", detail: `exit ${result.exitCode}` });
+    log(`${id}  draft  clarify-failed`);
+    return 1;
+  }
+  const specText = stripFence(result.text).trim();
+  if (specText.length === 0) {
+    await appendJournal(tasksDir, id, { stage: "clarify", event: "clarify-failed", detail: "empty spec" });
+    log(`${id}  draft  clarify-failed`);
+    return 1;
+  }
+  await writeSpec(tasksDir, id, specText);
+  let criteria: string[];
+  try {
+    criteria = extractCriteria(specText);
+  } catch (err) {
+    await appendJournal(tasksDir, id, {
+      stage: "clarify",
+      event: "spec-invalid",
+      detail: err instanceof Error ? err.message : String(err),
+    });
+    log(`${id}  draft  spec-invalid`);
+    return 1;
+  }
+  await store.updateFields(id, { criteria });
+  if (complexity === "simple") {
+    await store.setStatus(id, "open");
+  }
+  await appendJournal(tasksDir, id, {
+    stage: "clarify",
+    event: "spec-drafted",
+    detail: `criteria=${criteria.length}`,
+  });
+  log(`${id}  ${complexity === "simple" ? "open" : "draft"}  criteria=${criteria.length}`);
+  return 0;
+}
+
+/** `taskctl spec --task <id>` — print the draft spec a human is signing off. */
+async function specCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const spec = await readSpec(tasksDir, flags.get("task")!);
+  for (const line of (spec ?? "(no spec)").split(/\r?\n/)) {
+    log(line);
+  }
+  return 0;
+}
+
+/** `taskctl approve --task <id>` — the only way a draft becomes runnable. */
+async function approveCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const id = flags.get("task")!;
+  const store = new TaskStore(tasksDir);
+  const task = await store.get(id);
+  if (task.status !== "draft") {
+    throw new Error(`task ${id} is ${task.status}, expected draft`);
+  }
+  let criteria = task.criteria;
+  if (criteria.length === 0) {
+    // The natural fix is "edit spec.md, then approve": import instead of
+    // demanding the frontmatter be hand-edited.
+    const spec = await readSpec(tasksDir, id);
+    if (spec === null) {
+      throw new Error(`task ${id} has no criteria and no spec; re-run taskctl add to draft one`);
+    }
+    criteria = extractCriteria(spec);
+    await store.updateFields(id, { criteria });
+  }
+  await store.setStatus(id, "open");
+  await appendJournal(tasksDir, id, { stage: "human", event: "approved", detail: `criteria=${criteria.length}` });
+  log(`${id}  open  approved`);
   return 0;
 }
 
 /** `taskctl done --task <id>` — write the marker the worker polls for. */
 async function doneCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
-  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasksDir = await tasksDirFor(flags);
   const id = flags.get("task")!;
   await mkdir(join(tasksDir, id), { recursive: true });
   const marker = join(tasksDir, id, DONE_MARKER);
@@ -118,7 +316,7 @@ async function doneCommand(flags: Map<string, string>, deps: CliDeps, log: (line
 
 /** `taskctl note …` — append the next numbered handoff note, print its path. */
 async function noteCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
-  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasksDir = await tasksDirFor(flags);
   const files = (flags.get("files") ?? "")
     .split(",")
     .map((file) => file.trim())
@@ -139,7 +337,7 @@ async function noteCommand(flags: Map<string, string>, log: (line: string) => vo
 
 /** `taskctl status` — one table row per task. */
 async function statusCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
-  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasksDir = await tasksDirFor(flags);
   const store = new TaskStore(tasksDir);
   const tasks = await store.list();
   const rows: string[][] = [["id", "status", "retries", "sessions", "note"]];
@@ -159,6 +357,145 @@ async function statusCommand(flags: Map<string, string>, log: (line: string) => 
   return 0;
 }
 
+/** Flags that stand alone, with no value token after them. */
+const BOOLEAN_FLAGS = new Set(["simple", "all", "apply", "json"]);
+
+/** `taskctl board` — rewrite `.taskctl/board.md` and print the same content as a table. */
+async function boardCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const tasks = await new TaskStore(tasksDir).list();
+  const notes = await boardNotes(tasksDir, tasks);
+  const highlighted = new Set(
+    (await readAudits(tasksDir)).filter((record) => record.verdict === "pass" && record.highlight === true).map((record) => record.task),
+  );
+  const now = new Date();
+  const options = { all: flags.has("all"), notes, highlighted, now };
+  if (flags.has("json")) {
+    const payload = tasks.map((task) => ({ id: task.id, status: task.status, complexity: task.complexity, note: notes.get(task.id) ?? null, highlighted: highlighted.has(task.id) }));
+    for (const line of JSON.stringify(payload, null, 2).split("\n")) log(line);
+    return 0;
+  }
+  const path = await writeBoard(tasksDir, renderBoardMarkdown(tasks, options));
+  for (const line of renderBoardTable(tasks, options)) log(line);
+  log("");
+  log(path);
+  return 0;
+}
+
+/** Where each task is stuck, from its latest handoff note or its status. */
+async function boardNotes(tasksDir: string, tasks: Task[]): Promise<Map<string, string>> {
+  const notes = new Map<string, string>();
+  for (const task of tasks) {
+    const note = await latestNote(tasksDir, task.id);
+    const fromNote = note === null ? "-" : statusLineFromNote(note.markdown);
+    if (fromNote !== "-") {
+      notes.set(task.id, fromNote);
+      continue;
+    }
+    const fallback: Record<string, string> = {
+      draft: "等签字",
+      "awaiting-human": "等放行",
+      review: "复核中",
+      running: "执行中",
+      open: "排队",
+      blocked: "已阻塞",
+      done: "完成",
+    };
+    notes.set(task.id, fallback[task.status] ?? task.status);
+  }
+  return notes;
+}
+
+/** `taskctl report --task <id>` — one page of evidence for a human spot check. */
+async function reportCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  for (const line of await buildReport(tasksDir, flags.get("task")!)) {
+    log(line);
+  }
+  return 0;
+}
+
+/** `taskctl accept --task <id>` — a human signs off a reviewed task. */
+async function acceptCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const id = flags.get("task")!;
+  const store = new TaskStore(tasksDir);
+  const task = await store.get(id);
+  if (task.status !== "awaiting-human") {
+    throw new Error(`task ${id} is ${task.status}, expected awaiting-human`);
+  }
+  await store.setStatus(id, "done");
+  await appendJournal(tasksDir, id, { stage: "human", event: "accepted" });
+  await appendAudit(tasksDir, { task: id, at: new Date().toISOString(), verdict: "pass", stage: "none", highlight: true });
+  log(`${id}  done  accepted`);
+  return 0;
+}
+
+/** `taskctl reject --task <id> --reason …` — a human sends work back and names the failing stage. */
+async function rejectCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const id = flags.get("task")!;
+  const reason = flags.get("reason")!;
+  const stage = parseStage(flags.get("stage") ?? "reviewer");
+  const store = new TaskStore(tasksDir);
+  const task = await store.get(id);
+  if (task.status !== "awaiting-human") {
+    throw new Error(`task ${id} is ${task.status}, expected awaiting-human`);
+  }
+  const seq = ((await latestNote(tasksDir, id))?.seq ?? 0) + 1;
+  await writeNote(tasksDir, { task: id, seq, status: "rejected", done: "人工放行未通过", found: reason, next: reason, files: [] });
+  await store.setStatus(id, "open");
+  await appendJournal(tasksDir, id, { stage: "human", event: "rejected", detail: `stage=${stage} ${reason}` });
+  await appendAudit(tasksDir, { task: id, at: new Date().toISOString(), verdict: "fail", stage, note: reason });
+  log(`${id}  open  rejected (stage=${stage})`);
+  return 0;
+}
+
+/** `taskctl audit --task <id> --verdict pass|fail` — a spot check; it never changes task status. */
+async function auditCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const id = flags.get("task")!;
+  const verdict = flags.get("verdict");
+  if (verdict !== "pass" && verdict !== "fail") {
+    throw new UsageError(`--verdict must be pass or fail`);
+  }
+  const store = new TaskStore(tasksDir);
+  const task = await store.get(id);
+  if (task.status !== "done") {
+    throw new Error(`task ${id} is ${task.status}, only done tasks can be audited`);
+  }
+  const stage = parseStage(flags.get("stage") ?? (verdict === "pass" ? "none" : "reviewer"));
+  const note = flags.get("note");
+  await appendAudit(tasksDir, {
+    task: id,
+    at: new Date().toISOString(),
+    verdict,
+    stage,
+    ...(note === undefined ? {} : { note }),
+    ...(verdict === "pass" ? { highlight: true } : {}),
+  });
+  log(`${id}  audit ${verdict}  stage=${stage}`);
+  return 0;
+}
+
+/** `taskctl metrics` — which stage keeps failing. */
+async function metricsCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const tasks = await new TaskStore(tasksDir).list();
+  for (const line of summarizeAudits(await readAudits(tasksDir), tasks)) {
+    log(line);
+  }
+  return 0;
+}
+
+function parseStage(value: string): AuditStage {
+  const allowed: AuditStage[] = ["clarify", "worker", "reviewer", "none"];
+  if (!allowed.includes(value as AuditStage)) {
+    throw new UsageError(`unknown stage "${value}" (expected one of: ${allowed.join(", ")})`);
+  }
+  return value as AuditStage;
+}
+
 /** `--flag value` tokens into a map; bare tokens become positionals. */
 function parseArgs(argv: string[]): { command?: string; positionals: string[]; flags: Map<string, string> } {
   const positionals: string[] = [];
@@ -166,16 +503,40 @@ function parseArgs(argv: string[]): { command?: string; positionals: string[]; f
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i]!;
     if (token.startsWith("--")) {
+      const name = token.slice(2);
+      if (BOOLEAN_FLAGS.has(name)) {
+        flags.set(name, "true");
+        continue;
+      }
       const value = argv[++i];
       if (value === undefined) {
         throw new UsageError(`option ${token} requires a value`);
       }
-      flags.set(token.slice(2), value);
+      flags.set(name, value);
     } else {
       positionals.push(token);
     }
   }
   return { command: positionals.shift(), positionals, flags };
+}
+
+function parseType(value: string): TaskType {
+  const allowed: TaskType[] = ["code", "office", "research", "design"];
+  if (!allowed.includes(value as TaskType)) {
+    throw new UsageError(`unknown task type "${value}" (expected one of: ${allowed.join(", ")})`);
+  }
+  return value as TaskType;
+}
+
+/** First non-empty line, used as the task title. */
+function firstLine(text: string): string {
+  return text.split(/\r?\n/).find((line) => line.trim().length > 0)?.trim() ?? "task";
+}
+
+/** Models like to wrap a whole answer in one fence; unwrap that single wrapper. */
+function stripFence(text: string): string {
+  const match = /^```[a-zA-Z]*\r?\n([\s\S]*?)\r?\n```\s*$/.exec(text.trim());
+  return match ? match[1]! : text;
 }
 
 /** Reject unknown flags, then require the mandatory ones. */
@@ -230,11 +591,15 @@ const CONFIG_KEYS = new Set([
   "acceptanceTimeoutMs",
   "maxSessionsPerTask",
   "maxTurnsPerSession",
+  "maxReviewRounds",
+  "reviewerModel",
+  "reviewerEffort",
+  "parallel",
   "opencodeBin",
 ]);
 
 /** Merge config file over the defaults; every present field is validated. */
-function resolveConfig(raw: Record<string, unknown>, path: string): ResolvedConfig {
+export function resolveConfig(raw: Record<string, unknown>, path: string): ResolvedConfig {
   for (const key of Object.keys(raw)) {
     if (!CONFIG_KEYS.has(key)) {
       throw new Error(`config ${path}: unknown field "${key}"`);
@@ -258,6 +623,10 @@ function resolveConfig(raw: Record<string, unknown>, path: string): ResolvedConf
     acceptanceTimeoutMs: number(raw, "acceptanceTimeoutMs", path),
     maxSessionsPerTask: integer(raw, "maxSessionsPerTask", path),
     maxTurnsPerSession: integer(raw, "maxTurnsPerSession", path),
+    maxReviewRounds: integer(raw, "maxReviewRounds", path),
+    reviewerModel: string(raw, "reviewerModel", path),
+    reviewerEffort: string(raw, "reviewerEffort", path),
+    parallel: integer(raw, "parallel", path),
     opencodeBin: string(raw, "opencodeBin", path),
   };
 }

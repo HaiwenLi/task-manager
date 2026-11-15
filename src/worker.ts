@@ -8,12 +8,16 @@ import type { Task } from "./task-file.js";
 import type { AgentAdapter } from "./adapters/types.js";
 import type { Execution } from "./execution.js";
 import { reserveWorkspace, artifactDigest, type WorkspaceReservation } from "./workspace.js";
-import { definitionDigest, readAttempt, writeRuntime, type AttemptRecord } from "./runtime.js";
+import { definitionDigest, readAttempt, readRuntime, writeRuntime, type AttemptRecord } from "./runtime.js";
+import { readSpec } from "./spec.js";
+import { appendJournal, journalTail } from "./journal.js";
+import { startReview, type ReviewEvidence, type ReviewResult } from "./review.js";
 
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
 export const ACCEPTANCE_TIMEOUT_MS_DEFAULT = 10 * 60_000;
 export const MAX_SESSIONS_PER_TASK_DEFAULT = 20;
 export const MAX_TURNS_PER_SESSION_DEFAULT = 40;
+export const MAX_REVIEW_ROUNDS_DEFAULT = 2;
 export const WRAP_UP_INSTRUCTION = "上下文预算告急。请立即运行一次 taskctl note（详尽记录进展），然后只回复 HANDOFF_READY";
 
 export type WorkerConfig = {
@@ -21,16 +25,24 @@ export type WorkerConfig = {
   contextThreshold: number; retryLimit: number; lockTtlMs: number; heartbeatMs: number;
   turnTimeoutMs?: number; acceptanceTimeoutMs?: number;
   maxSessionsPerTask?: number; maxTurnsPerSession?: number;
+  /** Failed review rounds allowed before a task blocks. */
+  maxReviewRounds?: number;
+  /** Optional separate model/effort for the reviewer session. */
+  reviewerModel?: string; reviewerEffort?: string;
+  /** How many tasks the scheduler may run at once (default 2). */
+  parallel?: number;
 };
-export type WorkerStore = Pick<TaskStore, "list" | "setStatus" | "appendSession" | "incRetries" | "readDoneMarker" | "clearDoneMarker">;
+export type WorkerStore = Pick<TaskStore, "list" | "setStatus" | "appendSession" | "incRetries" | "readDoneMarker" | "clearDoneMarker" | "incReviewRounds">;
 export type WorkerDeps = {
   store: WorkerStore; adapter: AgentAdapter;
   acceptance?: (command: string, cwd: string) => Promise<AcceptanceResult>;
+  /** Test seam: judge the evidence without starting an agent session. */
+  review?: (evidence: ReviewEvidence) => Promise<ReviewResult>;
   onEvent?: (evt: WorkerEvent) => void;
 };
-export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "acceptance" | "acceptance-skipped" | "done" | "blocked" | "ownership-lost";
+export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
-export type TaskOutcome = "done" | "blocked" | "skipped";
+export type TaskOutcome = "done" | "blocked" | "skipped" | "open" | "awaiting-human";
 export class WorkerTimeoutError extends Error {}
 class UncertainExecutionError extends Error {}
 class ReviewRequiredError extends Error {}
@@ -214,7 +226,7 @@ async function turn(r: Run, text: string, sessionId?: string) {
   }
 }
 
-async function loop(r: Run): Promise<"done" | "blocked"> {
+async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
   let sessionId: string | undefined;
   let recordedSession = "", sessionsUsed = r.task.sessions.length, turns = 0;
   for (;;) {
@@ -259,9 +271,23 @@ async function loop(r: Run): Promise<"done" | "blocked"> {
   }
 }
 
-async function accept(r: Run): Promise<"done" | "blocked" | "retry"> {
+async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "awaiting-human"> {
   const command = r.task.acceptance?.trim();
-  if (!command) { emit(r, "acceptance-skipped", "missing acceptance requires review"); throw new ReviewRequiredError("missing acceptance criteria; review required"); }
+  if (!command) {
+    // No command and no criteria: nothing can judge this task, so it waits for
+    // a human. With criteria, the reviewer is the gate — office, design and
+    // research tasks rarely have a shell command that means "done".
+    if (r.task.criteria.length === 0) {
+      emit(r, "acceptance-skipped", "missing acceptance requires review");
+      throw new ReviewRequiredError("missing acceptance criteria; review required");
+    }
+    emit(r, "acceptance-skipped", "no command; review-only");
+    await owned(r, () => writeRuntime(r.cfg.tasksDir, r.task.id, "acceptance.json", {
+      command: "(none)", passed: false, skipped: true, exitCode: null,
+      note: "no acceptance command; review decides", at: new Date().toISOString(),
+    }));
+    return await reviewStage(r);
+  }
   const artifactBefore = await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir]);
   const startedAt = new Date().toISOString();
   let result: AcceptanceResult;
@@ -274,7 +300,9 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry"> {
   }
   const artifactAfter = await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir]);
   // All controller writers use the same mutex as takeover for final validation/write.
-  return owned(r, async () => {
+  // The review runs outside this guard: it takes the same mutex for its own
+  // writes, and nesting would deadlock the task against itself.
+  const outcome = await owned(r, async (): Promise<"review" | "blocked" | "retry"> => {
     const current = (await r.deps.store.list()).find(t => t.id === r.task.id);
     const definitionMatches = !!current && current.status === "running" && definitionDigest(current) === r.definition;
     const evidence = { attemptId: r.owner, definitionDigest: r.definition, artifactBefore, artifactAfter, command,
@@ -283,7 +311,7 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry"> {
     if (!definitionMatches || artifactBefore !== artifactAfter || result.skipped) throw new ReviewRequiredError("acceptance evidence invalidated by definition/artifact drift or skipped check");
     emit(r, "acceptance", result.passed ? "passed" : `failed (exit ${result.exitCode ?? "null"})`);
     if (result.passed) {
-      await r.deps.store.setStatus(r.task.id, "done"); emit(r, "done"); return "done";
+      return "review";
     }
     const retries = await r.deps.store.incRetries(r.task.id);
     if (retries >= r.cfg.retryLimit) {
@@ -291,6 +319,126 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry"> {
     }
     return "retry";
   });
+  if (outcome === "review") {
+    return await reviewStage(r);
+  }
+  return outcome;
+}
+
+/**
+ * The independent review gate. It runs in its own session, sees only written
+ * evidence, and can never mark work done on its own when the task has no
+ * criteria, is high risk, or asks for a human sign-off.
+ */
+async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
+  const id = r.task.id;
+  if (r.task.criteria.length === 0) {
+    await owned(r, () => r.deps.store.setStatus(id, "awaiting-human"));
+    emit(r, "awaiting-human", "no acceptance criteria to review");
+    return "awaiting-human";
+  }
+  const acceptance = await readRuntime<Record<string, unknown>>(r.cfg.tasksDir, id, "acceptance.json");
+  const evidence: ReviewEvidence = {
+    task: r.task,
+    spec: (await readSpec(r.cfg.tasksDir, id)) ?? "",
+    acceptanceMarkdown: acceptance === null ? "" : renderAcceptance(acceptance),
+    handoff: (await latestNote(r.cfg.tasksDir, id))?.markdown ?? null,
+    journal: await journalTail(r.cfg.tasksDir, id, 30),
+  };
+  emit(r, "reviewing");
+  await owned(r, async () => {
+    await r.deps.store.setStatus(id, "review");
+    await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "started", detail: `criteria=${r.task.criteria.length}` });
+  });
+  const result = await controlled(r, "review", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT, () =>
+    r.deps.review
+      ? legacyExecution(() => r.deps.review!(evidence))
+      : startReview({
+          adapter: r.deps.adapter,
+          cwd: r.cfg.workdir,
+          model: r.cfg.reviewerModel,
+          effort: r.cfg.reviewerEffort,
+          title: r.task.title,
+        }, evidence),
+  );
+  await owned(r, async () => {
+    await writeRuntime(r.cfg.tasksDir, id, "review.json", { ...result, at: new Date().toISOString() });
+    await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "verdict", detail: result.verdict });
+  });
+  emit(r, "reviewed", result.verdict);
+
+  if (result.verdict === "unclear") {
+    await owned(r, () => r.deps.store.setStatus(id, "awaiting-human"));
+    emit(r, "awaiting-human", "review could not decide");
+    return "awaiting-human";
+  }
+  if (result.verdict === "pass") {
+    if (r.task.risk === "high" || r.task.humanCheck) {
+      await owned(r, () => r.deps.store.setStatus(id, "awaiting-human"));
+      emit(r, "awaiting-human", "review passed; human sign-off required");
+      return "awaiting-human";
+    }
+    await owned(r, async () => {
+      await r.deps.store.setStatus(id, "done");
+      await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "done", detail: "passed" });
+    });
+    emit(r, "done", "review passed");
+    return "done";
+  }
+
+  // Verdict is `fail`: spend a review round, or block once rounds are exhausted.
+  const rounds = await owned(r, () => r.deps.store.incReviewRounds(id));
+  const limit = r.cfg.maxReviewRounds ?? MAX_REVIEW_ROUNDS_DEFAULT;
+  if (rounds > limit) {
+    await owned(r, async () => {
+      await r.deps.store.setStatus(id, "blocked");
+      await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "blocked", detail: `${rounds}/${limit}` });
+    });
+    emit(r, "blocked", `review rounds exhausted (${rounds}/${limit})`);
+    return "blocked";
+  }
+  const seq = ((await latestNote(r.cfg.tasksDir, id))?.seq ?? 0) + 1;
+  await owned(r, async () => {
+    await writeNote(r.cfg.tasksDir, reviewNote(r.task, seq, result));
+    await r.deps.store.setStatus(id, "open");
+    await appendJournal(r.cfg.tasksDir, id, {
+      stage: "review",
+      event: "rework",
+      detail: `round ${rounds}: ${result.defects.join("; ") || result.summary}`,
+    });
+  });
+  emit(r, "rework", `round ${rounds}: ${result.defects.join("; ") || result.summary}`);
+  return "open";
+}
+
+/** One line per acceptance fact the reviewer may rely on. */
+function renderAcceptance(record: Record<string, unknown>): string {
+  const value = (key: string) => (record[key] === undefined || record[key] === null ? "-" : String(record[key]));
+  const outcome = record.skipped === true
+    ? "skipped (no acceptance command; review decides)"
+    : record.passed === true ? "passed" : "failed";
+  return [
+    `command: ${value("command")}`,
+    `result: ${outcome}`,
+    `exitCode: ${value("exitCode")}`,
+    `artifactBefore: ${value("artifactBefore")}`,
+    `artifactAfter: ${value("artifactAfter")}`,
+    ...(record.note === undefined ? [] : [`note: ${value("note")}`]),
+    `output: ${value("output")}`,
+  ].join("\n");
+}
+
+/** The rework note: what failed, and exactly what has to change. */
+function reviewNote(task: Task, seq: number, result: ReviewResult): HandoffNote {
+  return {
+    task: task.id,
+    seq,
+    status: "review-failed",
+    done: result.summary || "复核未通过",
+    found: result.criteria.filter((criterion) => !criterion.pass).map((criterion) => `${criterion.id}: ${criterion.evidence}`).join("; ") || "未报告逐条依据",
+    next: result.defects.length > 0 ? result.defects.join("; ") : "按未通过的验收标准返工",
+    files: [],
+  };
 }
 
 async function overBudget(r: Run, sessionId?: string): Promise<boolean> {
