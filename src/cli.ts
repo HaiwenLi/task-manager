@@ -9,6 +9,9 @@ import type { AgentAdapter } from "./adapters/types.js";
 import { serializeTaskFile, type Task } from "./task-file.js";import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, type TaskType } from "./intake.js";
 import { extractCriteria, readSpec, writeSpec } from "./spec.js";
 import { appendJournal } from "./journal.js";
+import { renderBoardMarkdown, renderBoardTable, writeBoard } from "./board.js";
+import { buildReport } from "./report.js";
+import { readAudits } from "./audit.js";
 
 /** Injection seams for tests: adapter (for `run`), clock (for `done`), output. */
 export type CliDeps = {
@@ -33,6 +36,8 @@ const USAGE = [
   "  taskctl done --task <id> [--tasks-dir <dir>]",
   "  taskctl note --task <id> --status <s> --done <d> --found <f> --next <n> [--files <a,b>] [--tasks-dir <dir>]",
   "  taskctl status [--tasks-dir <dir>]",
+  "  taskctl board [--all] [--json] [--tasks-dir <dir>]",
+  "  taskctl report --task <id> [--tasks-dir <dir>]",
 ].join("\n");
 
 /** Marker file the `done` subcommand writes; mirrors task-store's DONE_MARKER. */
@@ -99,6 +104,12 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "status":
       checkFlags(command, flags, ["tasks-dir"], []);
       return statusCommand(flags, log);
+    case "board":
+      checkFlags(command, flags, ["tasks-dir", "all", "json"], []);
+      return boardCommand(flags, log);
+    case "report":
+      checkFlags(command, flags, ["task", "tasks-dir"], ["task"]);
+      return reportCommand(flags, log);
     default:
       throw new UsageError(`unknown command "${command}"`);
   }
@@ -287,6 +298,61 @@ async function statusCommand(flags: Map<string, string>, log: (line: string) => 
 
 /** Flags that stand alone, with no value token after them. */
 const BOOLEAN_FLAGS = new Set(["simple", "all", "apply", "json"]);
+
+/** `taskctl board` — rewrite `.taskctl/board.md` and print the same content as a table. */
+async function boardCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasks = await new TaskStore(tasksDir).list();
+  const notes = await boardNotes(tasksDir, tasks);
+  const highlighted = new Set(
+    (await readAudits(tasksDir)).filter((record) => record.verdict === "pass" && record.highlight === true).map((record) => record.task),
+  );
+  const now = new Date();
+  const options = { all: flags.has("all"), notes, highlighted, now };
+  if (flags.has("json")) {
+    const payload = tasks.map((task) => ({ id: task.id, status: task.status, complexity: task.complexity, note: notes.get(task.id) ?? null, highlighted: highlighted.has(task.id) }));
+    for (const line of JSON.stringify(payload, null, 2).split("\n")) log(line);
+    return 0;
+  }
+  const path = await writeBoard(tasksDir, renderBoardMarkdown(tasks, options));
+  for (const line of renderBoardTable(tasks, options)) log(line);
+  log("");
+  log(path);
+  return 0;
+}
+
+/** Where each task is stuck, from its latest handoff note or its status. */
+async function boardNotes(tasksDir: string, tasks: Task[]): Promise<Map<string, string>> {
+  const notes = new Map<string, string>();
+  for (const task of tasks) {
+    const note = await latestNote(tasksDir, task.id);
+    const fromNote = note === null ? "-" : statusLineFromNote(note.markdown);
+    if (fromNote !== "-") {
+      notes.set(task.id, fromNote);
+      continue;
+    }
+    const fallback: Record<string, string> = {
+      draft: "等签字",
+      "awaiting-human": "等放行",
+      review: "复核中",
+      running: "执行中",
+      open: "排队",
+      blocked: "已阻塞",
+      done: "完成",
+    };
+    notes.set(task.id, fallback[task.status] ?? task.status);
+  }
+  return notes;
+}
+
+/** `taskctl report --task <id>` — one page of evidence for a human spot check. */
+async function reportCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  for (const line of await buildReport(tasksDir, flags.get("task")!)) {
+    log(line);
+  }
+  return 0;
+}
 
 /** `--flag value` tokens into a map; bare tokens become positionals. */
 function parseArgs(argv: string[]): { command?: string; positionals: string[]; flags: Map<string, string> } {
