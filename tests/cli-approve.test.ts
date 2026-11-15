@@ -27,6 +27,16 @@ describe("taskctl approve", () => {
     expect(await runCli(["approve", "--task", "002-b", "--tasks-dir", dir], silent)).toBe(1);
     expect((await new TaskStore(dir).get("002-b")).status).toBe("draft");
   });
+
+  it("imports criteria from spec.md when the frontmatter has none", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "taskctl-approve-"));
+    await seed(dir, "004-d", "title: d\nstatus: draft");
+    await writeSpec(dir, "004-d", "## 目标\n好\n## 验收标准\n- C1 命令绿\n- C2 文案对\n");
+    expect(await runCli(["approve", "--task", "004-d", "--tasks-dir", dir], silent)).toBe(0);
+    const task = await new TaskStore(dir).get("004-d");
+    expect(task.status).toBe("open");
+    expect(task.criteria).toEqual(["C1 命令绿", "C2 文案对"]);
+  });
 });
 
 describe("taskctl spec", () => {

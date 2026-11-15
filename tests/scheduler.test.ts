@@ -118,6 +118,16 @@ describe("runScheduler", () => {
     await expect(runScheduler(config(), { store, adapter: adapter(), acceptance: failGate })).rejects.toThrow(/unknown task/);
   });
 
+  it("serializes two directories inside one git repository", async () => {
+    // Workspace reservation treats a whole git common dir as one resource, so
+    // the scheduler must not start a sibling directory task either.
+    await mkdir(join(cwd, ".git"), { recursive: true });
+    await seed("001-a", ["workdir: a"]);
+    await seed("002-b", ["workdir: b"]);
+    await runScheduler(config({ parallel: 2 }), { store, adapter: adapter(), acceptance: failGate });
+    expect(peak).toBe(1);
+  });
+
   it("never claims draft or awaiting-human tasks", async () => {
     await seed("001-a");
     await seed("002-b");

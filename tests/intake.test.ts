@@ -5,9 +5,16 @@ import { parseTaskFile } from "../src/task-file.js";
 describe("detectComplexity", () => {
   it("only an explicit statement downgrades to simple", () => {
     expect(detectComplexity("这是个简单任务：修一下 README 的错字")).toBe("simple");
+    expect(detectComplexity("这是一个简单任务")).toBe("simple");
     expect(detectComplexity("simple: fix typo")).toBe("simple");
+    expect(detectComplexity("简单任务：改个错字")).toBe("simple");
     expect(detectComplexity("重构登录模块")).toBe("complex");
     expect(detectComplexity("不太复杂，改个文案")).toBe("complex");
+  });
+
+  it("does not downgrade on a negation or a mere mention", () => {
+    expect(detectComplexity("这不是简单任务，要重构登录模块")).toBe("complex");
+    expect(detectComplexity("上次那个简单任务又出问题了")).toBe("complex");
   });
 });
 

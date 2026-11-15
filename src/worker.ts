@@ -10,8 +10,8 @@ import type { Execution } from "./execution.js";
 import { reserveWorkspace, artifactDigest, type WorkspaceReservation } from "./workspace.js";
 import { definitionDigest, readAttempt, readRuntime, writeRuntime, type AttemptRecord } from "./runtime.js";
 import { readSpec } from "./spec.js";
-import { journalTail } from "./journal.js";
-import { runReview, type ReviewEvidence, type ReviewResult } from "./review.js";
+import { appendJournal, journalTail } from "./journal.js";
+import { startReview, type ReviewEvidence, type ReviewResult } from "./review.js";
 
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
 export const ACCEPTANCE_TIMEOUT_MS_DEFAULT = 10 * 60_000;
@@ -346,16 +346,25 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
     journal: await journalTail(r.cfg.tasksDir, id, 30),
   };
   emit(r, "reviewing");
-  const reviewer = r.deps.review ?? ((ev: ReviewEvidence) => runReview({
-    adapter: r.deps.adapter,
-    cwd: r.cfg.workdir,
-    model: r.cfg.reviewerModel,
-    effort: r.cfg.reviewerEffort,
-    title: r.task.title,
-  }, ev));
-  const result = await controlled(r, "review", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT,
-    () => legacyExecution(() => reviewer(evidence)));
-  await owned(r, () => writeRuntime(r.cfg.tasksDir, id, "review.json", { ...result, at: new Date().toISOString() }));
+  await owned(r, async () => {
+    await r.deps.store.setStatus(id, "review");
+    await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "started", detail: `criteria=${r.task.criteria.length}` });
+  });
+  const result = await controlled(r, "review", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT, () =>
+    r.deps.review
+      ? legacyExecution(() => r.deps.review!(evidence))
+      : startReview({
+          adapter: r.deps.adapter,
+          cwd: r.cfg.workdir,
+          model: r.cfg.reviewerModel,
+          effort: r.cfg.reviewerEffort,
+          title: r.task.title,
+        }, evidence),
+  );
+  await owned(r, async () => {
+    await writeRuntime(r.cfg.tasksDir, id, "review.json", { ...result, at: new Date().toISOString() });
+    await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "verdict", detail: result.verdict });
+  });
   emit(r, "reviewed", result.verdict);
 
   if (result.verdict === "unclear") {
@@ -369,7 +378,10 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
       emit(r, "awaiting-human", "review passed; human sign-off required");
       return "awaiting-human";
     }
-    await owned(r, () => r.deps.store.setStatus(id, "done"));
+    await owned(r, async () => {
+      await r.deps.store.setStatus(id, "done");
+      await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "done", detail: "passed" });
+    });
     emit(r, "done", "review passed");
     return "done";
   }
@@ -377,8 +389,11 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
   // Verdict is `fail`: spend a review round, or block once rounds are exhausted.
   const rounds = await owned(r, () => r.deps.store.incReviewRounds(id));
   const limit = r.cfg.maxReviewRounds ?? MAX_REVIEW_ROUNDS_DEFAULT;
-  if (rounds >= limit) {
-    await owned(r, () => r.deps.store.setStatus(id, "blocked"));
+  if (rounds > limit) {
+    await owned(r, async () => {
+      await r.deps.store.setStatus(id, "blocked");
+      await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "blocked", detail: `${rounds}/${limit}` });
+    });
     emit(r, "blocked", `review rounds exhausted (${rounds}/${limit})`);
     return "blocked";
   }
@@ -386,6 +401,11 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
   await owned(r, async () => {
     await writeNote(r.cfg.tasksDir, reviewNote(r.task, seq, result));
     await r.deps.store.setStatus(id, "open");
+    await appendJournal(r.cfg.tasksDir, id, {
+      stage: "review",
+      event: "rework",
+      detail: `round ${rounds}: ${result.defects.join("; ") || result.summary}`,
+    });
   });
   emit(r, "rework", `round ${rounds}: ${result.defects.join("; ") || result.summary}`);
   return "open";
@@ -394,12 +414,16 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
 /** One line per acceptance fact the reviewer may rely on. */
 function renderAcceptance(record: Record<string, unknown>): string {
   const value = (key: string) => (record[key] === undefined || record[key] === null ? "-" : String(record[key]));
+  const outcome = record.skipped === true
+    ? "skipped (no acceptance command; review decides)"
+    : record.passed === true ? "passed" : "failed";
   return [
     `command: ${value("command")}`,
-    `result: ${record.passed === true ? "passed" : "failed"}`,
+    `result: ${outcome}`,
     `exitCode: ${value("exitCode")}`,
     `artifactBefore: ${value("artifactBefore")}`,
     `artifactAfter: ${value("artifactAfter")}`,
+    ...(record.note === undefined ? [] : [`note: ${value("note")}`]),
     `output: ${value("output")}`,
   ].join("\n");
 }

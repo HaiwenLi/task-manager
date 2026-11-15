@@ -1,4 +1,5 @@
 import type { AgentAdapter } from "./adapters/types.js";
+import type { Execution } from "./execution.js";
 import type { Task } from "./task-file.js";
 
 export type Verdict = "pass" | "fail" | "unclear";
@@ -102,14 +103,30 @@ export function parseVerdict(text: string, criteria: string[]): ReviewResult {
   if (verdict === "fail" && allPassed) {
     return { verdict: "unclear", criteria: merged, defects, summary };
   }
+  // A "pass" that contradicts its own criterion results is a fail: the
+  // per-criterion evidence is the specific claim, the overall word is not.
+  if (verdict === "pass" && !allPassed) {
+    return { verdict: "fail", criteria: merged, defects, summary };
+  }
   return { verdict, criteria: merged, defects, summary };
 }
 
 /** Run one review turn in a fresh session and parse its verdict. */
 export async function runReview(
-  deps: { adapter: AgentAdapter; cwd: string; model?: string; effort?: string; title?: string },
+  deps: ReviewDeps,
   evidence: ReviewEvidence,
 ): Promise<ReviewResult> {
+  return startReview(deps, evidence).result;
+}
+
+export type ReviewDeps = { adapter: AgentAdapter; cwd: string; model?: string; effort?: string; title?: string };
+
+/**
+ * A review turn as a cancellable handle. The worker needs the handle, not just
+ * the promise: a review that times out must be stopped and confirmed stopped
+ * before the task is retried (ADR-0007).
+ */
+export function startReview(deps: ReviewDeps, evidence: ReviewEvidence): Execution<ReviewResult> {
   const args = {
     text: buildReviewPrompt(evidence),
     cwd: deps.cwd,
@@ -117,14 +134,25 @@ export async function runReview(
     effort: deps.effort,
     title: `review: ${deps.title ?? evidence.task.title}`,
   };
-  const result = deps.adapter.start ? await deps.adapter.start(args).result : await deps.adapter.prompt(args);
-  if (result.exitCode !== 0) {
-    return degraded(
-      evidence.task.criteria.map((criterion) => criterion.split(/\s+/)[0]!),
-      `review turn failed with exit ${result.exitCode}`,
-    );
+  const finish = (result: { exitCode: number; text: string }): ReviewResult =>
+    result.exitCode !== 0
+      ? degraded(
+          evidence.task.criteria.map((criterion) => criterion.split(/\s+/)[0]!),
+          `review turn failed with exit ${result.exitCode}`,
+        )
+      : parseVerdict(result.text, evidence.task.criteria);
+
+  if (deps.adapter.start) {
+    const inner = deps.adapter.start(args);
+    return {
+      result: inner.result.then(finish),
+      inspect: inner.inspect,
+      cancel: inner.cancel,
+    };
   }
-  return parseVerdict(result.text, evidence.task.criteria);
+  let state: "running" | "exited" = "running";
+  const result = deps.adapter.prompt(args).then(finish).finally(() => { state = "exited"; });
+  return { result, inspect: () => ({ state }), cancel: async () => false };
 }
 
 function degraded(ids: string[], reason: string): ReviewResult {

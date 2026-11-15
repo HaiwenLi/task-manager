@@ -10,13 +10,15 @@ import type { AgentAdapter } from "./adapters/types.js";
 import { serializeTaskFile, type Task } from "./task-file.js";import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, type TaskType } from "./intake.js";
 import { extractCriteria, readSpec, writeSpec } from "./spec.js";
 import { appendJournal } from "./journal.js";
+import type { AcceptanceResult } from "./acceptance.js";
 import { renderBoardMarkdown, renderBoardTable, writeBoard } from "./board.js";
 import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
 
-/** Injection seams for tests: adapter (for `run`), clock (for `done`), output. */
+/** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
 export type CliDeps = {
   adapter?: AgentAdapter;
+  acceptance?: (command: string, cwd: string) => Promise<AcceptanceResult>;
   now?: () => Date;
   log?: (line: string) => void;
   err?: (line: string) => void;
@@ -51,6 +53,15 @@ const DONE_MARKER = "done.requested";
 /** Default `--tasks-dir` for the agent-facing subcommands (matches the protocol copy). */
 const TASKS_DIR_DEFAULT = "tasks";
 
+/** `--tasks-dir`, else `taskctl.json`'s `tasksDir`, else `tasks`. */
+async function tasksDirFor(flags: Map<string, string>): Promise<string> {
+  const explicit = flags.get("tasks-dir");
+  if (explicit !== undefined) {
+    return explicit;
+  }
+  return resolveConfig(await readConfig(flags.get("config") ?? "taskctl.json"), "taskctl.json").tasksDir;
+}
+
 /**
  * Parse argv and run one subcommand. Hand-rolled `--flag value` parsing —
  * no CLI dependency (binding constraint). Values pass through untouched, so
@@ -83,22 +94,22 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
   }
   switch (command) {
     case "add":
-      checkFlags(command, flags, ["type", "simple", "id", "config", "risk", "workdir", "tasks-dir"], []);
+      checkFlags(command, flags, ["type", "simple", "id", "config", "risk", "workdir", "tasks-dir", "acceptance"], []);
       return addCommand(positionals, flags, deps, log);
     case "spec":
-      checkFlags(command, flags, ["task", "tasks-dir"], ["task"]);
+      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return specCommand(flags, log);
     case "approve":
-      checkFlags(command, flags, ["task", "tasks-dir"], ["task"]);
+      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return approveCommand(flags, log);
     case "run":
       checkFlags(command, flags, ["config"], []);
       return runCommand(flags, deps, log);
     case "done":
-      checkFlags(command, flags, ["task", "tasks-dir"], ["task"]);
+      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return doneCommand(flags, deps, log);
     case "note":
-      checkFlags(command, flags, ["task", "status", "done", "found", "next", "files", "tasks-dir"], [
+      checkFlags(command, flags, ["task", "status", "done", "found", "next", "files", "tasks-dir", "config"], [
         "task",
         "status",
         "done",
@@ -107,25 +118,25 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
       ]);
       return noteCommand(flags, log);
     case "status":
-      checkFlags(command, flags, ["tasks-dir"], []);
+      checkFlags(command, flags, ["tasks-dir", "config"], []);
       return statusCommand(flags, log);
     case "board":
-      checkFlags(command, flags, ["tasks-dir", "all", "json"], []);
+      checkFlags(command, flags, ["tasks-dir", "config", "all", "json"], []);
       return boardCommand(flags, log);
     case "report":
-      checkFlags(command, flags, ["task", "tasks-dir"], ["task"]);
+      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return reportCommand(flags, log);
     case "accept":
-      checkFlags(command, flags, ["task", "tasks-dir"], ["task"]);
+      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return acceptCommand(flags, log);
     case "reject":
-      checkFlags(command, flags, ["task", "reason", "stage", "tasks-dir"], ["task", "reason"]);
+      checkFlags(command, flags, ["task", "reason", "stage", "tasks-dir", "config"], ["task", "reason"]);
       return rejectCommand(flags, log);
     case "audit":
-      checkFlags(command, flags, ["task", "verdict", "stage", "note", "tasks-dir"], ["task", "verdict"]);
+      checkFlags(command, flags, ["task", "verdict", "stage", "note", "tasks-dir", "config"], ["task", "verdict"]);
       return auditCommand(flags, log);
     case "metrics":
-      checkFlags(command, flags, ["tasks-dir"], []);
+      checkFlags(command, flags, ["tasks-dir", "config"], []);
       return metricsCommand(flags, log);
     default:
       throw new UsageError(`unknown command "${command}"`);
@@ -150,6 +161,7 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   await runScheduler(cfg, {
     store,
     adapter,
+    ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
     onEvent: (evt) => {
       log(`[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`);
       refreshBoard();
@@ -190,6 +202,7 @@ async function addCommand(
   const type = parseType(flags.get("type") ?? detectType(intent));
   const complexity = flags.has("simple") ? "simple" : detectComplexity(intent);
   const workdir = flags.get("workdir");
+  const acceptance = flags.get("acceptance");
   const task: Task = {
     id,
     title: firstLine(intent).slice(0, 80),
@@ -199,6 +212,7 @@ async function addCommand(
     complexity,
     risk: flags.get("risk") === "high" ? "high" : "normal",
     ...(workdir !== undefined && { workdir }),
+    ...(acceptance !== undefined && { acceptance }),
     dependsOn: [],
     humanCheck: false,
     reviewRounds: 0,
@@ -255,7 +269,7 @@ async function addCommand(
 
 /** `taskctl spec --task <id>` — print the draft spec a human is signing off. */
 async function specCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
-  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasksDir = await tasksDirFor(flags);
   const spec = await readSpec(tasksDir, flags.get("task")!);
   for (const line of (spec ?? "(no spec)").split(/\r?\n/)) {
     log(line);
@@ -265,25 +279,33 @@ async function specCommand(flags: Map<string, string>, log: (line: string) => vo
 
 /** `taskctl approve --task <id>` — the only way a draft becomes runnable. */
 async function approveCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
-  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasksDir = await tasksDirFor(flags);
   const id = flags.get("task")!;
   const store = new TaskStore(tasksDir);
   const task = await store.get(id);
   if (task.status !== "draft") {
     throw new Error(`task ${id} is ${task.status}, expected draft`);
   }
-  if (task.criteria.length === 0) {
-    throw new Error(`task ${id} has no acceptance criteria; add them to ${join(tasksDir, id, "spec.md")} and re-run add`);
+  let criteria = task.criteria;
+  if (criteria.length === 0) {
+    // The natural fix is "edit spec.md, then approve": import instead of
+    // demanding the frontmatter be hand-edited.
+    const spec = await readSpec(tasksDir, id);
+    if (spec === null) {
+      throw new Error(`task ${id} has no criteria and no spec; re-run taskctl add to draft one`);
+    }
+    criteria = extractCriteria(spec);
+    await store.updateFields(id, { criteria });
   }
   await store.setStatus(id, "open");
-  await appendJournal(tasksDir, id, { stage: "human", event: "approved", detail: `criteria=${task.criteria.length}` });
+  await appendJournal(tasksDir, id, { stage: "human", event: "approved", detail: `criteria=${criteria.length}` });
   log(`${id}  open  approved`);
   return 0;
 }
 
 /** `taskctl done --task <id>` — write the marker the worker polls for. */
 async function doneCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
-  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasksDir = await tasksDirFor(flags);
   const id = flags.get("task")!;
   await mkdir(join(tasksDir, id), { recursive: true });
   const marker = join(tasksDir, id, DONE_MARKER);
@@ -294,7 +316,7 @@ async function doneCommand(flags: Map<string, string>, deps: CliDeps, log: (line
 
 /** `taskctl note …` — append the next numbered handoff note, print its path. */
 async function noteCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
-  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasksDir = await tasksDirFor(flags);
   const files = (flags.get("files") ?? "")
     .split(",")
     .map((file) => file.trim())
@@ -315,7 +337,7 @@ async function noteCommand(flags: Map<string, string>, log: (line: string) => vo
 
 /** `taskctl status` — one table row per task. */
 async function statusCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
-  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasksDir = await tasksDirFor(flags);
   const store = new TaskStore(tasksDir);
   const tasks = await store.list();
   const rows: string[][] = [["id", "status", "retries", "sessions", "note"]];
@@ -340,7 +362,7 @@ const BOOLEAN_FLAGS = new Set(["simple", "all", "apply", "json"]);
 
 /** `taskctl board` — rewrite `.taskctl/board.md` and print the same content as a table. */
 async function boardCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
-  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasksDir = await tasksDirFor(flags);
   const tasks = await new TaskStore(tasksDir).list();
   const notes = await boardNotes(tasksDir, tasks);
   const highlighted = new Set(
@@ -386,7 +408,7 @@ async function boardNotes(tasksDir: string, tasks: Task[]): Promise<Map<string, 
 
 /** `taskctl report --task <id>` — one page of evidence for a human spot check. */
 async function reportCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
-  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasksDir = await tasksDirFor(flags);
   for (const line of await buildReport(tasksDir, flags.get("task")!)) {
     log(line);
   }
@@ -395,7 +417,7 @@ async function reportCommand(flags: Map<string, string>, log: (line: string) => 
 
 /** `taskctl accept --task <id>` — a human signs off a reviewed task. */
 async function acceptCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
-  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasksDir = await tasksDirFor(flags);
   const id = flags.get("task")!;
   const store = new TaskStore(tasksDir);
   const task = await store.get(id);
@@ -411,7 +433,7 @@ async function acceptCommand(flags: Map<string, string>, log: (line: string) => 
 
 /** `taskctl reject --task <id> --reason …` — a human sends work back and names the failing stage. */
 async function rejectCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
-  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasksDir = await tasksDirFor(flags);
   const id = flags.get("task")!;
   const reason = flags.get("reason")!;
   const stage = parseStage(flags.get("stage") ?? "reviewer");
@@ -431,7 +453,7 @@ async function rejectCommand(flags: Map<string, string>, log: (line: string) => 
 
 /** `taskctl audit --task <id> --verdict pass|fail` — a spot check; it never changes task status. */
 async function auditCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
-  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasksDir = await tasksDirFor(flags);
   const id = flags.get("task")!;
   const verdict = flags.get("verdict");
   if (verdict !== "pass" && verdict !== "fail") {
@@ -458,7 +480,7 @@ async function auditCommand(flags: Map<string, string>, log: (line: string) => v
 
 /** `taskctl metrics` — which stage keeps failing. */
 async function metricsCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
-  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const tasksDir = await tasksDirFor(flags);
   const tasks = await new TaskStore(tasksDir).list();
   for (const line of summarizeAudits(await readAudits(tasksDir), tasks)) {
     log(line);
@@ -482,8 +504,7 @@ function parseArgs(argv: string[]): { command?: string; positionals: string[]; f
     const token = argv[i]!;
     if (token.startsWith("--")) {
       const name = token.slice(2);
-      const next = argv[i + 1];
-      if (BOOLEAN_FLAGS.has(name) && (next === undefined || next.startsWith("--"))) {
+      if (BOOLEAN_FLAGS.has(name)) {
         flags.set(name, "true");
         continue;
       }

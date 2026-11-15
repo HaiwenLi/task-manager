@@ -69,6 +69,24 @@ describe("taskctl add", () => {
     expect((await journalTail(dir, "004-y", 5)).join("\n")).toMatch(/clarify-failed/);
   });
 
+  it("accepts --simple written before the intent", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
+    const adapter = fakeAdapter("## 目标\n修好\n## 验收标准\n- C1 错字为零\n");
+    const code = await runCli(["add", "--simple", "修 README 错字", "--tasks-dir", dir, "--id", "005-typo"], { ...silent, adapter });
+    expect(code).toBe(0);
+    const task = await new TaskStore(dir).get("005-typo");
+    expect(task.complexity).toBe("simple");
+    expect(task.status).toBe("open");
+    expect(task.description).toBe("修 README 错字");
+  });
+
+  it("records an acceptance command given on the command line", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
+    const adapter = fakeAdapter("## 目标\n好\n## 验收标准\n- C1 好\n");
+    await runCli(["add", "改登录页", "--acceptance", "npm test", "--tasks-dir", dir, "--id", "006-login"], { ...silent, adapter });
+    expect((await new TaskStore(dir).get("006-login")).acceptance).toBe("npm test");
+  });
+
   it("assigns the next numeric id when none is given", async () => {
     const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
     const adapter = fakeAdapter("## 目标\n好\n## 验收标准\n- C1 好\n");

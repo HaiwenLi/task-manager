@@ -35,12 +35,16 @@ export const TEMPLATES: Record<TaskType, IntakeTemplate> = {
 };
 
 /**
- * Explicit statements only: "简单任务" or a `simple:` prefix. Words like
- * "不复杂" do not count — downgrading clarification is a user decision, and a
- * mistaken downgrade is the expensive kind.
+ * Explicit statements only. A downgrade skips the signature gate, so a miss is
+ * expensive: negations ("不是简单任务") and mentions ("上次那个简单任务") must not
+ * count, and only "是/算…简单任务" or a leading `simple:`/`简单任务：` does.
  */
 export function detectComplexity(intent: string): "simple" | "complex" {
-  return /简单任务|simple\s*:/i.test(intent) ? "simple" : "complex";
+  const text = intent.trim();
+  if (/不是\s*(?:一个|个)?\s*简单任务|不算\s*(?:一个|个)?\s*简单任务/.test(text)) return "complex";
+  if (/^(?:简单任务|simple\s*:)/i.test(text)) return "simple";
+  if (/(?:这|那)?(?:是|算)(?:一个|个)?\s*简单任务/.test(text)) return "simple";
+  return "complex";
 }
 
 /** Keyword routing; anything unrecognised is treated as code. */

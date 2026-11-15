@@ -1,10 +1,30 @@
-import { resolve } from "node:path";
+import { stat } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { runTask, type WorkerConfig, type WorkerDeps } from "./worker.js";
 import type { Task } from "./task-file.js";
 
 /** Where a task runs: its own `workdir` under the configured one, or the configured one. */
 export function taskWorkdir(base: string, task: Task): string {
   return task.workdir === undefined ? base : resolve(base, task.workdir);
+}
+
+/**
+ * The resource a workdir belongs to. Workspace reservation already treats a git
+ * repository as one resource (its common dir is reserved), so the scheduler must
+ * agree: two sibling task directories in one repo queue instead of colliding.
+ */
+export async function resourceKey(cwd: string): Promise<string> {
+  let current = resolve(cwd);
+  for (;;) {
+    try {
+      await stat(join(current, ".git"));
+      return current;
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return resolve(cwd);
+      current = parent;
+    }
+  }
 }
 
 /**
@@ -37,6 +57,9 @@ export function assertAcyclic(tasks: Task[]): void {
   for (const task of tasks) visit(task.id, []);
 }
 
+/** How many passes over the queue one `run` may take before giving up. */
+const MAX_PASSES = 50;
+
 function ready(tasks: Task[], done: Set<string>): Task[] {
   return tasks.filter(
     (task) => task.status === "open" && task.dependsOn.every((dependency) => done.has(dependency)),
@@ -44,9 +67,10 @@ function ready(tasks: Task[], done: Set<string>): Task[] {
 }
 
 /**
- * Run eligible tasks with up to `cfg.parallel` in flight, never two in the
- * same workdir. A dependency that is not `done` keeps its dependants in `open`:
- * the queue is re-scanned, not reordered.
+ * Run eligible tasks with up to `cfg.parallel` in flight, never two in the same
+ * resource (a workdir, or the git repository it sits in). A task returned to
+ * `open` by the reviewer is claimed again in the next pass, so one `taskctl run`
+ * drives the rework loop until the retry limits stop it.
  */
 export async function runScheduler(
   cfg: WorkerConfig,
@@ -54,39 +78,50 @@ export async function runScheduler(
 ): Promise<{ done: string[]; blocked: string[] }> {
   const limit = Math.max(1, cfg.parallel ?? 2);
   const result = { done: [] as string[], blocked: [] as string[] };
-  const snapshot = await deps.store.list();
-  assertAcyclic(snapshot);
 
-  const doneIds = new Set(snapshot.filter((task) => task.status === "done").map((task) => task.id));
-  const pending = new Map(ready(snapshot, doneIds).map((task) => [task.id, task]));
-  const busy = new Set<string>();
-  const inflight = new Map<string, Promise<void>>();
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    const snapshot = await deps.store.list();
+    assertAcyclic(snapshot);
 
-  const startAvailable = (): void => {
-    for (const [id, task] of pending) {
-      if (inflight.size >= limit) return;
-      const workdir = taskWorkdir(cfg.workdir, task);
-      if (busy.has(workdir)) continue;
-      pending.delete(id);
-      busy.add(workdir);
-      const run = (async () => {
-        try {
-          const outcome = await runTask({ ...cfg, workdir }, deps, task, `worker-${process.pid}-${id}`);
-          if (outcome === "done") result.done.push(id);
-          if (outcome === "blocked") result.blocked.push(id);
-        } finally {
-          busy.delete(workdir);
-          inflight.delete(id);
-        }
-      })();
-      inflight.set(id, run);
+    const doneIds = new Set(snapshot.filter((task) => task.status === "done").map((task) => task.id));
+    const pending = new Map(ready(snapshot, doneIds).map((task) => [task.id, task]));
+    const busy = new Set<string>();
+    const inflight = new Map<string, Promise<void>>();
+    let ranThisPass = 0;
+
+    const startAvailable = async (): Promise<void> => {
+      for (const [id, task] of pending) {
+        if (inflight.size >= limit) return;
+        const workdir = taskWorkdir(cfg.workdir, task);
+        const key = await resourceKey(workdir);
+        if (busy.has(key)) continue;
+        pending.delete(id);
+        busy.add(key);
+        ranThisPass += 1;
+        const run = (async () => {
+          try {
+            const outcome = await runTask({ ...cfg, workdir }, deps, task, `worker-${process.pid}-${id}`);
+            if (outcome === "done" && !result.done.includes(id)) result.done.push(id);
+            if (outcome === "blocked" && !result.blocked.includes(id)) result.blocked.push(id);
+          } finally {
+            busy.delete(key);
+            inflight.delete(id);
+          }
+        })();
+        inflight.set(id, run);
+      }
+    };
+
+    while (pending.size > 0 || inflight.size > 0) {
+      await startAvailable();
+      if (inflight.size === 0) break;
+      await Promise.race([...inflight.values()]);
     }
-  };
 
-  while (pending.size > 0 || inflight.size > 0) {
-    startAvailable();
-    if (inflight.size === 0) break;
-    await Promise.race([...inflight.values()]);
+    // Nothing ran: no eligible task left, so another pass would change nothing.
+    // Progress is "did we run anything", not "did a status string change" — a
+    // rework legitimately returns a task to the status it started in.
+    if (ranThisPass === 0) break;
   }
   return result;
 }

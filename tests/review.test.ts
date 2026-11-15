@@ -43,6 +43,23 @@ describe("parseVerdict", () => {
     );
     expect(r.verdict).toBe("unclear");
   });
+
+  it("a pass verdict with a failed criterion is a fail, not a pass", () => {
+    const r = parseVerdict(
+      `{"verdict":"pass","criteria":[{"id":"C1","pass":false,"evidence":"exit 1"},{"id":"C2","pass":true,"evidence":"ok"}],"defects":[],"summary":"总体可以"}`,
+      criteria,
+    );
+    expect(r.verdict).toBe("fail");
+    expect(r.criteria.find((c) => c.id === "C1")?.pass).toBe(false);
+  });
+
+  it("a truthy but non-boolean pass value does not count as passed", () => {
+    const r = parseVerdict(
+      `{"verdict":"pass","criteria":[{"id":"C1","pass":"true"},{"id":"C2","pass":1}],"defects":[],"summary":"ok"}`,
+      criteria,
+    );
+    expect(r.verdict).toBe("fail");
+  });
 });
 
 describe("buildReviewPrompt", () => {

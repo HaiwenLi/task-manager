@@ -7,15 +7,16 @@ import { TaskStore } from "../src/task-store.js";
 import type { AgentAdapter } from "../src/adapters/types.js";
 
 /**
- * End-to-end through the CLI with a scripted agent: one process-like adapter
- * answers the clarify prompt, one writes the completion marker like a worker
- * turn, one answers the review prompt. Everything else (fencing, journal,
- * board, report, audit) is the real code path.
+ * End-to-end through the CLI with a scripted agent: one adapter answers the
+ * clarify prompt, one writes the completion marker like a worker turn, one
+ * answers the review prompt. Everything else (fencing, acceptance gate, journal,
+ * board, report) is the real code path.
  */
 let root: string;
 let tasksDir: string;
 let workdir: string;
 let calls: string[];
+let acceptanceCalls = 0;
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "taskctl-e2e-"));
@@ -24,6 +25,7 @@ beforeEach(async () => {
   await mkdir(tasksDir, { recursive: true });
   await mkdir(workdir, { recursive: true });
   calls = [];
+  acceptanceCalls = 0;
 });
 
 afterEach(async () => {
@@ -55,53 +57,63 @@ function scriptedAgent(verdict: "pass" | "fail"): AgentAdapter {
 }
 
 const silent = { log: () => {}, err: () => {} };
-const acceptance = async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" });
 
-function config(): string {
-  const path = join(root, "taskctl.json");
-  return path;
-}
+const acceptance = async () => {
+  acceptanceCalls += 1;
+  return { passed: true, skipped: false as const, exitCode: 0, output: "ok" };
+};
 
 async function writeConfig(): Promise<string> {
-  const path = config();
+  const path = join(root, "taskctl.json");
   await writeFile(path, JSON.stringify({ tasksDir, workdir, parallel: 1, retryLimit: 1, maxReviewRounds: 1 }), "utf8");
   return path;
 }
 
 describe("pipeline end to end through the CLI", () => {
-  it("add → approve → run → done, with the board updated at each step", async () => {
+  it("add → approve → run → done, with the acceptance gate, review and board", async () => {
     const cfgPath = await writeConfig();
     const agent = scriptedAgent("pass");
 
-    expect(await runCli(["add", "复杂任务：改登录页", "--config", cfgPath, "--id", "001-login"], { ...silent, adapter: agent })).toBe(0);
+    const added = await runCli(
+      ["add", "复杂任务：改登录页", "--acceptance", "check", "--config", cfgPath, "--id", "001-login"],
+      { ...silent, adapter: agent },
+    );
+    expect(added).toBe(0);
     expect((await new TaskStore(tasksDir).get("001-login")).status).toBe("draft");
 
     expect(await runCli(["approve", "--task", "001-login", "--tasks-dir", tasksDir], silent)).toBe(0);
     expect((await new TaskStore(tasksDir).get("001-login")).status).toBe("open");
 
     expect(await runCli(["run", "--config", cfgPath], { ...silent, adapter: agent, acceptance })).toBe(0);
-    expect((await new TaskStore(tasksDir).get("001-login")).status).toBe("done");
-    expect(calls).toEqual(["clarify", "worker", "review"]);
 
-    const report = await runCli(["report", "--task", "001-login", "--tasks-dir", tasksDir], { log: () => {} });
-    expect(report).toBe(0);
+    const finished = await new TaskStore(tasksDir).get("001-login");
+    expect(finished.status).toBe("done");
+    expect(finished.acceptance).toBe("check");
+    expect(calls).toEqual(["clarify", "worker", "review"]);
+    expect(acceptanceCalls).toBe(1);
+
     const journal = await readFile(join(tasksDir, "001-login", "journal.md"), "utf8");
     expect(journal).toContain("approved");
+    expect(journal).toContain("verdict");
 
     const board = await readFile(join(root, ".taskctl", "board.md"), "utf8");
     expect(board).toContain("# taskctl");
   });
 
-  it("a failing review sends the task back to open instead of done", async () => {
+  it("a failing review spends a round and ends blocked at the limit", async () => {
     const cfgPath = await writeConfig();
     const agent = scriptedAgent("fail");
-    await runCli(["add", "复杂任务：改登录页", "--config", cfgPath, "--id", "001-login"], { ...silent, adapter: agent });
+    await runCli(
+      ["add", "复杂任务：改登录页", "--acceptance", "check", "--config", cfgPath, "--id", "001-login"],
+      { ...silent, adapter: agent },
+    );
     await runCli(["approve", "--task", "001-login", "--tasks-dir", tasksDir], silent);
 
     expect(await runCli(["run", "--config", cfgPath], { ...silent, adapter: agent, acceptance })).toBe(0);
     const task = await new TaskStore(tasksDir).get("001-login");
     expect(task.status).toBe("blocked");
-    expect(task.reviewRounds).toBe(1);
+    expect(task.reviewRounds).toBe(2);
+
     const report: string[] = [];
     await runCli(["report", "--task", "001-login", "--tasks-dir", tasksDir], { log: (line) => report.push(line) });
     expect(report.join("\n")).toContain("verdict  fail");
