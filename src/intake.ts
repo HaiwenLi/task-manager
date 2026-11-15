@@ -1,3 +1,5 @@
+import { readdir } from "node:fs/promises";
+
 /** The four kinds of work taskctl is expected to carry; each gets its own intake template. */
 export type TaskType = "code" | "office" | "research" | "design";
 
@@ -47,6 +49,29 @@ export function detectType(intent: string): TaskType {
   if (/设计|视觉|排版|ppt|幻灯|海报|封面|图标/i.test(intent)) return "design";
   if (/文档|表格|报告|邮件|周报|excel|word|汇报/i.test(intent)) return "office";
   return "code";
+}
+
+/**
+ * Next free id: the highest numeric prefix plus one, padded to three digits,
+ * plus an ASCII slug. A Chinese-only title has no usable slug, so it becomes
+ * `task`; the numeric prefix is what keeps ids unique and sortable.
+ */
+export async function nextTaskId(tasksDir: string, title: string): Promise<string> {
+  let highest = 0;
+  try {
+    for (const name of await readdir(tasksDir)) {
+      const match = /^(\d+)-.*\.md$/.exec(name);
+      if (match) highest = Math.max(highest, Number(match[1]));
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+  const slug = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 24) || "task";
+  return `${String(highest + 1).padStart(3, "0")}-${slug}`;
 }
 
 /**

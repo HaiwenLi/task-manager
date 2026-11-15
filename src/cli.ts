@@ -6,6 +6,9 @@ import { TaskStore } from "./task-store.js";
 import { runWorker, type WorkerConfig } from "./worker.js";
 import { OpenCodeAdapter } from "./adapters/opencode.js";
 import type { AgentAdapter } from "./adapters/types.js";
+import { serializeTaskFile, type Task } from "./task-file.js";import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, type TaskType } from "./intake.js";
+import { extractCriteria, readSpec, writeSpec } from "./spec.js";
+import { appendJournal } from "./journal.js";
 
 /** Injection seams for tests: adapter (for `run`), clock (for `done`), output. */
 export type CliDeps = {
@@ -23,6 +26,9 @@ class UsageError extends Error {}
 
 const USAGE = [
   "usage:",
+  "  taskctl add \"<意图>\" [--type code|office|research|design] [--simple] [--id <id>] [--config taskctl.json]",
+  "  taskctl spec --task <id> [--tasks-dir <dir>]",
+  "  taskctl approve --task <id> [--tasks-dir <dir>]",
   "  taskctl run [--config taskctl.json]",
   "  taskctl done --task <id> [--tasks-dir <dir>]",
   "  taskctl note --task <id> --status <s> --done <d> --found <f> --next <n> [--files <a,b>] [--tasks-dir <dir>]",
@@ -62,10 +68,19 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
   if (command === undefined) {
     throw new UsageError("missing command");
   }
-  if (positionals.length > 0) {
+  if (positionals.length > 0 && command !== "add") {
     throw new UsageError(`unexpected argument "${positionals[0]}"`);
   }
   switch (command) {
+    case "add":
+      checkFlags(command, flags, ["type", "simple", "id", "config", "risk", "workdir", "tasks-dir"], []);
+      return addCommand(positionals, flags, deps, log);
+    case "spec":
+      checkFlags(command, flags, ["task", "tasks-dir"], ["task"]);
+      return specCommand(flags, log);
+    case "approve":
+      checkFlags(command, flags, ["task", "tasks-dir"], ["task"]);
+      return approveCommand(flags, log);
     case "run":
       checkFlags(command, flags, ["config"], []);
       return runCommand(flags, deps, log);
@@ -102,6 +117,117 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
     adapter,
     onEvent: (evt) => log(`[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`),
   });
+  return 0;
+}
+
+/** `taskctl add "<intent>"` — capture the intent, draft the spec, gate the state. */
+async function addCommand(
+  positionals: string[],
+  flags: Map<string, string>,
+  deps: CliDeps,
+  log: (line: string) => void,
+): Promise<number> {
+  const intent = positionals.join(" ").trim();
+  if (intent.length === 0) {
+    throw new UsageError("add requires the intent as an argument");
+  }
+  const configPath = flags.get("config") ?? "taskctl.json";
+  const cfg = resolveConfig(await readConfig(configPath), configPath);
+  const tasksDir = flags.get("tasks-dir") ? resolve(flags.get("tasks-dir")!) : cfg.tasksDir;
+  await mkdir(tasksDir, { recursive: true });
+  const store = new TaskStore(tasksDir);
+  const id = flags.get("id") ?? (await nextTaskId(tasksDir, intent));
+  const type = parseType(flags.get("type") ?? detectType(intent));
+  const complexity = flags.has("simple") ? "simple" : detectComplexity(intent);
+  const workdir = flags.get("workdir");
+  const task: Task = {
+    id,
+    title: firstLine(intent).slice(0, 80),
+    description: intent,
+    status: "draft",
+    criteria: [],
+    complexity,
+    risk: flags.get("risk") === "high" ? "high" : "normal",
+    ...(workdir !== undefined && { workdir }),
+    dependsOn: [],
+    humanCheck: false,
+    reviewRounds: 0,
+    sessions: [],
+    retries: 0,
+  };
+  await writeFile(join(tasksDir, `${id}.md`), serializeTaskFile(task), { encoding: "utf8", flag: "wx" });
+
+  const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+  const prompt = buildClarifyPrompt({ task, type, profile: null });
+  const result = await adapter.prompt({
+    text: prompt,
+    cwd: cfg.workdir,
+    model: cfg.model,
+    effort: cfg.effort,
+    title: task.title,
+  });
+  if (result.exitCode !== 0) {
+    await appendJournal(tasksDir, id, { stage: "clarify", event: "clarify-failed", detail: `exit ${result.exitCode}` });
+    log(`${id}  draft  clarify-failed`);
+    return 1;
+  }
+  const specText = stripFence(result.text).trim();
+  if (specText.length === 0) {
+    await appendJournal(tasksDir, id, { stage: "clarify", event: "clarify-failed", detail: "empty spec" });
+    log(`${id}  draft  clarify-failed`);
+    return 1;
+  }
+  await writeSpec(tasksDir, id, specText);
+  let criteria: string[];
+  try {
+    criteria = extractCriteria(specText);
+  } catch (err) {
+    await appendJournal(tasksDir, id, {
+      stage: "clarify",
+      event: "spec-invalid",
+      detail: err instanceof Error ? err.message : String(err),
+    });
+    log(`${id}  draft  spec-invalid`);
+    return 1;
+  }
+  await store.updateFields(id, { criteria });
+  if (complexity === "simple") {
+    await store.setStatus(id, "open");
+  }
+  await appendJournal(tasksDir, id, {
+    stage: "clarify",
+    event: "spec-drafted",
+    detail: `criteria=${criteria.length}`,
+  });
+  log(`${id}  ${complexity === "simple" ? "open" : "draft"}  criteria=${criteria.length}`);
+  return 0;
+}
+
+/** `taskctl spec --task <id>` — print the draft spec a human is signing off. */
+async function specCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const spec = await readSpec(tasksDir, flags.get("task")!);
+  for (const line of (spec ?? "(no spec)").split(/\r?\n/)) {
+    log(line);
+  }
+  return 0;
+}
+
+/** `taskctl approve --task <id>` — the only way a draft becomes runnable. */
+async function approveCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = flags.get("tasks-dir") ?? TASKS_DIR_DEFAULT;
+  const id = flags.get("task")!;
+  const store = new TaskStore(tasksDir);
+  const task = await store.get(id);
+  if (task.status !== "draft") {
+    throw new Error(`task ${id} is ${task.status}, expected draft`);
+  }
+  if (task.criteria.length === 0) {
+    throw new Error(`task ${id} has no acceptance criteria; add them to ${join(tasksDir, id, "spec.md")} and re-run add`);
+  }
+  await store.setStatus(id, "open");
+  await appendJournal(tasksDir, id, { stage: "human", event: "approved", detail: `criteria=${task.criteria.length}` });
+  log(`${id}  open  approved`);
   return 0;
 }
 
@@ -159,6 +285,9 @@ async function statusCommand(flags: Map<string, string>, log: (line: string) => 
   return 0;
 }
 
+/** Flags that stand alone, with no value token after them. */
+const BOOLEAN_FLAGS = new Set(["simple", "all", "apply", "json"]);
+
 /** `--flag value` tokens into a map; bare tokens become positionals. */
 function parseArgs(argv: string[]): { command?: string; positionals: string[]; flags: Map<string, string> } {
   const positionals: string[] = [];
@@ -166,16 +295,41 @@ function parseArgs(argv: string[]): { command?: string; positionals: string[]; f
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i]!;
     if (token.startsWith("--")) {
+      const name = token.slice(2);
+      const next = argv[i + 1];
+      if (BOOLEAN_FLAGS.has(name) && (next === undefined || next.startsWith("--"))) {
+        flags.set(name, "true");
+        continue;
+      }
       const value = argv[++i];
       if (value === undefined) {
         throw new UsageError(`option ${token} requires a value`);
       }
-      flags.set(token.slice(2), value);
+      flags.set(name, value);
     } else {
       positionals.push(token);
     }
   }
   return { command: positionals.shift(), positionals, flags };
+}
+
+function parseType(value: string): TaskType {
+  const allowed: TaskType[] = ["code", "office", "research", "design"];
+  if (!allowed.includes(value as TaskType)) {
+    throw new UsageError(`unknown task type "${value}" (expected one of: ${allowed.join(", ")})`);
+  }
+  return value as TaskType;
+}
+
+/** First non-empty line, used as the task title. */
+function firstLine(text: string): string {
+  return text.split(/\r?\n/).find((line) => line.trim().length > 0)?.trim() ?? "task";
+}
+
+/** Models like to wrap a whole answer in one fence; unwrap that single wrapper. */
+function stripFence(text: string): string {
+  const match = /^```[a-zA-Z]*\r?\n([\s\S]*?)\r?\n```\s*$/.exec(text.trim());
+  return match ? match[1]! : text;
 }
 
 /** Reject unknown flags, then require the mandatory ones. */
