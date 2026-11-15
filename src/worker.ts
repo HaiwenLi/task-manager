@@ -116,6 +116,7 @@ export async function runTask(cfg: WorkerConfig, deps: WorkerDeps, task: Task, w
       await writeRuntime(cfg.tasksDir, task.id, "attempt.json", r.record);
       await deps.store.clearDoneMarker(task.id); // do not consume a predecessor's completion request
       await deps.store.setStatus(task.id, "running");
+      await appendJournal(cfg.tasksDir, task.id, { stage: "worker", event: "claimed", detail: reservation?.cwd ?? cfg.workdir });
     });
     tick(); emit(r, "running");
     const outcome = await loop(r);
@@ -310,6 +311,11 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
     await writeRuntime(r.cfg.tasksDir, r.task.id, "acceptance.json", evidence);
     if (!definitionMatches || artifactBefore !== artifactAfter || result.skipped) throw new ReviewRequiredError("acceptance evidence invalidated by definition/artifact drift or skipped check");
     emit(r, "acceptance", result.passed ? "passed" : `failed (exit ${result.exitCode ?? "null"})`);
+    await appendJournal(r.cfg.tasksDir, r.task.id, {
+      stage: "worker",
+      event: "acceptance",
+      detail: `${result.passed ? "passed" : "failed"} exit=${result.exitCode ?? "null"}`,
+    });
     if (result.passed) {
       return "review";
     }

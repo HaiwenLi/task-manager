@@ -9,9 +9,10 @@ export type CriterionResult = { id: string; pass: boolean; evidence: string };
 
 /**
  * The reviewer's whole answer. `unclear` is the safe verdict: it parks the task
- * for a human instead of spending a retry on a guess.
+ * for a human instead of spending a retry on a guess. `raw` keeps the model's
+ * actual words so a parse failure can be diagnosed instead of guessed at.
  */
-export type ReviewResult = { verdict: Verdict; criteria: CriterionResult[]; defects: string[]; summary: string };
+export type ReviewResult = { verdict: Verdict; criteria: CriterionResult[]; defects: string[]; summary: string; raw?: string };
 
 export type ReviewEvidence = {
   task: Task;
@@ -68,7 +69,7 @@ export function parseVerdict(text: string, criteria: string[]): ReviewResult {
   const ids = criteria.map((criterion) => criterion.split(/\s+/)[0]!);
   const parsed = extractJson(text);
   if (parsed === null) {
-    return degraded(ids, "reviewer output was not a JSON verdict");
+    return { ...degraded(ids, "reviewer output was not a JSON verdict"), raw: text };
   }
   const verdict = parsed.verdict;
   if (verdict !== "pass" && verdict !== "fail" && verdict !== "unclear") {
@@ -98,17 +99,17 @@ export function parseVerdict(text: string, criteria: string[]): ReviewResult {
   const allPassed = merged.every((criterion) => criterion.pass);
 
   if (missing || verdict === "unclear") {
-    return { verdict: "unclear", criteria: merged, defects, summary };
+    return { verdict: "unclear", criteria: merged, defects, summary, raw: text };
   }
   if (verdict === "fail" && allPassed) {
-    return { verdict: "unclear", criteria: merged, defects, summary };
+    return { verdict: "unclear", criteria: merged, defects, summary, raw: text };
   }
   // A "pass" that contradicts its own criterion results is a fail: the
   // per-criterion evidence is the specific claim, the overall word is not.
   if (verdict === "pass" && !allPassed) {
-    return { verdict: "fail", criteria: merged, defects, summary };
+    return { verdict: "fail", criteria: merged, defects, summary, raw: text };
   }
-  return { verdict, criteria: merged, defects, summary };
+  return { verdict, criteria: merged, defects, summary, raw: text };
 }
 
 /** Run one review turn in a fresh session and parse its verdict. */

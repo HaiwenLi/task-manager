@@ -67,7 +67,7 @@ it("OpenCode cancellation kills the local tree but cannot confirm backend termin
 it("OpenCode start preserves successful prompt results", async () => {
   const fixture = fileURLToPath(new URL("./adapters/fake-opencode.mjs", import.meta.url));
   const execution = new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: [fixture] }).start({ text: "hi", cwd });
-  await expect(execution.result).resolves.toEqual({ sessionId: "ses_fake123", exitCode: 0, text: "你好，任务完成" });
+  await expect(execution.result).resolves.toEqual({ sessionId: "ses_fake123", exitCode: 0, text: "你好，任务完成。" });
   expect(execution.inspect().state).toBe("exited");
   await expect(execution.cancel()).resolves.toBe(process.platform !== "win32");
 });

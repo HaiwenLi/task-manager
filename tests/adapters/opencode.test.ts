@@ -45,11 +45,11 @@ async function readArgv(file: string): Promise<string[]> {
 
 describe("OpenCodeAdapter.prompt", () => {
   it("returns the stream sessionId, concatenated text events and exit 0", async () => {
-    // 首个含 sessionID 的行记录 id；type:"text" 的 text 字段按序拼接；
-    // 无法 JSON.parse 的行被跳过；进程退出码 0 即回合成功
+    // 首个含 sessionID 的行记录 id；text 事件按序拼接（含 opencode >= 2.2 的
+    // part.text 形状）；无法 JSON.parse 的行被跳过；进程退出码 0 即回合成功
     const result = await makeAdapter().prompt({ text: "请完成任务A", cwd });
 
-    expect(result).toEqual({ sessionId: "ses_fake123", exitCode: 0, text: "你好，任务完成" });
+    expect(result).toEqual({ sessionId: "ses_fake123", exitCode: 0, text: "你好，任务完成。" });
   });
 
   it("spawns run with the exact argv: format, session, model#effort, title, auto", async () => {
@@ -142,7 +142,7 @@ describe("OpenCodeAdapter.prompt", () => {
 
     const result = await makeAdapter().prompt({ text: "正常回合", cwd });
 
-    expect(result).toEqual({ sessionId: "ses_fake123", exitCode: 0, text: "你好，任务完成" });
+    expect(result).toEqual({ sessionId: "ses_fake123", exitCode: 0, text: "你好，任务完成。" });
   });
 });
 

@@ -79,12 +79,45 @@ id         status          retries  sessions  note
 - 003-mig 数据迁移 · complex · 已阻塞
 ```
 
-## 4. 未验证的部分
+## 4. 真实 opencode 会话（已跑通一次）
 
-- **真实 opencode 会话**：`run` 走真实模型、真实工具调用、真实中途交接，没有跑过。
-  这会消耗额度，需要单独授权。
-- **多后端**：DSH / Kimi / Pi 适配器属于 P2，本增量只有 opencode 适配器。
-- **复核会话的真实取消**：`runReview` 走 `start` 句柄，但“OpenCode CLI 被杀 ≠ 后端会话已停”
-  的限制对复核会话同样存在（ADR-0007）。超时按不确定处理，未做真机验证。
+本机 opencode 2.3.0，真实二进制
+`%APPDATA%\npm\node_modules\@opencode\cli\bin\opencode.exe`，任务目录在临时项目里，
+`taskctl` 通过一个 shim 暴露给 agent。
+
+第一次跑：agent 写出了 `hello.txt`，验收命令通过，但复核判 `unclear`，任务停在
+`awaiting-human`。查 `review.json` 的 `raw` 是空字符串——真实 opencode 的 NDJSON 里文本在
+`part.text`，而适配器读的是顶层 `text`（fixture 也是按旧形状写的，所以单测一直绿）。
+已修适配器并让 fixture 覆盖两种形状；修复后重跑：
+
+```
+[001-hello] claimed
+[001-hello] running
+[001-hello] acceptance passed
+[001-hello] reviewing
+[001-hello] reviewed pass
+[001-hello] done review passed
+```
+
+`review.json`：
+
+```json
+{
+  "verdict": "pass",
+  "criteria": [{ "id": "C1", "pass": true, "evidence": "验收命令检查 hello.txt 的 utf8 内容 trim 后等于 'hi'，result 为 passed 且 exitCode 为 0" }],
+  "defects": [],
+  "summary": "提供的验收证据表明 hello.txt 存在且内容为 hi，C1 通过。"
+}
+```
+
+两件事值得记住：fail-closed 生效了（解析失败没有当通过，任务停下等人）；单测覆盖的是
+fixture 的假设，不是真实 CLI 的形状。
+
+## 5. 仍未验证
+
+- **多后端**：DSH / Kimi / Pi 适配器尚未实现（P2）。
+- **复核会话的真实取消**：`startReview` 走可取消句柄，但「OpenCode CLI 被杀 ≠ 后端会话已停」
+  的限制对复核同样存在（ADR-0007）。超时按不确定处理，未做真机验证。
 - **跨平台**：只在 Windows 验证；POSIX 的进程树取消路径没跑过。
-- **并发压力**：`parallel` 的验证是 2 个任务、串行/并行各一次，没有做长时间多任务压测。
+- **并发压力**：`parallel` 只验证到 2 个任务；没做长时间多任务压测。
+- **多任务真实并跑**：真实 opencode 只跑了单任务。

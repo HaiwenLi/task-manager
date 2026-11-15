@@ -8,7 +8,7 @@ type PromptArgs = Parameters<AgentAdapter["prompt"]>[0];
 type PromptResult = Awaited<ReturnType<AgentAdapter["prompt"]>>;
 
 /** A parsed NDJSON event line from `opencode run --format json`. */
-type RunEvent = { sessionID?: unknown; type?: unknown; text?: unknown };
+type RunEvent = { sessionID?: unknown; type?: unknown; text?: unknown; part?: unknown };
 
 /** A parsed `{"location":…,"data":…}` envelope from `opencode api`. */
 type ApiEnvelope = { data?: unknown };
@@ -101,8 +101,14 @@ export class OpenCodeAdapter implements AgentAdapter {
           sessionId = event.sessionID;
           sawSessionId = true;
         }
-        if (event.type === "text" && typeof event.text === "string") {
-          text += event.text;
+        if (event.type === "text") {
+          // opencode >= 2.2 nests the payload under `part`; older builds put
+          // `text` at the top level. Accept both, prefer the nested one.
+          const part = asObject(event.part);
+          const piece = typeof part?.text === "string" ? part.text : event.text;
+          if (typeof piece === "string") {
+            text += piece;
+          }
         }
       };
 

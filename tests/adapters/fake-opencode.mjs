@@ -44,6 +44,8 @@ if (subcommand === "run") {
     "not-json {{{ must be skipped",
     '{"sessionID":"ses_fake123","type":"tool_use","tool":"read","args":{"path":"a.md"}}',
     '{"sessionID":"ses_fake123","type":"text","text":"，任务完成"}',
+    // opencode >= 2.2 shape: the payload moved under `part`.
+    '{"sessionID":"ses_fake123","type":"text","part":{"type":"text","text":"。"}}',
     '{"sessionID":"ses_fake123","type":"step_finish"}',
   ];
   if (process.env.FAKE_CWD_MARKER) {

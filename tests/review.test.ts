@@ -23,7 +23,9 @@ describe("parseVerdict", () => {
   });
 
   it("unparsable output becomes unclear, never fail", () => {
-    expect(parseVerdict("我觉得还行，但说不好。", criteria).verdict).toBe("unclear");
+    const r = parseVerdict("我觉得还行，但说不好。", criteria);
+    expect(r.verdict).toBe("unclear");
+    expect(r.raw).toContain("我觉得还行");
     expect(parseVerdict(`{"verdict":"maybe"}`, criteria).verdict).toBe("unclear");
   });
 
