@@ -29,6 +29,16 @@ export async function readAttempt(tasksDir: string, id: string): Promise<Attempt
   }
 }
 
+/** Read one runtime record; a missing file reads as null. */
+export async function readRuntime<T>(tasksDir: string, id: string, name: string): Promise<T | null> {
+  try {
+    return JSON.parse(await readFile(join(tasksDir, id, name), "utf8")) as T;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
 export async function writeRuntime(tasksDir: string, id: string, name: string, record: unknown): Promise<void> {
   const file = join(tasksDir, id, name);
   const tmp = `${file}.${randomUUID()}.tmp`;
