@@ -273,7 +273,21 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
 
 async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "awaiting-human"> {
   const command = r.task.acceptance?.trim();
-  if (!command) { emit(r, "acceptance-skipped", "missing acceptance requires review"); throw new ReviewRequiredError("missing acceptance criteria; review required"); }
+  if (!command) {
+    // No command and no criteria: nothing can judge this task, so it waits for
+    // a human. With criteria, the reviewer is the gate — office, design and
+    // research tasks rarely have a shell command that means "done".
+    if (r.task.criteria.length === 0) {
+      emit(r, "acceptance-skipped", "missing acceptance requires review");
+      throw new ReviewRequiredError("missing acceptance criteria; review required");
+    }
+    emit(r, "acceptance-skipped", "no command; review-only");
+    await owned(r, () => writeRuntime(r.cfg.tasksDir, r.task.id, "acceptance.json", {
+      command: "(none)", passed: false, skipped: true, exitCode: null,
+      note: "no acceptance command; review decides", at: new Date().toISOString(),
+    }));
+    return await reviewStage(r);
+  }
   const artifactBefore = await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir]);
   const startedAt = new Date().toISOString();
   let result: AcceptanceResult;

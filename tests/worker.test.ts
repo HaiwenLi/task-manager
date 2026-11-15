@@ -730,7 +730,7 @@ describe("runWorker — 逐事件日志（Plan Task 9 / ADR-0006 告警）", () 
     expect(sink.events[5]).toMatchObject({ type: "done", taskId: "a" });
   });
 
-  it("missing acceptance requires review instead of silently reaching Done", async () => {
+  it("missing acceptance goes to the reviewer instead of silently reaching Done", async () => {
     const store = FakeStore.seed(task({ acceptance: undefined }));
     const adapter = new FakeAdapter(() => {
       store.requestDone("a");
@@ -738,12 +738,19 @@ describe("runWorker — 逐事件日志（Plan Task 9 / ADR-0006 告警）", () 
     });
     const sink = eventSink();
 
-    // 不注入 acceptance seam：走真 runAcceptance，空命令返回 skipped:true
-    const result = await runWorker(cfg(tasksDir), { store, adapter, ...sink });
+    // 不注入 acceptance seam：空命令返回 skipped，由复核判定（本 fixture 全绿）
+    const result = await runWorker(cfg(tasksDir), { store, adapter, review: passReview, ...sink });
 
-    expect(result).toEqual({ done: [], blocked: ["a"] });
-    expect(store.task("a").status).toBe("blocked");
-    expect(sink.events.map((e) => e.type)).toEqual(["claimed", "running", "acceptance-skipped", "blocked"]);
+    expect(result).toEqual({ done: ["a"], blocked: [] });
+    expect(store.task("a").status).toBe("done");
+    expect(sink.events.map((e) => e.type)).toEqual([
+      "claimed",
+      "running",
+      "acceptance-skipped",
+      "reviewing",
+      "reviewed",
+      "done",
+    ]);
     expect(sink.events[2]!.detail).toBeTruthy(); // 告警带说明
   });
 

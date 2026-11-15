@@ -35,14 +35,14 @@ export function renderBoardMarkdown(tasks: Task[], options: BoardOptions): strin
     const members = tasks.filter((task) => group.matches(task.status));
     if (members.length === 0) continue;
     lines.push(`## ${group.title} ${members.length}`);
-    for (const task of members) lines.push(item(task, options));
+    for (const task of members) lines.push(item(task, options, true));
     lines.push("");
   }
   if (options.all) {
     const finished = tasks.filter((task) => task.status === "done");
     if (finished.length > 0) {
       lines.push(`## 已完成 ${finished.length}`);
-      for (const task of finished) lines.push(item(task, options));
+      for (const task of finished) lines.push(item(task, options, true));
       lines.push("");
     }
   }
@@ -56,13 +56,13 @@ export function renderBoardTable(tasks: Task[], options: BoardOptions): string[]
     const members = tasks.filter((task) => group.matches(task.status));
     if (members.length === 0) continue;
     lines.push(`${group.title} ${members.length}`);
-    for (const task of members) lines.push(`  ${item(task, options)}`);
+    for (const task of members) lines.push(`  ${item(task, options, false)}`);
   }
   if (options.all) {
     const finished = tasks.filter((task) => task.status === "done");
     if (finished.length > 0) {
       lines.push(`已完成 ${finished.length}`);
-      for (const task of finished) lines.push(`  ${item(task, options)}`);
+      for (const task of finished) lines.push(`  ${item(task, options, false)}`);
     }
   }
   return lines;
@@ -83,12 +83,14 @@ export async function writeBoard(tasksDir: string, markdown: string): Promise<st
   return path;
 }
 
-function item(task: Task, options: BoardOptions): string {
+function item(task: Task, options: BoardOptions, bullet: boolean): string {
   const star = options.highlighted.has(task.id) ? "★ " : "";
   const note = options.notes.get(task.id) ?? task.status;
-  return `- ${star}${task.id} ${task.title} · ${task.complexity} · ${note}`;
+  return `${bullet ? "- " : ""}${star}${task.id} ${task.title} · ${task.complexity} · ${note}`;
 }
 
+/** Local time: the board is read by a person, not by a machine. */
 function stamp(date: Date): string {
-  return date.toISOString().slice(0, 16).replace("T", " ");
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }

@@ -72,10 +72,12 @@ describe("review lifecycle safety regressions", () => {
     expect((await store.get("a")).sessions).toEqual(["offline-session"]);
     expect(JSON.parse(await readFile(join(tasks, "a", "attempt.json"), "utf8")).phase).toBe("settled");
   });
-  it("T4: absent acceptance blocks for review instead of accepting", async () => {
+  it("T4: absent acceptance is judged by the reviewer instead of being auto-accepted", async () => {
     await seed();
-    expect(await run(config(), { store, adapter: adapter(done) })).toEqual({ done: [], blocked: ["a"] });
+    expect(await run(config(), { store, adapter: adapter(done) })).toEqual({ done: ["a"], blocked: [] });
     expect((await store.get("a")).retries).toBe(0);
+    const evidence = JSON.parse(await readFile(join(tasks, "a", "acceptance.json"), "utf8"));
+    expect(evidence.skipped).toBe(true);
   });
   it("T3: replacement owner during acceptance prevents Done and all stale mutations", async () => {
     await seed("check");

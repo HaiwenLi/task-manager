@@ -4,6 +4,7 @@ import { LOCK_TTL_MS_DEFAULT } from "./claim.js";
 import { latestNote, writeNote } from "./handoff.js";
 import { TaskStore } from "./task-store.js";
 import { runWorker, type WorkerConfig } from "./worker.js";
+import { runScheduler } from "./scheduler.js";
 import { OpenCodeAdapter } from "./adapters/opencode.js";
 import type { AgentAdapter } from "./adapters/types.js";
 import { serializeTaskFile, type Task } from "./task-file.js";import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, type TaskType } from "./intake.js";
@@ -137,14 +138,36 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   const cfg = resolveConfig(await readConfig(configPath), configPath);
   const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
   const store = new TaskStore(cfg.tasksDir);
+  // The board is rewritten on every event, so a browser watching board.md sees
+  // tasks move while the run is still going. Writes are chained, never racing.
+  let boardJob: Promise<unknown> = Promise.resolve();
+  const refreshBoard = (): void => {
+    boardJob = boardJob.then(() => refreshBoardFile(cfg.tasksDir)).catch(() => {});
+  };
+  refreshBoard();
   // Plan Task 9：逐事件打印 [task] 状态 单行日志 —— 事件发生即输出，
   // 而不是整队跑完再补一份总结
-  await runWorker(cfg, {
+  await runScheduler(cfg, {
     store,
     adapter,
-    onEvent: (evt) => log(`[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`),
+    onEvent: (evt) => {
+      log(`[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`);
+      refreshBoard();
+    },
   });
+  refreshBoard();
+  await boardJob;
   return 0;
+}
+
+/** Rewrite the board from disk state; safe to call at any point. */
+async function refreshBoardFile(tasksDir: string): Promise<void> {
+  const tasks = await new TaskStore(tasksDir).list();
+  const notes = await boardNotes(tasksDir, tasks);
+  const highlighted = new Set(
+    (await readAudits(tasksDir)).filter((record) => record.verdict === "pass" && record.highlight === true).map((record) => record.task),
+  );
+  await writeBoard(tasksDir, renderBoardMarkdown(tasks, { all: false, notes, highlighted, now: new Date() }));
 }
 
 /** `taskctl add "<intent>"` — capture the intent, draft the spec, gate the state. */
@@ -547,11 +570,15 @@ const CONFIG_KEYS = new Set([
   "acceptanceTimeoutMs",
   "maxSessionsPerTask",
   "maxTurnsPerSession",
+  "maxReviewRounds",
+  "reviewerModel",
+  "reviewerEffort",
+  "parallel",
   "opencodeBin",
 ]);
 
 /** Merge config file over the defaults; every present field is validated. */
-function resolveConfig(raw: Record<string, unknown>, path: string): ResolvedConfig {
+export function resolveConfig(raw: Record<string, unknown>, path: string): ResolvedConfig {
   for (const key of Object.keys(raw)) {
     if (!CONFIG_KEYS.has(key)) {
       throw new Error(`config ${path}: unknown field "${key}"`);
@@ -575,6 +602,10 @@ function resolveConfig(raw: Record<string, unknown>, path: string): ResolvedConf
     acceptanceTimeoutMs: number(raw, "acceptanceTimeoutMs", path),
     maxSessionsPerTask: integer(raw, "maxSessionsPerTask", path),
     maxTurnsPerSession: integer(raw, "maxTurnsPerSession", path),
+    maxReviewRounds: integer(raw, "maxReviewRounds", path),
+    reviewerModel: string(raw, "reviewerModel", path),
+    reviewerEffort: string(raw, "reviewerEffort", path),
+    parallel: integer(raw, "parallel", path),
     opencodeBin: string(raw, "opencodeBin", path),
   };
 }
