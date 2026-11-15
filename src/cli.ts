@@ -7,7 +7,8 @@ import { runWorker, type WorkerConfig } from "./worker.js";
 import { runScheduler } from "./scheduler.js";
 import { OpenCodeAdapter } from "./adapters/opencode.js";
 import type { AgentAdapter } from "./adapters/types.js";
-import { serializeTaskFile, type Task } from "./task-file.js";import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, type TaskType } from "./intake.js";
+import { serializeTaskFile, type Task } from "./task-file.js";import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, TEMPLATES, type TaskType } from "./intake.js";
+import { appendObservation, readProfile } from "./profile.js";
 import { extractCriteria, readSpec, writeSpec } from "./spec.js";
 import { appendJournal } from "./journal.js";
 import type { AcceptanceResult } from "./acceptance.js";
@@ -45,6 +46,8 @@ const USAGE = [
   "  taskctl reject --task <id> --reason \"…\" [--stage clarify|worker|reviewer] [--tasks-dir <dir>]",
   "  taskctl audit --task <id> --verdict pass|fail [--stage …] [--note \"…\"] [--tasks-dir <dir>]",
   "  taskctl metrics [--tasks-dir <dir>]",
+  "  taskctl learn --note \"<原话 → 改法>\" [--tasks-dir <dir>]",
+  "  taskctl template [--type code|office|research|design]",
 ].join("\n");
 
 /** Marker file the `done` subcommand writes; mirrors task-store's DONE_MARKER. */
@@ -138,6 +141,12 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "metrics":
       checkFlags(command, flags, ["tasks-dir", "config"], []);
       return metricsCommand(flags, log);
+    case "learn":
+      checkFlags(command, flags, ["note", "tasks-dir", "config"], ["note"]);
+      return learnCommand(flags, log);
+    case "template":
+      checkFlags(command, flags, ["type", "tasks-dir", "config"], []);
+      return templateCommand(flags, log);
     default:
       throw new UsageError(`unknown command "${command}"`);
   }
@@ -222,7 +231,8 @@ async function addCommand(
   await writeFile(join(tasksDir, `${id}.md`), serializeTaskFile(task), { encoding: "utf8", flag: "wx" });
 
   const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
-  const prompt = buildClarifyPrompt({ task, type, profile: null });
+  const profile = await readProfile(tasksDir);
+  const prompt = buildClarifyPrompt({ task, type, profile });
   const result = await adapter.prompt({
     text: prompt,
     cwd: cfg.workdir,
@@ -494,6 +504,34 @@ function parseStage(value: string): AuditStage {
     throw new UsageError(`unknown stage "${value}" (expected one of: ${allowed.join(", ")})`);
   }
   return value as AuditStage;
+}
+
+/** `taskctl learn --note …` — record one preference, verbatim, for the next clarify. */
+async function learnCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const path = await appendObservation(tasksDir, flags.get("note")!);
+  log(path);
+  return 0;
+}
+
+/** `taskctl template [--type …]` — show what the agent will ask and infer. */
+async function templateCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const type = parseType(flags.get("type") ?? "code");
+  const template = TEMPLATES[type];
+  const lines = [
+    `## ${type}`,
+    "",
+    "### 必答（只有你知道；缺了就问，不要编）",
+    ...template.required.map((item) => `- ${item}`),
+    "",
+    "### 可推（agent 自己写，你删）",
+    ...template.infer.map((item) => `- ${item}`),
+    "",
+    "### 补问（最多 3 条，只问会改变验收的空白）",
+    ...template.ask.map((item) => `- ${item}`),
+  ];
+  for (const line of lines) log(line);
+  return 0;
 }
 
 /** `--flag value` tokens into a map; bare tokens become positionals. */

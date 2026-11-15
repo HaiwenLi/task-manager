@@ -86,6 +86,16 @@ describe("writeBoard", () => {
     const names = await readdir(join(root, ".taskctl"));
     expect(names.filter((name) => name.endsWith(".tmp"))).toEqual([]);
   });
+
+  it("two concurrent writers both succeed and leave no tmp behind", async () => {
+    const root = await mkdtemp(join(tmpdir(), "taskctl-board-race-"));
+    const tasksDir = join(root, "tasks");
+    await mkdir(tasksDir, { recursive: true });
+    await Promise.all([writeBoard(tasksDir, "# one\n"), writeBoard(tasksDir, "# two\n")]);
+    const names = await readdir(join(root, ".taskctl"));
+    expect(names.filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    expect(["# one\n", "# two\n"]).toContain(await readFile(join(root, ".taskctl", "board.md"), "utf8"));
+  });
 });
 
 describe("taskctl board CLI", () => {

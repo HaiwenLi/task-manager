@@ -104,6 +104,8 @@ taskctl report --task <id>  单任务证据页
 taskctl accept|reject       人工放行或打回（reject 要说明是哪个环节的问题）
 taskctl audit --verdict …   抽查已完成的
 taskctl metrics             哪个环节在拖后腿
+taskctl learn --note "…"    记一条偏好（原话 → 改法），下次澄清会读到
+taskctl template --type …   看某类任务的必答/可推/补问模板
 ```
 
 要点：
@@ -113,6 +115,17 @@ taskctl metrics             哪个环节在拖后腿
 - **返工**：复核不过会写一条 `review-failed` 笔记并回到 `open`；连续 `maxReviewRounds` 轮（默认 2）后 `blocked`。
 - **人工节点**：`risk: high`、`human_check: true`、以及复核无法判定的任务停在 `awaiting-human`，只有 `accept` 能放行。
 - **归因**：`reject`/`audit` 都会记录问题出在 `clarify`（标准本身错）、`worker`（没做到）、还是 `reviewer`（漏判），`metrics` 按环节汇总。
+
+### 偏好档案
+
+`.taskctl/profile.md` 是一份可读、可手改的 Markdown，前面是说明，`## 观察` 下每条一行：
+
+```
+- 2026-11-16  不要问我能从仓库推出来的事
+- 2026-11-16  交付物先给结论再给证据
+```
+
+`taskctl learn --note "原话 → 改法"` 追加一条；`taskctl add` 会把它整段注入澄清提示词。它不是模型训练，是「把规则写下来，下次先按它走」；写错了直接删那一行。
 
 ## 运行
 

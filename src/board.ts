@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Task, TaskStatus } from "./task-file.js";
@@ -77,7 +78,9 @@ export function boardPath(tasksDir: string): string {
 export async function writeBoard(tasksDir: string, markdown: string): Promise<string> {
   const path = boardPath(tasksDir);
   await mkdir(join(path, ".."), { recursive: true });
-  const tmp = `${path}.tmp`;
+  // Unique temp name: two `taskctl board` processes in different terminals must
+  // not rename each other's half-written file.
+  const tmp = `${path}.${randomUUID()}.tmp`;
   await writeFile(tmp, markdown, "utf8");
   await rename(tmp, path);
   return path;
