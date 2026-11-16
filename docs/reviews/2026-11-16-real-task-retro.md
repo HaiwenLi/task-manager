@@ -219,5 +219,11 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 - `src/review.ts`：`ReviewEvidence.window`；提示词新增「容忍的外部变更」「时间窗口」两节与规则 5–7；`ReviewResult.externalChanges`（解析、去空、degraded 时为空）
 - `src/worker.ts`：证据带执行窗口；验收记录补 `startedAt`/`finishedAt`/`model`；journal 记 `verdict external=N`，事件详情带容忍条数
 - `src/report.ts`：`tolerate` 一行 + `tolerated` 逐条列表 + 复核模型
-- `tests/drift-tolerance.test.ts`：7 条；`tests/review.test.ts` 补一条提示词断言；`tests/helpers/task-fixture.ts` / `tests/worker*.test.ts` / `tests/lifecycle-safety.test.ts` 的 `Task`/`ReviewResult` fixture 补齐新必填字段
-- 验证：`npx vitest run` **278 passed / 1 skipped**
+- `tests/drift-tolerance.test.ts`：11 条；`tests/review.test.ts` 补提示词断言；`tests/helpers/task-fixture.ts` / `tests/worker*.test.ts` / `tests/lifecycle-safety.test.ts` 的 `Task`/`ReviewResult` fixture 补齐新必填字段
+- 独立复核（`docs/reviews/2026-11-17-drift-tolerance-review.md`）判为 ship with fixes，三条阻断项已修：
+  1. **复核-only 路径没有定义摘要检查**（最严重）：有 `criteria`、没有验收命令的任务直接进复核，而全仓唯一的 `definitionDigest` 比对在命令路径里。worker 因此可以在自己的回合里改 `tasks/<id>.md`——给自己加 `tolerate`、或把 `C1 32 行` 改成 `C1 大致填一下`——下一轮就按它自己写的判据被判过。复核用探针实跑证实（`{outcome:"done"}`）。修法：`requireUnchangedDefinition()` 在复核-only 路径进入复核前比对摘要，不一致就写 `definition-drift` 日志并 `blocked`。回归测试两条（加 `tolerate` / 改 `criteria`），并已确认**去掉修复后这两条会红**（任务变成 `done`）
+  2. **判决里没有记当时那份声明**：`review.json` 现在带 `tolerate` 与 `definitionDigest`；`report` 打印 `tolerate(at review)`，与当前声明不一致时标 `changed since`——事后收窄，旧判决不会看起来像被允许过更多
+  3. **提示词自相矛盾**：`new_column` 的说明写着"表头/列序变了"可容忍，规则 5 却说改表头含义必须 fail；且时间窗口印了但没有一条规则引用它。改为 `new_column` 只覆盖"别人插入一列（没改已有列含义、没删列）"，并新增规则 8：证据说明不了先后的差异按本任务的问题处理
+- 顺带（复核的非阻断项里便宜的）：`tolerate` 在摘要里排序（顺序不同不算定义变更）；`report` 的容忍列表截断到 5 条；`taskctl accept` 放行前打印容忍清单（人工闸门是最后一道）
+- 明确未做（记录在案）：窗口是 per-attempt 而不是 per-task（返工/retry 后上一轮的损伤会被读成"本来就有"）；没有 `tolerate` 的 CLI 写入口（只能改 frontmatter，和 worker 同一条通道——现已被定义检查兜住）；词表不含删列/加行/改名 sheet/改文件内容
+- 验证：`npx vitest run` **282 passed / 1 skipped**

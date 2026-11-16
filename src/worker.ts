@@ -378,6 +378,20 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
   }
 }
 
+/** Refuse to review work whose task definition moved under it. */
+async function requireUnchangedDefinition(r: Run): Promise<void> {
+  const current = await owned(r, async () => (await r.deps.store.list()).find((task) => task.id === r.task.id));
+  if (current && current.status === "running" && definitionDigest(current) === r.definition) return;
+  await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
+    stage: "review",
+    event: "definition-drift",
+    detail: "the task definition changed during the attempt; refusing to review it",
+  }));
+  throw new ReviewRequiredError(
+    "task definition changed during the attempt (criteria/tolerate/risk); re-approve before reviewing",
+  );
+}
+
 async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "awaiting-human"> {
   const command = r.task.acceptance?.trim();
   // Which model produced the work is part of the evidence: after a handover it
@@ -391,6 +405,13 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
       emit(r, "acceptance-skipped", "missing acceptance requires review");
       throw new ReviewRequiredError("missing acceptance criteria; review required");
     }
+    // The command path has always compared the definition digest; this path did
+    // not, so a worker could rewrite its own task file during its turn — widen
+    // `tolerate`, soften `criteria` — and the reviewer would judge it against
+    // the self-written definition. A definition is the operator's, and a change
+    // to it invalidates the attempt rather than being reviewed under the new
+    // rules.
+    await requireUnchangedDefinition(r);
     emit(r, "acceptance-skipped", "no command; review-only");
     await owned(r, () => writeRuntime(r.cfg.tasksDir, r.task.id, "acceptance.json", {
       command: "(none)", passed: false, skipped: true, exitCode: null, model,
@@ -493,8 +514,16 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
     );
     await owned(r, async () => {
       // Which model judged is part of the evidence: work passed by a fallback is
-      // not the same claim as work passed by the model the operator chose.
-      await writeRuntime(r.cfg.tasksDir, id, "review.json", { ...result, model: reviewerModel, at: new Date().toISOString() });
+      // not the same claim as work passed by the model the operator chose. So is
+      // the declaration that authorised any excused drift — a narrowed field
+      // must not read as if the reviewer had been allowed what it now says.
+      await writeRuntime(r.cfg.tasksDir, id, "review.json", {
+        ...result,
+        model: reviewerModel,
+        tolerate: r.task.tolerate,
+        definitionDigest: r.definition,
+        at: new Date().toISOString(),
+      });
       await appendJournal(r.cfg.tasksDir, id, {
         stage: "review",
         event: "verdict",

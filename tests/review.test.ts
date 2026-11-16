@@ -103,6 +103,12 @@ describe("buildReviewPrompt", () => {
     expect(withDrift).toContain("external_cell_change");
     expect(withDrift).toContain("2026-11-16T00:20:00.000Z");
     expect(withDrift).toContain("externalChanges");
+    // A changed header meaning is not "a new column": the hint and rule 5 have
+    // to agree, or the reviewer gets opposite instructions on the one case the
+    // real incident involved.
+    expect(withDrift).not.toContain("表头/列序变了");
+    expect(withDrift).toContain("时间上从严");
+    expect(withDrift).toContain("证据说明不了先后");
 
     const strict = parseTaskFile(
       "---\ntitle: 填表\nstatus: running\ncriteria:\n  - C1 填了 32 行\nsessions: []\nretries: 0\n---\n正文",

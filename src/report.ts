@@ -12,6 +12,8 @@ type AcceptanceFile = {
 
 type ReviewFile = {
   verdict?: string; summary?: string; defects?: string[]; model?: string; externalChanges?: string[];
+  /** The declaration the reviewer actually worked under, and the digest it belonged to. */
+  tolerate?: string[]; definitionDigest?: string;
   criteria?: Array<{ id?: string; pass?: boolean; evidence?: string }>;
 };
 
@@ -52,14 +54,12 @@ export async function buildReport(tasksDir: string, id: string): Promise<string[
       ? ["(no reviewer verdict recorded)"]
       : [
           `verdict  ${review.verdict ?? "?"}  ${review.summary ?? ""}${review.model === undefined ? "" : `  model ${review.model}`}`,
+          ...declarationLines(review, task.tolerate),
           ...(review.criteria ?? []).map(
             (criterion) => `  [${criterion.pass === true ? "x" : " "}] ${criterion.id ?? "?"} ${firstLine(criterion.evidence ?? "")}`,
           ),
           ...((review.defects ?? []).length > 0 ? [`defects  ${(review.defects ?? []).join("; ")}`] : []),
-          ...((review.externalChanges ?? []).length > 0
-            ? ["tolerated (attributed to someone else, not this task):",
-               ...(review.externalChanges ?? []).map((change) => `  ~ ${firstLine(change)}`)]
-            : []),
+          ...toleratedLines(review.externalChanges ?? []),
         ]),
     "",
     "## journal",
@@ -67,6 +67,33 @@ export async function buildReport(tasksDir: string, id: string): Promise<string[
     "",
     "## human audits",
     ...(audits.length > 0 ? audits.map(renderAudit) : ["(none)"]),
+  ];
+}
+
+/**
+ * The declaration the verdict was actually reached under. Today's task file is
+ * not evidence about an older review: narrowing `tolerate` after a pass must not
+ * read as if the reviewer had been allowed what the file now says.
+ */
+function declarationLines(review: ReviewFile, current: readonly string[]): string[] {
+  if (review.tolerate === undefined) return [];
+  const reviewed = review.tolerate;
+  const same = [...reviewed].sort().join(",") === [...current].sort().join(",");
+  const asReviewed = reviewed.length === 0 ? "(none)" : reviewed.join(", ");
+  return [`tolerate(at review) ${asReviewed}${same ? "" : `  (changed since; now ${current.length === 0 ? "(none)" : current.join(", ")})`}`];
+}
+
+/** One page, so a pathological list is summarised instead of pushing the rest off. */
+const TOLERATED_SHOWN = 5;
+
+function toleratedLines(changes: readonly string[]): string[] {
+  if (changes.length === 0) return [];
+  const shown = changes.slice(0, TOLERATED_SHOWN).map((change) => `  ~ ${firstLine(change)}`);
+  const rest = changes.length - shown.length;
+  return [
+    "tolerated (attributed to someone else, not this task):",
+    ...shown,
+    ...(rest > 0 ? [`  ~ (+${rest} more; see tasks/<id>/review.json)`] : []),
   ];
 }
 

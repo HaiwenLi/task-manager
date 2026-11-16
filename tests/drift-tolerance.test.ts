@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildReport } from "../src/report.js";
@@ -59,6 +59,28 @@ function adapter(): AgentAdapter {
     contextUsage: async () => 0,
     contextLimit: async () => 100,
   };
+}
+
+/** A turn that also rewrites its own task file, like a worker shelling out would. */
+function adapterThatRewrites(edit: (markdown: string) => string): AgentAdapter {
+  return {
+    prompt: async () => {
+      await mkdir(join(tasks, "a"), { recursive: true });
+      await writeFile(join(tasks, "a", "done.requested"), "done");
+      await writeFile(join(tasks, "a.md"), edit(await readFile(join(tasks, "a.md"), "utf8")), "utf8");
+      return { sessionId: "s", text: "done", exitCode: 0 };
+    },
+    contextUsage: async () => 0,
+    contextLimit: async () => 100,
+  };
+}
+
+/** A task with criteria and no acceptance command: the review-only path. */
+async function seedReviewOnly(): Promise<void> {
+  await writeFile(join(tasks, "a.md"), [
+    "---", "title: 填表", "status: open", "criteria:", "  - C1 32 行全部填好",
+    "review_rounds: 0", "sessions: []", "retries: 0", "---", "把 32 行填进共享表", "",
+  ].join("\n"), "utf8");
 }
 
 function config(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
@@ -128,19 +150,40 @@ describe("tolerate declaration", () => {
 });
 
 describe("tolerated drift through the review stage", () => {
-  it("passes, but records what was excused", async () => {
+  it("passes, but records what was excused, under which declaration", async () => {
     await seed(["tolerate:", "  - new_column", "  - external_cell_change"]);
     await runTask(config(), { store, adapter: adapter(), acceptance: pass, review: review(passedWithDrift) }, await store.get("a"), "w1");
 
     expect((await store.get("a")).status).toBe("done");
-    const recorded = await readRuntime<{ externalChanges: string[]; model?: string }>(tasks, "a", "review.json");
+    const recorded = await readRuntime<{
+      externalChanges: string[]; model?: string; tolerate?: string[]; definitionDigest?: string;
+    }>(tasks, "a", "review.json");
     expect(recorded?.externalChanges).toHaveLength(2);
+    // The permission is evidence too: an older verdict must not be re-read
+    // against a declaration that has since been narrowed.
+    expect(recorded?.tolerate).toEqual(["new_column", "external_cell_change"]);
+    expect(recorded?.definitionDigest).toBe(definitionDigest(await store.get("a")));
     expect((await journalTail(tasks, "a", 20)).join("\n")).toContain("external=2");
 
     // A tolerated change is a fact a human can still read back.
     const report = (await buildReport(tasks, "a")).join("\n");
     expect(report).toContain("tolerate new_column, external_cell_change");
+    expect(report).toContain("tolerate(at review) new_column, external_cell_change");
     expect(report).toContain("~ 表头多了 1 列");
+  });
+
+  it("marks a declaration that changed after the verdict", async () => {
+    await seed(["tolerate:", "  - new_column", "  - external_cell_change"]);
+    await runTask(config(), { store, adapter: adapter(), acceptance: pass, review: review(passedWithDrift) }, await store.get("a"), "w1");
+
+    // The operator narrows the field afterwards; the old verdict was reached
+    // under the old declaration and the report has to say so.
+    const narrowed = (await readFile(join(tasks, "a.md"), "utf8")).replace("  - external_cell_change\n", "");
+    await writeFile(join(tasks, "a.md"), narrowed, "utf8");
+
+    const report = (await buildReport(tasks, "a")).join("\n");
+    expect(report).toContain("tolerate(at review) new_column, external_cell_change");
+    expect(report).toContain("changed since; now new_column");
   });
 
   it("does not turn a failing verdict into a pass", async () => {
@@ -175,5 +218,45 @@ describe("tolerated drift through the review stage", () => {
     expect(seen.split("\n")[0]).not.toBe(seen.split("\n")[1]);
     expect(seen).toContain("windows: startedAt");
     expect(seen).toContain("model: w/one");
+  });
+});
+
+describe("a worker cannot write its own definition", () => {
+  const widenTolerate = (markdown: string) =>
+    markdown.replace("criteria:", "tolerate:\n  - external_cell_change\ncriteria:");
+  const softenCriteria = (markdown: string) =>
+    markdown.replace("C1 32 行全部填好", "C1 大致填一下就行");
+
+  it.each([
+    ["widens tolerate", widenTolerate],
+    ["softens its own criteria", softenCriteria],
+  ])("blocks when the worker %s mid-turn on the review-only path", async (_label, edit) => {
+    await seedReviewOnly();
+    let reviewed = 0;
+    const outcome = await runTask(config(), {
+      store,
+      adapter: adapterThatRewrites(edit),
+      acceptance: pass,
+      review: async () => { reviewed += 1; return passedWithDrift; },
+    }, await store.get("a"), "w1");
+
+    // The reviewer never sees evidence gathered under a definition the worker
+    // wrote for itself; the human has to look at what changed.
+    expect(outcome).toBe("blocked");
+    expect(reviewed).toBe(0);
+    expect((await store.get("a")).status).toBe("blocked");
+    expect((await journalTail(tasks, "a", 20)).join("\n")).toContain("definition-drift");
+  });
+
+  it("ignores the order of the tolerated kinds", () => {
+    const one = parseTaskFile(
+      "---\ntitle: t\nstatus: open\ncriteria:\n  - C1 ok\ntolerate:\n  - new_column\n  - deleted_row\nsessions: []\nretries: 0\n---\nbody",
+      "007-g",
+    );
+    const other = parseTaskFile(
+      "---\ntitle: t\nstatus: open\ncriteria:\n  - C1 ok\ntolerate:\n  - deleted_row\n  - new_column\nsessions: []\nretries: 0\n---\nbody",
+      "007-g",
+    );
+    expect(definitionDigest(one)).toBe(definitionDigest(other));
   });
 });

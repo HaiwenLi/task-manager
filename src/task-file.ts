@@ -30,9 +30,15 @@ export type DriftKind = "external_cell_change" | "new_column" | "deleted_row" | 
 /** How each tolerated kind reads to a human and to the reviewer. */
 export const DRIFT_HINTS: Record<DriftKind, string> = {
   external_cell_change: "别的单元格被改了，不是本任务写的那几个",
-  new_column: "表里多出一列（表头/列序变了）",
+  // Deliberately narrower than "the table structure may change": a column
+  // inserted by someone else is drift, a header whose meaning changed is a
+  // different table and must fail. The prompt's rule 5 says the same thing; the
+  // two used to disagree on the one case the real incident involved.
+  new_column: "别人插入了一列（判据：没有改动已有列的含义，也没有删列）",
   deleted_row: "不是本任务写入的行消失了",
-  extra_file: "工作目录里多出不是本任务写的文件",
+  // Only sound in the direction "someone else put a file here": a missing or
+  // wrong deliverable is still the task's problem, whatever else appeared.
+  extra_file: "别人往工作目录放了文件；本任务该产出的东西仍然必须存在且正确",
 };
 
 const DRIFT_KINDS = Object.keys(DRIFT_HINTS) as DriftKind[];

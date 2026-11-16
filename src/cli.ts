@@ -15,6 +15,7 @@ import type { AcceptanceResult } from "./acceptance.js";
 import { renderBoardMarkdown, renderBoardTable, writeBoard } from "./board.js";
 import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
+import { readRuntime } from "./runtime.js";
 import { reconcileTask, retryTask } from "./reconcile.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
@@ -449,6 +450,14 @@ async function acceptCommand(flags: Map<string, string>, log: (line: string) => 
   const task = await store.get(id);
   if (task.status !== "awaiting-human") {
     throw new Error(`task ${id} is ${task.status}, expected awaiting-human`);
+  }
+  // The human gate is the last place an excused defect can still be caught, so
+  // what the reviewer tolerated is printed here and not only in `report`.
+  const review = await readRuntime<{ externalChanges?: string[] }>(tasksDir, id, "review.json");
+  const tolerated = review?.externalChanges ?? [];
+  if (tolerated.length > 0) {
+    log(`${id}  复核容忍了 ${tolerated.length} 处外部变更，放行前请确认这些不是你该补的：`);
+    for (const change of tolerated) log(`  ~ ${change}`);
   }
   await store.setStatus(id, "done");
   await appendJournal(tasksDir, id, { stage: "human", event: "accepted" });
