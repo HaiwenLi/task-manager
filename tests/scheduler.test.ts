@@ -67,6 +67,38 @@ function adapter(): AgentAdapter {
   };
 }
 
+/**
+ * A turn that waits for its peer instead of sleeping a fixed time.
+ *
+ * The overlap this test wants to observe is "both turns are open at once". A
+ * 20 ms sleep measures that only if both tasks reach their turn within 20 ms of
+ * each other, and each first has to claim, reserve a workspace and write its
+ * runtime record — filesystem work whose jitter on Windows regularly exceeds
+ * the window, which made this test fail about half the time under full-suite
+ * load while passing alone. Waiting for the peer observes the overlap directly.
+ * The timeout keeps a real regression (only one task ever running) a failure
+ * instead of a hang.
+ */
+function overlappingAdapter(expected: number, waitMs = 250): AgentAdapter {
+  let release!: () => void;
+  const together = new Promise<void>((resolve) => { release = resolve; });
+  return {
+    prompt: async () => {
+      active++;
+      peak = Math.max(peak, active);
+      if (active >= expected) release();
+      const timer = setTimeout(release, waitMs);
+      timer.unref?.();
+      await together;
+      clearTimeout(timer);
+      active--;
+      return { sessionId: "s", text: "done", exitCode: 0 };
+    },
+    contextUsage: async () => 0,
+    contextLimit: async () => 100,
+  };
+}
+
 function config(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
   return {
     tasksDir: tasks,
@@ -76,11 +108,17 @@ function config(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
     retryLimit: 1,
     lockTtlMs: 20_000,
     heartbeatMs: 1_000,
+    // These tests are about which tasks run at the same time, not about what a
+    // turn does. Without a completion request the worker spends the whole turn
+    // budget (40 turns) before it blocks, which cost ~2 s per task and made the
+    // 20 ms overlap window the only thing standing between pass and flake.
+    maxTurnsPerSession: 1,
     ...overrides,
   };
 }
 
-/** Fails the acceptance gate so tasks end `blocked` and no review runs. */
+/** Tasks block at the turn cap, so this gate is never reached; the tests below
+ * only assert scheduling. Keeping it explicit documents that they end `blocked`. */
 const failGate = async () => ({ passed: false, skipped: false as const, exitCode: 1, output: "no" });
 
 describe("runScheduler", () => {
@@ -88,7 +126,7 @@ describe("runScheduler", () => {
     await seed("001-a", ["workdir: a"]);
     await seed("002-b", ["workdir: b"]);
     claimed = ["001-a", "002-b"];
-    await runScheduler(config({ parallel: 2 }), { store, adapter: adapter(), acceptance: failGate });
+    await runScheduler(config({ parallel: 2 }), { store, adapter: overlappingAdapter(2), acceptance: failGate });
     expect(peak).toBe(2);
   });
 

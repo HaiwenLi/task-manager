@@ -268,6 +268,9 @@ async function fallBack(r: Run, role: ModelRole, reason: string): Promise<boolea
   try {
     handover = await owned(r, () => rotateModel(r.cfg.tasksDir, r.task.id, role, chain, reason));
   } catch (error) {
+    // A lost lease is not a rotation problem: let the run skip, and do not
+    // report a write failure for a task this controller no longer owns.
+    if (error instanceof OwnershipLostError) throw error;
     const message = error instanceof Error ? error.message : String(error);
     await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
       stage: role === "worker" ? "worker" : "review",
@@ -310,6 +313,12 @@ async function turn(r: Run, text: string, model: string | undefined, sessionId?:
 async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
   let sessionId: string | undefined;
   let recordedSession = "", sessionsUsed = r.task.sessions.length, turns = 0;
+  // A handover is progress only if the recording sticks. On a cached or syncing
+  // filesystem the position can read back stale, and then every turn looks like
+  // a successful handover with no retry ever spent. The chain bounds how many
+  // legitimate handovers exist, so the loop is bounded by it too.
+  const maxHandovers = workerChain(r).length;
+  let handovers = 0;
   for (;;) {
     const note = await latestNote(r.cfg.tasksDir, r.task.id);
     const prompt = buildWorkerPrompt(r.task, { handoff: note?.markdown, workdir: r.cfg.workdir, tasksDir: r.cfg.tasksDir });
@@ -330,11 +339,11 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
     if (result.exitCode !== 0) {
       await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
       emit(r, "turn-failed", result.timedOut ? "turn timed out; shutdown confirmed" : `exit ${result.exitCode}`);
-      const handedOver = result.failure === "provider"
+      const handedOver = handovers < maxHandovers && result.failure === "provider"
         && await fallBack(r, "worker", `turn rejected by ${model ?? "(default)"}`);
       // The next model must not be asked to continue a session created by
       // another backend. A handover is a session boundary.
-      if (handedOver) fresh = true;
+      if (handedOver) { handovers++; fresh = true; }
       if (!handedOver && await fail(r)) return "blocked";
     } else if (await owned(r, () => r.deps.store.readDoneMarker(r.task.id))) {
       await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
@@ -350,7 +359,9 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       if (!after || after.seq <= (note?.seq ?? 0)) {
         if (wrap.failure === "provider") {
           // The wrap-up turn never ran, so there is no text to build a note from.
-          const handedOver = await fallBack(r, "worker", `wrap-up rejected by ${model ?? "(default)"}`);
+          const handedOver = handovers < maxHandovers
+            && await fallBack(r, "worker", `wrap-up rejected by ${model ?? "(default)"}`);
+          if (handedOver) handovers++;
           if (!handedOver && await fail(r)) return "blocked";
         } else {
           if (!wrap.timedOut) await owned(r, () => writeNote(r.cfg.tasksDir, fallbackNote(r.task, note?.seq ?? 0, wrap.text)));
@@ -459,8 +470,12 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
   // review is retried in place — with the next model when the chain has one —
   // and the task does not go back through the worker, because re-executing the
   // work to retry a review duplicates every side effect of a task that is not
-  // idempotent (a spreadsheet write, a file move). Each handover advances the
-  // chain, and the chain is finite, so the loop terminates.
+  // idempotent (a spreadsheet write, a file move). The chain is finite, and the
+  // loop is bounded by it explicitly rather than by trusting the read-back: a
+  // position that keeps coming back stale would otherwise spin forever with no
+  // retry spent.
+  const maxHandovers = reviewerChain(r).length;
+  let handovers = 0;
   for (;;) {
     const reviewerModel = await modelFor(r, "reviewer");
     const result = await controlled(r, "review", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT, () =>
@@ -489,8 +504,10 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
       event: "provider-failed",
       detail: result.summary,
     }));
-    const handedOver = await fallBack(r, "reviewer", `review rejected by ${reviewerModel ?? "(default)"}`);
+    const handedOver = handovers < maxHandovers
+      && await fallBack(r, "reviewer", `review rejected by ${reviewerModel ?? "(default)"}`);
     if (handedOver) {
+      handovers++;
       emit(r, "rework", "reviewer provider failure; retrying with the next model");
       continue;
     }

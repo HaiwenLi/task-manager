@@ -200,4 +200,5 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 - `src/reconcile.ts`：`retry` 把 `models.json` 一并归档（手动重开 = 回到链首）
 - `tests/model-fallback.test.ts`：13 条；`tests/provider-failure.test.ts`：2 条对照；`tests/reconcile.test.ts` / `tests/cli-config.test.ts` 各补一条
 - 独立复核（`docs/reviews/2026-11-17-model-fallback-review.md`）判为 ship with fixes，四条阻断项已按上表修正：`turn` 返回类型补 `PromptResult`、`models.json` 读全量容错且写失败不外抛、复核原地重试、换模型即换会话
-- 验证：`npx vitest run` **270 passed / 1 skipped**
+- 复核的复检（同文件 "Re-check" 节）判为 ship，并指出三条值得修的：两个换模型循环的终止都依赖"读回刚写的位置"，在缓存/同步文件系统上可能读到旧位置而无限循环且不花重试额度 → 改为按链长显式设上限；`fallBack` 把 `OwnershipLostError` 当写失败吞掉 → 改为透传，租约丢失按 skip 处理而不是记成 I/O 问题；`tests/scheduler.test.ts` 的并发断言靠 20ms 睡眠窗口，而它的 fake adapter 从不提交完成请求，每个任务实际空转满 40 个回合（4 次全量跑 2 红 2 绿）→ 改为"等对端进入"的屏障 + `maxTurnsPerSession: 1`，该文件从 11s 降到 2.7s
+- 验证：`npx vitest run` **270 passed / 1 skipped**，连续三次全绿
