@@ -5,13 +5,13 @@ import { startAcceptance, type AcceptanceResult } from "./acceptance.js";
 import { buildWorkerPrompt } from "./protocol.js";
 import type { TaskStore } from "./task-store.js";
 import type { Task } from "./task-file.js";
-import type { AgentAdapter } from "./adapters/types.js";
+import type { AgentAdapter, PromptResult } from "./adapters/types.js";
 import type { Execution } from "./execution.js";
 import { reserveWorkspace, artifactDigest, type WorkspaceReservation } from "./workspace.js";
 import { definitionDigest, readAttempt, readRuntime, writeRuntime, type AttemptRecord } from "./runtime.js";
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
-import { modelAt, modelChain, readModelRotation, rotateModel, type ModelRole } from "./models.js";
+import { chainPosition, modelAt, modelChain, readModelRotation, rotateModel, type Handover, type ModelRole } from "./models.js";
 import { startReview, type ReviewEvidence, type ReviewResult } from "./review.js";
 
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
@@ -245,7 +245,7 @@ const reviewerChain = (r: Run): string[] => modelChain(r.cfg.reviewerModel, r.cf
 async function modelFor(r: Run, role: ModelRole): Promise<string | undefined> {
   const chain = role === "worker" ? workerChain(r) : reviewerChain(r);
   const rotation = await readModelRotation(r.cfg.tasksDir, r.task.id);
-  return modelAt(chain, rotation[role]);
+  return modelAt(chain, chainPosition(chain, rotation[role]));
 }
 
 /**
@@ -255,10 +255,28 @@ async function modelFor(r: Run, role: ModelRole): Promise<string | undefined> {
  * attempt never reached the work, and the alternative is spending the whole
  * budget on the one model that is provably unavailable. The chain is finite, so
  * this stays bounded; running out of models spends retries as before.
+ *
+ * A handover that cannot be recorded is not a handover: the position is what
+ * survives into the retry, and claiming success without it would send the next
+ * turn straight back to the model that just refused. It reports `false`
+ * instead, so the ordinary retry budget and its `blocked` outcome apply — never
+ * an exception out of a task that had already settled its turn.
  */
 async function fallBack(r: Run, role: ModelRole, reason: string): Promise<boolean> {
   const chain = role === "worker" ? workerChain(r) : reviewerChain(r);
-  const handover = await owned(r, () => rotateModel(r.cfg.tasksDir, r.task.id, role, chain, reason));
+  let handover: Handover | null;
+  try {
+    handover = await owned(r, () => rotateModel(r.cfg.tasksDir, r.task.id, role, chain, reason));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
+      stage: role === "worker" ? "worker" : "review",
+      event: "model-fallback-failed",
+      detail: `could not record the rotation: ${message}`,
+    })).catch(() => {});
+    emit(r, "model-fallback", `${role}: ${reason} (rotation not recorded: ${message})`);
+    return false;
+  }
   if (handover === null) return false;
   const detail = `${handover.from || "(default)"} -> ${handover.to}`;
   emit(r, "model-fallback", `${role}: ${detail}`);
@@ -270,7 +288,12 @@ async function fallBack(r: Run, role: ModelRole, reason: string): Promise<boolea
   return true;
 }
 
-async function turn(r: Run, text: string, model: string | undefined, sessionId?: string) {
+/**
+ * One agent turn. The declared return type is the union of "the backend
+ * answered" and "we timed out", which is why `failure` has to be part of it:
+ * both branches reach the caller's provider check.
+ */
+async function turn(r: Run, text: string, model: string | undefined, sessionId?: string): Promise<PromptResult & { timedOut: boolean }> {
   const args = { sessionId, text, model, effort: r.task.effort ?? r.cfg.effort, title: r.task.title, cwd: r.cfg.workdir };
   try {
     return { ...await controlled(r, "agent turn", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT,
@@ -293,7 +316,10 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
     const model = await modelFor(r, "worker");
     const result = await turn(r, prompt, model, sessionId);
     await owned(r, async () => {
-      if (result.sessionId && result.sessionId !== recordedSession) {
+      // A rejected turn did no work, and its session belongs to the backend that
+      // refused it: recording it would both spend a session and hand the next
+      // provider a transcript it never wrote.
+      if (result.sessionId && result.failure !== "provider" && result.sessionId !== recordedSession) {
         await r.deps.store.appendSession(r.task.id, result.sessionId);
         recordedSession = sessionId = result.sessionId; sessionsUsed++;
       }
@@ -306,6 +332,9 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       emit(r, "turn-failed", result.timedOut ? "turn timed out; shutdown confirmed" : `exit ${result.exitCode}`);
       const handedOver = result.failure === "provider"
         && await fallBack(r, "worker", `turn rejected by ${model ?? "(default)"}`);
+      // The next model must not be asked to continue a session created by
+      // another backend. A handover is a session boundary.
+      if (handedOver) fresh = true;
       if (!handedOver && await fail(r)) return "blocked";
     } else if (await owned(r, () => r.deps.store.readDoneMarker(r.task.id))) {
       await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
@@ -319,9 +348,15 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       const wrap = await turn(r, WRAP_UP_INSTRUCTION, model, sessionId);
       const after = await latestNote(r.cfg.tasksDir, r.task.id);
       if (!after || after.seq <= (note?.seq ?? 0)) {
-        if (!wrap.timedOut) await owned(r, () => writeNote(r.cfg.tasksDir, fallbackNote(r.task, note?.seq ?? 0, wrap.text)));
-        emit(r, "handoff", sessionId);
-        if (await fail(r)) return "blocked";
+        if (wrap.failure === "provider") {
+          // The wrap-up turn never ran, so there is no text to build a note from.
+          const handedOver = await fallBack(r, "worker", `wrap-up rejected by ${model ?? "(default)"}`);
+          if (!handedOver && await fail(r)) return "blocked";
+        } else {
+          if (!wrap.timedOut) await owned(r, () => writeNote(r.cfg.tasksDir, fallbackNote(r.task, note?.seq ?? 0, wrap.text)));
+          emit(r, "handoff", sessionId);
+          if (await fail(r)) return "blocked";
+        }
       } else emit(r, "handoff", sessionId);
       fresh = true;
     }
@@ -334,6 +369,9 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
 
 async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "awaiting-human"> {
   const command = r.task.acceptance?.trim();
+  // Which model produced the work is part of the evidence: after a handover it
+  // is no longer the model the operator configured.
+  const model = await modelFor(r, "worker");
   if (!command) {
     // No command and no criteria: nothing can judge this task, so it waits for
     // a human. With criteria, the reviewer is the gate — office, design and
@@ -344,7 +382,7 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
     }
     emit(r, "acceptance-skipped", "no command; review-only");
     await owned(r, () => writeRuntime(r.cfg.tasksDir, r.task.id, "acceptance.json", {
-      command: "(none)", passed: false, skipped: true, exitCode: null,
+      command: "(none)", passed: false, skipped: true, exitCode: null, model,
       note: "no acceptance command; review decides", at: new Date().toISOString(),
     }));
     return await reviewStage(r);
@@ -367,7 +405,7 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
     const current = (await r.deps.store.list()).find(t => t.id === r.task.id);
     const definitionMatches = !!current && current.status === "running" && definitionDigest(current) === r.definition;
     const evidence = { attemptId: r.owner, definitionDigest: r.definition, artifactBefore, artifactAfter, command,
-      startedAt, finishedAt: new Date().toISOString(), ...result, definitionMatches };
+      startedAt, finishedAt: new Date().toISOString(), ...result, model, definitionMatches };
     await writeRuntime(r.cfg.tasksDir, r.task.id, "acceptance.json", evidence);
     if (!definitionMatches || artifactBefore !== artifactAfter || result.skipped) throw new ReviewRequiredError("acceptance evidence invalidated by definition/artifact drift or skipped check");
     emit(r, "acceptance", result.passed ? "passed" : `failed (exit ${result.exitCode ?? "null"})`);
@@ -416,40 +454,58 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
     await r.deps.store.setStatus(id, "review");
     await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "started", detail: `criteria=${r.task.criteria.length}` });
   });
-  const reviewerModel = await modelFor(r, "reviewer");
-  const result = await controlled(r, "review", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT, () =>
-    r.deps.review
-      ? legacyExecution(() => r.deps.review!(evidence))
-      : startReview({
-          adapter: r.deps.adapter,
-          cwd: r.cfg.workdir,
-          model: reviewerModel,
-          effort: r.cfg.reviewerEffort,
-          title: r.task.title,
-        }, evidence),
-    (review) => review.failure === "provider",
-  );
-  await owned(r, async () => {
-    await writeRuntime(r.cfg.tasksDir, id, "review.json", { ...result, at: new Date().toISOString() });
-    await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "verdict", detail: result.verdict });
-  });
-  emit(r, "reviewed", result.verdict);
 
-  // A provider rejection is not a verdict: the reviewer never got to judge.
-  // Spend an attempt (not a review round) and reopen for a rerun.
-  if (result.failure === "provider") {
+  // A provider rejection is not a verdict: the reviewer never got to judge. The
+  // review is retried in place — with the next model when the chain has one —
+  // and the task does not go back through the worker, because re-executing the
+  // work to retry a review duplicates every side effect of a task that is not
+  // idempotent (a spreadsheet write, a file move). Each handover advances the
+  // chain, and the chain is finite, so the loop terminates.
+  for (;;) {
+    const reviewerModel = await modelFor(r, "reviewer");
+    const result = await controlled(r, "review", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT, () =>
+      r.deps.review
+        ? legacyExecution(() => r.deps.review!(evidence))
+        : startReview({
+            adapter: r.deps.adapter,
+            cwd: r.cfg.workdir,
+            model: reviewerModel,
+            effort: r.cfg.reviewerEffort,
+            title: r.task.title,
+          }, evidence),
+      (review) => review.failure === "provider",
+    );
+    await owned(r, async () => {
+      // Which model judged is part of the evidence: work passed by a fallback is
+      // not the same claim as work passed by the model the operator chose.
+      await writeRuntime(r.cfg.tasksDir, id, "review.json", { ...result, model: reviewerModel, at: new Date().toISOString() });
+      await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "verdict", detail: result.verdict });
+    });
+    emit(r, "reviewed", result.verdict);
+
+    if (result.failure !== "provider") return await judge(r, result);
     await owned(r, () => appendJournal(r.cfg.tasksDir, id, {
       stage: "review",
       event: "provider-failed",
       detail: result.summary,
     }));
     const handedOver = await fallBack(r, "reviewer", `review rejected by ${reviewerModel ?? "(default)"}`);
-    if (!handedOver && await fail(r)) return "blocked";
+    if (handedOver) {
+      emit(r, "rework", "reviewer provider failure; retrying with the next model");
+      continue;
+    }
+    // No model left: spend an attempt and reopen. A full rerun is the only
+    // remaining option, and the operator can raise the quota and call `retry`.
+    if (await fail(r)) return "blocked";
     await owned(r, () => r.deps.store.setStatus(id, "open"));
-    emit(r, "rework", handedOver ? "reviewer provider failure; retrying with the next model" : "reviewer provider failure; retrying");
+    emit(r, "rework", "reviewer provider failure; retrying");
     return "open";
   }
+}
 
+/** Act on a verdict that actually judged the work. */
+async function judge(r: Run, result: ReviewResult): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
+  const id = r.task.id;
   if (result.verdict === "unclear") {
     await owned(r, () => r.deps.store.setStatus(id, "awaiting-human"));
     emit(r, "awaiting-human", "review could not decide");

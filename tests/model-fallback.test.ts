@@ -74,11 +74,16 @@ const rejected = (model: string): PromptResult => ({ sessionId: `s-${model}`, te
  * review turns get separate tables, because both may run on the same model name
  * and the point of these tests is which model was handed what.
  */
-function adapter(tables: { turns: Record<string, Behaviour>; reviews?: Record<string, Behaviour> }, models: string[] = []): AgentAdapter {
+function adapter(
+  tables: { turns: Record<string, Behaviour>; reviews?: Record<string, Behaviour> },
+  models: string[] = [],
+  sessions: (string | undefined)[] = [],
+): AgentAdapter {
   const answer = async (args: Args): Promise<PromptResult> => {
     const model = args.model ?? "(default)";
     const review = args.title?.startsWith("review:") === true;
     models.push(`${review ? "review:" : ""}${model}`);
+    if (!review) sessions.push(args.sessionId);
     const behaviour = (review ? tables.reviews : tables.turns)?.[model];
     if (behaviour === undefined) throw new Error(`unexpected ${review ? "review" : "turn"} model ${model}`);
     if (behaviour !== "done") return behaviour;
@@ -142,8 +147,25 @@ describe("worker model fallback", () => {
     expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one", "w/two"]);
     expect(events.find((event) => event.type === "model-fallback")?.detail).toBe("worker: w/one -> w/two");
     expect((await store.get("a")).retries).toBe(0);
-    expect((await readModelRotation(tasks, "a")).worker).toBe(1);
+    expect((await readModelRotation(tasks, "a")).worker).toEqual({ index: 1, model: "w/two" });
     expect((await journalTail(tasks, "a", 20)).join("\n")).toContain("model-fallback");
+  });
+
+  it("starts a new session for the model that takes over", async () => {
+    await seed();
+    const models: string[] = [];
+    const sessions: (string | undefined)[] = [];
+    const agent = adapter({
+      turns: { "w/one": rejected("w/one"), "w/two": "done" },
+      reviews: { "(default)": PASS_VERDICT },
+    }, models, sessions);
+
+    expect(await run(agent, [], { modelFallbacks: ["w/two"] })).toBe("done");
+    // The rejected turn's session is neither resumed nor recorded as a session
+    // the task spent: the next provider must not inherit another backend's
+    // transcript, and a turn that did no work is not part of the session chain.
+    expect(sessions).toEqual([undefined, undefined]);
+    expect((await store.get("a")).sessions).toEqual(["s-w/two"]);
   });
 
   it("blocks once the chain is spent, keeping the last model chosen", async () => {
@@ -156,7 +178,7 @@ describe("worker model fallback", () => {
     expect(outcome).toBe("blocked");
     expect(models).toEqual(["w/one", "w/two"]);
     expect((await store.get("a")).retries).toBe(1);
-    expect((await readModelRotation(tasks, "a")).worker).toBe(1);
+    expect((await readModelRotation(tasks, "a")).worker).toEqual({ index: 1, model: "w/two" });
   });
 
   it("keeps the rotation across attempts, so a rerun does not retry the dead model first", async () => {
@@ -175,7 +197,7 @@ describe("worker model fallback", () => {
 });
 
 describe("reviewer model fallback", () => {
-  it("reviews with the next model when the first one is rejected", async () => {
+  it("re-reviews with the next model instead of re-running the work", async () => {
     await seed();
     const models: string[] = [];
     const agent = adapter({
@@ -184,14 +206,25 @@ describe("reviewer model fallback", () => {
     }, models);
     const cfg = { reviewerModel: "r/one", reviewerModelFallbacks: ["r/two"] };
 
-    // The rejected review reopens the task without spending the single retry.
-    expect(await run(agent, [], cfg)).toBe("open");
-    expect((await store.get("a")).retries).toBe(0);
-    expect((await readModelRotation(tasks, "a")).reviewer).toBe(1);
-
-    // The next run reviews with the fallback and finishes.
+    // The rejected review is retried inside the review stage: the single retry
+    // is untouched, and the task does not go back through the worker, which
+    // would duplicate the side effects of a task that is not idempotent.
     expect(await run(agent, [], cfg)).toBe("done");
+    expect((await store.get("a")).retries).toBe(0);
+    expect((await readModelRotation(tasks, "a")).reviewer).toEqual({ index: 1, model: "r/two" });
+    expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one"]);
     expect(models.filter((model) => model.startsWith("review:"))).toEqual(["review:r/one", "review:r/two"]);
+  });
+
+  it("reopens for a full rerun only when no reviewer model is left", async () => {
+    await seed();
+    const models: string[] = [];
+    const agent = adapter({ turns: { "w/one": "done" }, reviews: { "r/one": rejected("r/one") } }, models);
+
+    // One model, no fallback: the rejected review spends an attempt and reopens.
+    expect(await run(agent, [], { reviewerModel: "r/one", retryLimit: 2 })).toBe("open");
+    expect(models.filter((model) => model.startsWith("review:"))).toEqual(["review:r/one"]);
+    expect((await store.get("a")).retries).toBe(1);
   });
 });
 
@@ -202,6 +235,46 @@ describe("rotation is advisory", () => {
     await writeFile(join(tasks, "a", "models.json"), "{ not json", "utf8");
     const models: string[] = [];
     const agent = adapter({ turns: { "w/one": "done" }, reviews: { "(default)": PASS_VERDICT } }, models);
+
+    expect(await run(agent, [], { modelFallbacks: ["w/two"] })).toBe("done");
+    expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one"]);
+  });
+
+  it("treats an unreadable models.json as no rotation at all", async () => {
+    await seed();
+    // A directory where the record should be: the read cannot succeed, and a
+    // cache file must never turn a working task into an uncertain attempt.
+    await mkdir(join(tasks, "a", "models.json"), { recursive: true });
+    const models: string[] = [];
+    const agent = adapter({ turns: { "w/one": "done" }, reviews: { "(default)": PASS_VERDICT } }, models);
+
+    expect(await run(agent, [], { modelFallbacks: ["w/two"] })).toBe("done");
+    expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one"]);
+  });
+
+  it("blocks instead of throwing when a rotation cannot be recorded", async () => {
+    await seed();
+    await mkdir(join(tasks, "a", "models.json"), { recursive: true });
+    const models: string[] = [];
+    const agent = adapter({
+      turns: { "w/one": rejected("w/one"), "w/two": rejected("w/two") },
+    }, models);
+
+    // The write fails (the path is a directory). The task must end as an
+    // ordinary retry-limit block with a journal line, not as an exception out
+    // of a turn that had already settled.
+    expect(await run(agent, [], { modelFallbacks: ["w/two"] })).toBe("blocked");
+    expect((await journalTail(tasks, "a", 20)).join("\n")).toContain("model-fallback-failed");
+  });
+
+  it("re-anchors when the recorded position belongs to a different model", async () => {
+    await seed();
+    await mkdir(join(tasks, "a"), { recursive: true });
+    // Someone changed the primary model; the old position pointed at a model
+    // the chain no longer has in that slot.
+    await writeFile(join(tasks, "a", "models.json"), JSON.stringify({ worker: { index: 1, model: "w/old" } }), "utf8");
+    const models: string[] = [];
+    const agent = adapter({ turns: { "w/one": "done", "w/two": "done" }, reviews: { "(default)": PASS_VERDICT } }, models);
 
     expect(await run(agent, [], { modelFallbacks: ["w/two"] })).toBe("done");
     expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one"]);

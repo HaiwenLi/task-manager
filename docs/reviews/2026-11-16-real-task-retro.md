@@ -101,9 +101,12 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 
 1. `taskctl.json` 新增 `modelFallbacks` / `reviewerModelFallbacks`（`string[]`）；链条 = 主模型（任务 frontmatter 的 `model` 优先）+ 备用列表，去重去空。没有主模型时链条为空——备用列表只是追加，不会替人"选"一个没人配的模型
 2. 只有在 adapter 判定 `failure: "provider"` 时才轮转，并且**不消耗重试额度**：这一回合根本没干活，把额度花在必然不可用的模型上才是浪费。链条有限，走完照旧按 `retryLimit` 计失败
-3. 当前位置写 `tasks/<id>/models.json`（不是 `attempt.json`——它要活过自己触发的重试）；`taskctl retry` 把它和旧证据一起归档，回到链首，配额恢复后手动重开就从主模型重来
-4. `models.json` 是提示性状态不是证据：损坏按"从链首开始"，不阻塞任务；写失败才抛错（写失败说明目录不可写，那是真问题）
-5. 事件与 journal 都记 `model-fallback`（`from -> to` + 原因），`tests/model-fallback.test.ts` 8 条覆盖：worker 轮转不花额度（`retryLimit=1` 下仍能跑完）、链耗尽才 blocked、跨 attempt 保持当前位置、reviewer 轮转、损坏文件、无主模型时忽略备用列表
+3. 当前位置写 `tasks/<id>/models.json`（不是 `attempt.json`——它要活过自己触发的重试）；位置里存的是**选中的模型名**而不只是下标，主模型被改动后旧下标不会悄悄指向另一个备用模型。`taskctl retry` 把它和旧证据一起归档，回到链首
+4. `models.json` 是提示性状态不是证据，读写两半分开对待：**读**全量容错（缺失、损坏、越界、模型对不上 → 从链首开始），绝不因为缓存文件把已结算的回合推成 `uncertain`；**写**失败则不认为换成了（返回 false，走普通重试并 journal 记 `model-fallback-failed`），因为位置正是"下次别再撞同一堵墙"的唯一凭据
+5. 换模型同时是**会话边界**：被拒的回合不记进 `sessions`，下一个模型也不续用别的后端创建的会话——否则一个外来会话被新 provider 拒绝会产生非 429 的普通失败，把 `retryLimit` 原地烧光，正好是这功能要避免的结局
+6. 复核被拒在**复核阶段内部**换模型重试，不把任务退回 `open` 重跑：非幂等任务（写共享表、移文件）不能为了重试一次复核被执行两遍。没有备用模型时才回到"计一次失败 + 重开"
+7. 事件与 journal 都记 `model-fallback`（`from -> to` + 原因）；`acceptance.json` / `review.json` 记下实际使用的模型，被备用模型判定通过的工作与主模型判定通过不是同一个声明
+8. `tests/model-fallback.test.ts` 13 条覆盖：不花额度（`retryLimit=1` 下仍能跑完）、会话边界、链耗尽才 blocked、跨 attempt 保持位置、复核原地重试（只跑一次 worker）、无备用时重开、损坏/不可读/不可写三种文件状态、主模型变更后重新定位、无主模型时忽略备用列表
 
 **未做**：`reviewerModel` 与 `model` 强制不同 provider（担心把 `--allow-same-provider` 做成一个人人都会加的参数，不如在文档里写清"同 provider 的复核独立性存疑"）；退避等待。
 
@@ -191,9 +194,10 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 ### 第二轮补充（N2 / N5 落地）
 
 - `src/adapters/types.ts` + `src/adapters/opencode.ts`：`PromptResult.failure?: "provider"`，从 NDJSON error 事件与 stderr 识别 429 / 配额 / 鉴权 / 5xx
-- `src/worker.ts`：`controlled(..., acceptSettled)` 让"已结算的 provider 拒绝"跳过取消确认；`reviewStage` 透传 `ReviewResult.failure`；新增模型降级（`modelFor` / `fallBack`），`turn` 与复核都按链取模型
-- `src/models.ts`：新增模型链与轮转状态（`modelChain` / `modelAt` / `readModelRotation` / `rotateModel`）——`tasks/<id>/models.json`，损坏按链首处理
+- `src/worker.ts`：`controlled(..., acceptSettled)` 让"已结算的 provider 拒绝"跳过取消确认；`reviewStage` 透传 `ReviewResult.failure` 并在原地重试复核；新增模型降级（`modelFor` / `fallBack`），`turn` 与复核都按链取模型；换模型即换会话
+- `src/models.ts`：新增模型链与轮转状态（`modelChain` / `chainPosition` / `readModelRotation` / `rotateModel`）——`tasks/<id>/models.json`，读全量容错、写失败不外抛
 - `src/cli.ts`：`modelFallbacks` / `reviewerModelFallbacks` 两个 `string[]` 字段的校验
 - `src/reconcile.ts`：`retry` 把 `models.json` 一并归档（手动重开 = 回到链首）
-- `tests/model-fallback.test.ts`：8 条；`tests/provider-failure.test.ts`：2 条对照；`tests/reconcile.test.ts` / `tests/cli-config.test.ts` 各补一条
-- 验证：`npx vitest run` **265 passed / 1 skipped**
+- `tests/model-fallback.test.ts`：13 条；`tests/provider-failure.test.ts`：2 条对照；`tests/reconcile.test.ts` / `tests/cli-config.test.ts` 各补一条
+- 独立复核（`docs/reviews/2026-11-17-model-fallback-review.md`）判为 ship with fixes，四条阻断项已按上表修正：`turn` 返回类型补 `PromptResult`、`models.json` 读全量容错且写失败不外抛、复核原地重试、换模型即换会话
+- 验证：`npx vitest run` **270 passed / 1 skipped**

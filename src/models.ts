@@ -10,18 +10,28 @@ import { join } from "node:path";
  * `retryLimit` is the one failure mode a single-model setup cannot escape, so
  * each role may declare a chain of alternatives after its primary model.
  *
- * The rotation index lives in `tasks/<id>/models.json` rather than
- * `attempt.json`, because it has to survive the very retries it causes: a new
- * attempt starts from a fresh record, and would otherwise forget that the head
- * of the chain is the model that just refused.
+ * The rotation lives in `tasks/<id>/models.json` rather than `attempt.json`,
+ * because it has to survive the very retries it causes: a new attempt starts
+ * from a fresh record, and would otherwise forget that the head of the chain is
+ * the model that just refused.
  *
- * It is advisory state, not evidence. A damaged file reads as "start at the
- * head" — losing the index costs one rejected attempt, while refusing to run
- * would strand a healthy task over a cache file.
+ * It is advisory state, not evidence, and that shapes both halves of the I/O:
+ *
+ * - reads are total. A missing, unreadable, truncated or nonsensical file means
+ *   "start at the head". Losing the position costs one rejected attempt; letting
+ *   the error escape would push a settled turn into `uncertain`, leak the
+ *   workspace reservation, and abort the whole queue over a cache file.
+ * - a position records *which model it chose*, not just an index. If someone
+ *   changes the primary model in `taskctl.json`, an old index would silently
+ *   select a fallback that no longer means what it did; re-anchoring on mismatch
+ *   puts the new primary back in front.
  */
 export type ModelRole = "worker" | "reviewer";
-export type ModelRotation = { worker?: number; reviewer?: number; reason?: string; updatedAt?: string };
-export type Handover = { role: ModelRole; from: string; to: string; index: number };
+
+/** How far down the chain a role has moved, and the model that position was chosen for. */
+export type RotationEntry = { index: number; model: string };
+export type ModelRotation = { worker?: RotationEntry; reviewer?: RotationEntry; reason?: string; updatedAt?: string };
+export type Handover = { role: ModelRole; from: string; to: string };
 
 const FILE = "models.json";
 
@@ -44,30 +54,40 @@ export function modelChain(primary: string | undefined, fallbacks: readonly stri
   return chain;
 }
 
-/** The model at a rotation index; an unusable index means the head of the chain. */
+/** The model at a rotation index; an index the chain no longer has means the head. */
 export function modelAt(chain: readonly string[], index: number | undefined): string | undefined {
   const at = index ?? 0;
   return Number.isInteger(at) && at >= 0 && at < chain.length ? chain[at] : chain[0];
 }
 
-function indexOf(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+/** Where the chain actually stands: a position recorded for a different model is stale. */
+export function chainPosition(chain: readonly string[], entry: RotationEntry | undefined): number {
+  if (entry === undefined) return 0;
+  return chain[entry.index] === entry.model ? entry.index : 0;
+}
+
+function entry(value: unknown): RotationEntry | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  const index = record.index;
+  if (typeof index !== "number" || !Number.isInteger(index) || index < 0) return undefined;
+  if (typeof record.model !== "string" || record.model.length === 0) return undefined;
+  return { index, model: record.model };
 }
 
 export async function readModelRotation(tasksDir: string, id: string): Promise<ModelRotation> {
   let raw: string;
   try {
     raw = await readFile(join(tasksDir, id, FILE), "utf8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return {};
-    throw err;
+  } catch {
+    return {};
   }
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown> | null;
     if (typeof parsed !== "object" || parsed === null) return {};
     return {
-      worker: indexOf(parsed.worker),
-      reviewer: indexOf(parsed.reviewer),
+      worker: entry(parsed.worker),
+      reviewer: entry(parsed.reviewer),
       ...(typeof parsed.reason === "string" ? { reason: parsed.reason } : {}),
       ...(typeof parsed.updatedAt === "string" ? { updatedAt: parsed.updatedAt } : {}),
     };
@@ -87,9 +107,12 @@ export async function writeModelRotation(tasksDir: string, id: string, rotation:
 
 /**
  * Advance one role to the next model in its chain, or report that the chain is
- * spent. The write is a plain read-modify-write under a unique temp name: two
- * controllers can only rotate the same task if the task lock was stolen, and in
- * that case the loser's fencing token makes its write irrelevant.
+ * spent.
+ *
+ * A failed write throws: the caller contains it (see `fallBack` in the worker),
+ * because a rotation that cannot be recorded must not be reported as progress.
+ * Writing is how the position survives the retry, so an unrecorded handover
+ * would send the next turn back to the model that just refused.
  */
 export async function rotateModel(
   tasksDir: string,
@@ -100,14 +123,10 @@ export async function rotateModel(
   now: Date = new Date(),
 ): Promise<Handover | null> {
   const current = await readModelRotation(tasksDir, id);
-  const index = current[role] ?? 0;
+  const index = chainPosition(chain, current[role]);
   const next = index + 1;
   if (next >= chain.length) return null;
-  await writeModelRotation(tasksDir, id, { ...current, [role]: next, reason, updatedAt: now.toISOString() });
-  return { role, from: modelAt(chain, index) ?? "", to: chain[next] as string, index: next };
-}
-
-/** Back to the head of every chain — a manual retry is a fresh start. */
-export async function resetModelRotation(tasksDir: string, id: string): Promise<void> {
-  await writeModelRotation(tasksDir, id, {});
+  const to = chain[next]!;
+  await writeModelRotation(tasksDir, id, { ...current, [role]: { index: next, model: to }, reason, updatedAt: now.toISOString() });
+  return { role, from: chain[index]!, to };
 }
