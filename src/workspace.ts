@@ -48,11 +48,16 @@ async function withRegistryMutex<T>(registryDir: string, action: () => Promise<T
       await mkdir(mutex);
       break;
     } catch (error) {
-      // Concurrent creation of the same name reports EEXIST on POSIX but can
-      // surface as EPERM/EBUSY on Windows. All three mean "someone else may
-      // hold it": retry within the deadline instead of failing the caller.
-      if (!["EEXIST", "EPERM", "EBUSY"].includes(code(error) ?? "")) throw error;
-      if (Date.now() >= deadline) throw new Error("Workspace registry mutex is busy; no automatic stale-lock takeover");
+      const failure = code(error) ?? "";
+      // Concurrent creation of the same name reports EEXIST everywhere, but can
+      // surface as EPERM/EBUSY on Windows. Retry those only there: on POSIX a
+      // real permission error must be reported, not turned into a 5s wait.
+      const retryable = failure === "EEXIST" ||
+        (process.platform === "win32" && (failure === "EPERM" || failure === "EBUSY"));
+      if (!retryable) throw error;
+      if (Date.now() >= deadline) {
+        throw new Error(`Workspace registry mutex is busy (last error ${failure}); no automatic stale-lock takeover`);
+      }
       await delay(10);
     }
   }
@@ -166,28 +171,55 @@ export async function reserveWorkspace(
     const lock = join(canonical, LOCK_NAME);
     const marker = join(lock, `${record.token}.json`);
     const owner = JSON.stringify({ ...record, attemptId });
-    let identity: Awaited<ReturnType<typeof lstat>> | null = null;
-    let markerIdentity: Awaited<ReturnType<typeof lstat>> | null = null;
+    // Identity of the lock dir we create here; null while acquisition has not
+    // read it yet (it may be what fails), which the catch handles explicitly.
+    let dirIdentity: Awaited<ReturnType<typeof lstat>> | null = null;
     let created = false;
     try {
       await mkdir(lock);
       created = true;
-      identity = await lstat(lock);
+      dirIdentity = await lstat(lock);
       await writeFile(marker, owner, { flag: "wx" });
-      markerIdentity = await lstat(marker);
+      const markerId = await lstat(marker);
+      let released = false;
+      return {
+        cwd: canonical,
+        async release() {
+          if (released) return;
+          await withRegistryMutex(registryDir, async () => {
+            const currentRecords = await readRegistry(registryDir);
+            const currentRecord = currentRecords.find((item) => item.token === record.token);
+            if (!currentRecord || currentRecord.cwd !== canonical || currentRecord.gitCommonDir !== common) return;
+            try {
+              const current = await lstat(lock);
+              const currentMarker = await lstat(marker);
+              if (!current.isDirectory() || current.dev !== dirIdentity.dev || current.ino !== dirIdentity.ino ||
+                  !currentMarker.isFile() || currentMarker.dev !== markerId.dev || currentMarker.ino !== markerId.ino ||
+                  await readFile(marker, "utf8") !== owner) return;
+              await unlink(marker);
+              await rmdir(lock);
+            } catch (error) {
+              if (["ENOENT", "ENOTDIR", "ENOTEMPTY", "EEXIST"].includes(code(error) ?? "")) return;
+              throw error;
+            }
+            await writeRegistry(registryDir, currentRecords.filter((item) => item.token !== record.token));
+          });
+          released = true;
+        },
+      };
     } catch (error) {
       // Acquisition failed after the record was published. Undo the local
-      // artifacts first (verifying they are ours), then the record: an orphaned
-      // record has no owner, so nothing can ever release it and every later
-      // attempt for this path range is refused (observed live: three leaked
-      // records and a stale lock dir permanently wedged a workspace).
+      // artifacts first, then the record: an orphaned record has no owner, so
+      // nothing can ever release it and every later attempt for this path range
+      // is refused (observed live: three leaked records and a stale lock dir
+      // permanently wedged a workspace).
       if (created) {
-        // The registry mutex is held, so a directory we created here cannot be
-        // a foreign one. Only compare identities when we actually read them:
-        // lstat itself may have been what failed.
-        const current = identity === null ? null : await lstat(lock).catch(() => null);
-        const ours = identity === null || (current !== null && current.isDirectory() &&
-          current.dev === identity.dev && current.ino === identity.ino);
+        // The registry mutex is held, so the directory at this path is the one
+        // this call just created unless a foreign actor raced us. Compare
+        // identities only when they were actually read: lstat may be what failed.
+        const current = dirIdentity === null ? null : await lstat(lock).catch(() => null);
+        const ours = dirIdentity === null || (current !== null && current.isDirectory() &&
+          current.dev === dirIdentity.dev && current.ino === dirIdentity.ino);
         if (ours) {
           await unlink(marker).catch(() => {});
           await rmdir(lock).catch(() => {});
@@ -197,37 +229,6 @@ export async function reserveWorkspace(
       if (code(error) === "EEXIST") return null;
       throw error;
     }
-    if (identity === null || markerIdentity === null) {
-      throw new Error("workspace reservation lost its local identity during acquisition");
-    }
-    const dirIdentity = identity;
-    const markerId = markerIdentity;
-    let released = false;
-    return {
-      cwd: canonical,
-      async release() {
-        if (released) return;
-        await withRegistryMutex(registryDir, async () => {
-          const currentRecords = await readRegistry(registryDir);
-          const currentRecord = currentRecords.find((item) => item.token === record.token);
-          if (!currentRecord || currentRecord.cwd !== canonical || currentRecord.gitCommonDir !== common) return;
-          try {
-            const current = await lstat(lock);
-            const currentMarker = await lstat(marker);
-            if (!current.isDirectory() || current.dev !== dirIdentity.dev || current.ino !== dirIdentity.ino ||
-                !currentMarker.isFile() || currentMarker.dev !== markerId.dev || currentMarker.ino !== markerId.ino ||
-                await readFile(marker, "utf8") !== owner) return;
-            await unlink(marker);
-            await rmdir(lock);
-          } catch (error) {
-            if (["ENOENT", "ENOTDIR", "ENOTEMPTY", "EEXIST"].includes(code(error) ?? "")) return;
-            throw error;
-          }
-          await writeRegistry(registryDir, currentRecords.filter((item) => item.token !== record.token));
-        });
-        released = true;
-      },
-    };
   });
 }
 

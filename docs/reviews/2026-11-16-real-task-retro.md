@@ -73,6 +73,8 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 
 **遗留边界**：注册表损坏时 `reservationsFor()` fail closed（抛错），这是对的，但 `reconcile` 会直接抛栈而不是把"注册表损坏"作为结论展示；下一步把注册表错误分类后交给诊断命令输出。另外 `retry` 只重置计数，不重置会话链——因会话预算耗尽而 blocked 的任务会再次 blocked，需要 `--reset-sessions` 或文档说明。
 
+**另一个已记录的 fail-open**：`reservationsFor()` 在 Git 元数据读不出来时（缺 git、safe.directory、不可读）退化为纯路径比较，可能漏掉同一仓库其他 worktree 的预留。安全上不致命——同样的失败会让 `reserveWorkspace()` 直接抛错，不会造成并发执行——但诊断会误报"无预留"。正确形状是复用它已经用过的三态：`known-common` / `known-no-common` / `unknown`，`unknown` 映射到 `manual-review`。
+
 ### N4 共享表在任务运行期被人工编辑是常态
 
 **症状**：任务运行中，人加了 1 列、删了 1 行、改了 4 个单元格；复核因此判 fail（"列数/表头/零附带改动"不成立），白跑一轮 20 分钟。
@@ -162,7 +164,7 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 - `src/task-store.ts`：`TaskFieldsPatch` 增加 `retries` / `reviewRounds`，供 retry 重置计数
 - `tests/workspace.test.ts`：回归测试「stale 锁目录 → 预留失败 → 注册表必须为空 → 清理后可预留」
 - `tests/reconcile.test.ts`：9 条测试覆盖诊断结论（含已 settled 但 pid 存活的复用情形、归属路径不可知）与 retry 的四类守卫 + 归档/重开
-- 验证：`npx vitest run` 全绿；`tsc --noEmit` 在本机受 TSD 透明加密影响不可用（`TS1490: File appears to be binary`），需在未加密环境复验
+- 验证：`npx vitest run` **253 passed / 1 skipped**，连续两轮全绿；此前偶发的 `workspace`/`pipeline-e2e` 失败已定位为 `withRegistryMutex` 在 Windows 并发 `mkdir` 下的 `EPERM`（只在全量并行时出现、单文件必过），已改为在截止时间内重试并保留原始错误码。`tsc --noEmit` 在本机受 TSD 透明加密影响仍不可用（`TS1490`），需在未加密环境复验
 
 ### 评审后的修正（同一轮内）
 
