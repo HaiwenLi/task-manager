@@ -179,6 +179,7 @@ async function controlled<T>(r: Run, label: string, ms: number, start: () => Exe
   await checkpoint(r, "active", label);
   let execution: Execution<T> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let settledByResult = false;
   try {
     // Generation cannot be taken over between the ownership check and dispatch.
     await owned(r, async () => {
@@ -193,12 +194,20 @@ async function controlled<T>(r: Run, label: string, ms: number, start: () => Exe
       timer = setTimeout(() => reject(new WorkerTimeoutError(`${label} timed out after ${ms}ms`)), ms);
     });
     const lost = r.loss.then(() => { throw new OwnershipLostError(); });
-    const value = await Promise.race([execution!.result, timeout, lost]);
+    // Track whether the execution itself reported its outcome. A settled result
+    // means the child process is gone, so nothing needs cancelling — even when
+    // the way it settled is an error (e.g. provider 429 makes the CLI exit 1).
+    const tracked = execution!.result.then(
+      (value) => { settledByResult = true; return value; },
+      (error) => { settledByResult = true; throw error; },
+    );
+    const value = await Promise.race([tracked, timeout, lost]);
     if (execution!.inspect().state !== "exited") throw new UncertainExecutionError(`${label}: execution termination is uncertain`);
     return value;
   } catch (err) {
     if (!execution) throw err;
     r.record.sessionId = execution.inspect().sessionId;
+    if (settledByResult) throw err;
     if (!(err instanceof WorkerTimeoutError) && !(err instanceof OwnershipLostError) && !r.lost && execution.inspect().state === "exited") throw err;
     // Never wait indefinitely for a broken cancellation implementation.
     let stopTimer: ReturnType<typeof setTimeout> | undefined;

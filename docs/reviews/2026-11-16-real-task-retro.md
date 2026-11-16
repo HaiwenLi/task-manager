@@ -51,6 +51,10 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 
 同时把 provider 的 `429/5xx/rate_limit` 识别为 `external-transient`：不消耗 `retryLimit`、不退化成 `uncertain`，走带退避的重试并允许切换模型。
 
+**实现进度**：已先落一步——`controlled()` 现在记录"结果是否由执行本身结算"（`settledByResult`），结算过就直接把错误原样抛出，不再走取消判定。这一步不改变 `cancel()` 的安全语义，因此不破坏既有测试"父进程先消失时不得声称已确认停止"。**剩余部分（429 归类、三分语义）本轮未改**，原因如下。
+
+**改不动的原因（重要）**：曾尝试让 `cancel()` 对"已退出"的进程直接返回 `true`，结果 `tests/execution.test.ts` 里那条既有测试立刻失败——它守的是一条真实安全性质：父进程在请求取消前就消失时，Windows 无法再定位其子进程树，此时若声称"已确认停止"，就可能把仍在跑的后端会话当成已停。所以正确做法不是放宽 `cancel()`，而是让 **adapter 明确报告"这次是 provider 侧失败"**（例如在 `PromptResult` 上带 `failure: "provider"`），让 `controlled()` 在不调用 `cancel()` 的前提下计一次可重试失败。这条要改 adapter 契约，需单独评审。
+
 ### N3 `blocked` 是死胡同
 
 **症状**：本次 3 次 `blocked` 全部由人工改文件恢复（归档 `attempt.json`、清注册表、改 frontmatter 状态）。README 里写的就是手工流程，但没有任何命令支撑。
@@ -60,6 +64,10 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 - `taskctl reconcile <id>`：只读诊断——lock/attempt/acceptance/预留/进程存活，给出"可 retry / 必须先停进程"的结论
 - `taskctl cancel <id>`：按 `attempt.pid` 停进程树 → 标 `uncertain` → 提示 reconcile
 - `taskctl retry <id>`：仅当 `phase=settled`、无活跃锁、无匹配预留时，归档 `attempt.json`/`acceptance.json` 到 `archive/<ts>/`，状态回 `open`
+
+**状态：已实现**（`src/reconcile.ts` + CLI + `tests/reconcile.test.ts`，9 条测试）。守卫：非 `blocked` 拒绝、`attempt` 未 `settled` 拒绝、活跃锁拒绝、工作目录仍被预留拒绝；`retry` 只改 Markdown 状态与归档证据，不绕过验收。
+
+**遗留边界**：`reservationsFor()` 在注册表损坏时 fail closed（抛错），这是对的；但 `reconcile` 现在会直接抛栈而不是把"注册表损坏"作为结论展示。下一步把注册表错误分类后交给诊断命令输出。
 
 ### N4 共享表在任务运行期被人工编辑是常态
 
@@ -120,17 +128,17 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 
 ## 6. 优先级
 
-| 优先级 | 项 | 工作量 | 理由 |
+| 优先级 | 项 | 工作量 | 状态 |
 | --- | --- | --- | --- |
-| P0 | N1 预留回滚（已修）+ workspace list/prune | 0.5 天 | 会永久锁死工作区，已实测 |
-| P0 | N2 退出语义三分 | 1 天 | 把可重试失败误判为不确定，直接阻断 |
-| P0 | N3 reconcile/cancel/retry | 1.5 天 | 每次 blocked 都要人工改文件，不可持续 |
-| P1 | N4 外部漂移容忍 | 1.5 天 | 共享表场景的常态，白跑一轮 20 分钟 |
-| P1 | N5 reviewer 降级链 | 0.5 天 | 单点故障 |
-| P1 | N6 acceptance 生成器 | 1.5 天 | 省钱且更早拦截 |
-| P2 | N7 证据自包含 | 0.5 天 | 复盘依赖 |
-| P2 | N8 进度可见 | 0.5 天 | 体验 |
-| P2 | N9 编码 | 0.2 天 | 体验 |
+| P0 | N1 预留回滚 + workspace 诊断 | 0.5 天 | ✅ 回滚已修；list/prune 待做 |
+| P0 | N2 退出语义三分 | 1 天 | 🟡 仅 `settledByResult` 一步；provider 失败分类待做 |
+| P0 | N3 reconcile/cancel/retry | 1.5 天 | ✅ 已实现（9 条测试） |
+| P1 | N4 外部漂移容忍 | 1.5 天 | 待做 |
+| P1 | N5 reviewer 降级链 | 0.5 天 | 待做 |
+| P1 | N6 acceptance 生成器 | 1.5 天 | 待做 |
+| P2 | N7 证据自包含 | 0.5 天 | 待做 |
+| P2 | N8 进度可见 | 0.5 天 | 待做 |
+| P2 | N9 编码 | 0.2 天 | 待做 |
 
 ## 7. 验收标准（每条怎么证明修好）
 
@@ -144,6 +152,11 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 
 ## 附录 A：本次代码改动
 
-- `src/workspace.ts`：`reserveWorkspace` 失败路径回滚注册表记录，并清理本次创建的 marker/锁目录
-- `tests/workspace.test.ts`：新增回归测试「stale 锁目录 → 预留失败 → 注册表必须为空 → 清理后可预留」
-- 验证：`npx vitest run tests/workspace.test.ts` 27 passed；`tsc --noEmit` 在本机受 TSD 透明加密影响不可用（`TS1490: File appears to be binary`），需在未加密环境复验
+- `src/workspace.ts`：`reserveWorkspace` 失败路径回滚注册表记录，并清理本次创建的 marker/锁目录；新增只读的 `reservationsFor()` 供诊断使用
+- `src/reconcile.ts`：新增 `reconcileTask` / `retryTask` / `cancelTask`
+- `src/cli.ts`：新增 `reconcile` / `retry` / `cancel` 三个子命令
+- `src/worker.ts`：`controlled()` 记录 `settledByResult`，结果已结算时不再走取消判定
+- `src/task-store.ts`：`TaskFieldsPatch` 增加 `retries` / `reviewRounds`，供 retry 重置计数
+- `tests/workspace.test.ts`：回归测试「stale 锁目录 → 预留失败 → 注册表必须为空 → 清理后可预留」
+- `tests/reconcile.test.ts`：9 条测试覆盖诊断结论、四类 retry 守卫、cancel 的两种结局
+- 验证：`npx vitest run` **249 passed / 1 skipped**；`tsc --noEmit` 在本机受 TSD 透明加密影响不可用（`TS1490: File appears to be binary`），需在未加密环境复验

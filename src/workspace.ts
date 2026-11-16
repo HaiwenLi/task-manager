@@ -215,6 +215,29 @@ export async function reserveWorkspace(
 }
 
 /**
+ * Reservations covering this path (either direction), for operator diagnostics.
+ * Read-only: it never mutates the registry.
+ */
+export async function reservationsFor(
+  cwd: string,
+  registryDir: string = DEFAULT_REGISTRY,
+): Promise<ReservationRecord[]> {
+  const canonical = await realpath(cwd).catch(() => cwd);
+  let records: ReservationRecord[] = [];
+  try {
+    records = await readRegistry(registryDir);
+  } catch (error) {
+    // No registry means no reservations yet. A corrupt one still throws: the
+    // caller must not conclude "free" from unreadable ownership state.
+    if (code(error) !== "ENOENT") throw error;
+  }
+  return records.filter((record) => {
+    const held = record.gitCommonDir === null ? [record.cwd] : [record.cwd, record.gitCommonDir];
+    return held.some((path) => within(path, canonical) || within(canonical, path));
+  });
+}
+
+/**
  * SHA256 of a sorted, framed manifest and streamed file contents. Includes all
  * tracked, untracked and ignored files except .git, node_modules, .taskctl and
  * .taskctl-* metadata. Explicit exclusions may be absolute or cwd-relative and

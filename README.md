@@ -174,6 +174,16 @@ npx tsx src/main.ts status [--tasks-dir <dir>]
 
 **任务变 blocked** —— 原因包括重试耗尽、缺少验收、任务/产物变化、工作目录被占用和执行停止未确认。先看事件日志、`attempt.json`、`acceptance.json` 与交接笔记。只有普通、已停止的失败才可修复后重开；不确定执行不能只改状态绕过。
 
+### blocked 之后的三条命令
+
+```bash
+taskctl reconcile --task <id>   # 只读诊断：lock / attempt / 预留 / 存活进程 / 结论
+taskctl cancel --task <id>      # 按 attempt.json 的 pid 停进程树，并把该次执行标记为不确定
+taskctl retry --task <id>       # 归档旧证据后重开；仅在 attempt 已 settled、无活跃锁、无匹配预留时执行
+```
+
+`reconcile` 只报告不改状态，结论是 `retry-allowed` / `stop-process-first` / `manual-review` / `already-terminal` 之一。`retry` 会拒绝任何"还可能有执行在跑"的情况，并且把 `attempt.json`、`acceptance.json`、`review.json` 移入 `tasks/<id>/archive/<时间戳>/`、重置 `retries` 与 `review_rounds`、写一条 `human retry` 日志。`cancel` 只负责停进程；停完仍然要 `reconcile` 确认，再决定是否 `retry`。
+
 **worker 崩溃 / 不确定执行** —— 先核实原控制器、子进程树与后端会话均已停止，再检查产物。保留证据后，人工归档旧 `attempt.json` 和对应工作目录预留，再按需重开任务。不能仅按旧 PID 杀进程、删任务锁或改 `status` 后自动重跑。互斥目录 `.mutation.lock` 若因崩溃遗留也必须先确认原操作已停止，不能按时间强抢。
 
 人工修改共享预留注册表之前，先停止所有使用该注册表的 taskctl 控制器；仅处理已核对身份的那条预留及其本地标记，不清空其他任务的记录。当前没有自动“强制恢复”命令。缺少验收造成的普通待审则补上验收并重开任务即可，不需要清理已正常释放的预留。

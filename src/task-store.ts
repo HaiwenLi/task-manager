@@ -8,7 +8,7 @@ const DONE_MARKER = "done.requested";
 
 /** The pipeline fields a caller may patch in one guarded write. */
 export type TaskFieldsPatch = Partial<
-  Pick<Task, "status" | "criteria" | "workdir" | "complexity" | "risk" | "humanCheck" | "dependsOn">
+  Pick<Task, "status" | "criteria" | "workdir" | "complexity" | "risk" | "humanCheck" | "dependsOn" | "retries" | "reviewRounds">
 >;
 
 /**

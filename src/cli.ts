@@ -15,6 +15,7 @@ import type { AcceptanceResult } from "./acceptance.js";
 import { renderBoardMarkdown, renderBoardTable, writeBoard } from "./board.js";
 import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
+import { cancelTask, reconcileTask, retryTask } from "./reconcile.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
 export type CliDeps = {
@@ -46,6 +47,9 @@ const USAGE = [
   "  taskctl reject --task <id> --reason \"…\" [--stage clarify|worker|reviewer] [--tasks-dir <dir>]",
   "  taskctl audit --task <id> --verdict pass|fail [--stage …] [--note \"…\"] [--tasks-dir <dir>]",
   "  taskctl metrics [--tasks-dir <dir>]",
+  "  taskctl reconcile --task <id> [--tasks-dir <dir>]",
+  "  taskctl retry --task <id> [--tasks-dir <dir>]",
+  "  taskctl cancel --task <id> [--tasks-dir <dir>]",
   "  taskctl learn --note \"<原话 → 改法>\" [--tasks-dir <dir>]",
   "  taskctl template [--type code|office|research|design]",
 ].join("\n");
@@ -144,6 +148,15 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "learn":
       checkFlags(command, flags, ["note", "tasks-dir", "config"], ["note"]);
       return learnCommand(flags, log);
+    case "reconcile":
+      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
+      return reconcileCommand(flags, log);
+    case "retry":
+      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
+      return retryCommand(flags, log);
+    case "cancel":
+      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
+      return cancelCommand(flags, log);
     case "template":
       checkFlags(command, flags, ["type", "tasks-dir", "config"], []);
       return templateCommand(flags, log);
@@ -532,6 +545,43 @@ async function templateCommand(flags: Map<string, string>, log: (line: string) =
   ];
   for (const line of lines) log(line);
   return 0;
+}
+
+/**
+ * `taskctl reconcile --task <id>` — read-only diagnosis of a blocked task.
+ * Prints what a retry would have to clear; it never changes state.
+ */
+async function reconcileCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const findings = await reconcileTask(tasksDir, flags.get("task")!);
+  log(`${findings.id}  status=${findings.status}  attempt=${findings.attempt?.phase ?? "none"}  lock=${findings.lockLive ? "live" : "free"}  pid=${findings.pid ?? "-"}  reservations=${findings.reservations.length}`);
+  for (const note of findings.notes) log(`  - ${note}`);
+  for (const reservation of findings.reservations) log(`  reservation ${reservation.token} -> ${reservation.cwd}`);
+  log(`  verdict: ${findings.verdict}`);
+  if (findings.verdict === "stop-process-first") log(`  next: taskctl cancel --task ${findings.id}`);
+  if (findings.verdict === "retry-allowed") log(`  next: taskctl retry --task ${findings.id}`);
+  return 0;
+}
+
+/** `taskctl retry --task <id>` — reopen a blocked task once nothing is running. */
+async function retryCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const outcome = await retryTask(tasksDir, flags.get("task")!);
+  if (!outcome.ok) {
+    log(`retry refused: ${outcome.reason}`);
+    return 1;
+  }
+  log(`reopened; previous attempt archived to ${outcome.archive}`);
+  return 0;
+}
+
+/** `taskctl cancel --task <id>` — stop the process tree recorded in attempt.json. */
+async function cancelCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const outcome = await cancelTask(tasksDir, flags.get("task")!);
+  log(outcome.stopped ? `cancelled: ${outcome.reason}` : `not cancelled: ${outcome.reason}`);
+  if (outcome.stopped) log(`next: taskctl reconcile --task ${flags.get("task")}`);
+  return outcome.stopped ? 0 : 1;
 }
 
 /** `--flag value` tokens into a map; bare tokens become positionals. */
