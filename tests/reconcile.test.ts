@@ -131,6 +131,8 @@ describe("retry", () => {
     await writeAttempt("settled");
     await writeRuntime(tasksDir, "t1", "acceptance.json", { passed: false });
     await writeRuntime(tasksDir, "t1", "review.json", { verdict: "fail" });
+    // A manual retry goes back to the head of the model chain.
+    await writeRuntime(tasksDir, "t1", "models.json", { worker: 1 });
 
     const outcome = await retryTask(tasksDir, "t1", {
       registryDir,
@@ -139,9 +141,10 @@ describe("retry", () => {
     expect(outcome.ok).toBe(true);
 
     const archived = await readdir(join(tasksDir, "t1", "archive", "2026-11-16T08-00-00-000Z"));
-    expect(archived.sort()).toEqual(["acceptance.json", "attempt.json", "review.json"]);
+    expect(archived.sort()).toEqual(["acceptance.json", "attempt.json", "models.json", "review.json"]);
     const remaining = await readdir(join(tasksDir, "t1"));
     expect(remaining).not.toContain("attempt.json");
+    expect(remaining).not.toContain("models.json");
 
     const rendered = await readFile(join(tasksDir, "t1.md"), "utf8");
     expect(rendered).toContain("status: open");

@@ -116,8 +116,13 @@ export async function reconcileTask(
 
 export type RetryOutcome = { ok: true; archive: string } | { ok: false; reason: string };
 
-/** Files belonging to one attempt; archiving them clears the evidence trail for a rerun. */
-const ATTEMPT_EVIDENCE = ["attempt.json", "acceptance.json", "review.json"] as const;
+/**
+ * Files belonging to one attempt; archiving them clears the evidence trail for
+ * a rerun. `models.json` is not evidence, but a manual retry is a fresh start:
+ * the operator may have restored the quota that made the head model fail, and
+ * the rotation costs nothing to rebuild (one rejected attempt).
+ */
+const ATTEMPT_EVIDENCE = ["attempt.json", "acceptance.json", "review.json", "models.json"] as const;
 
 /**
  * Reopen a blocked task whose previous attempt is settled and unreferenced.

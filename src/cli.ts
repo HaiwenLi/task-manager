@@ -679,6 +679,8 @@ const CONFIG_KEYS = new Set([
   "maxReviewRounds",
   "reviewerModel",
   "reviewerEffort",
+  "modelFallbacks",
+  "reviewerModelFallbacks",
   "parallel",
   "opencodeBin",
 ]);
@@ -711,6 +713,8 @@ export function resolveConfig(raw: Record<string, unknown>, path: string): Resol
     maxReviewRounds: integer(raw, "maxReviewRounds", path),
     reviewerModel: string(raw, "reviewerModel", path),
     reviewerEffort: string(raw, "reviewerEffort", path),
+    modelFallbacks: stringArray(raw, "modelFallbacks", path),
+    reviewerModelFallbacks: stringArray(raw, "reviewerModelFallbacks", path),
     parallel: integer(raw, "parallel", path),
     opencodeBin: string(raw, "opencodeBin", path),
   };
@@ -725,6 +729,18 @@ function string(raw: Record<string, unknown>, key: string, path: string): string
     throw new Error(`config ${path}: field "${key}" must be a non-empty string`);
   }
   return value;
+}
+
+/** A list of non-empty strings, e.g. a fallback chain of `provider/model` names. */
+function stringArray(raw: Record<string, unknown>, key: string, path: string): string[] | undefined {
+  const value = raw[key];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim().length === 0)) {
+    throw new Error(`config ${path}: field "${key}" must be an array of non-empty strings`);
+  }
+  return value as string[];
 }
 
 function number(raw: Record<string, unknown>, key: string, path: string): number | undefined {

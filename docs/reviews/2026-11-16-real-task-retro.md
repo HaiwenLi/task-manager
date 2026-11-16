@@ -60,7 +60,7 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 
 测试 `tests/provider-failure.test.ts` 用同一个 fake adapter 跑了对照组：带 `failure: "provider"` 时 blocked 原因是 `retry limit`、`cancel` 零调用；不带时仍是 `shutdown unconfirmed` 且 `cancel` 被调用——两条路径不会互相污染。
 
-**未做**：provider 失败后的模型降级链（`reviewerModels` 轮转）与退避。现在是"重试同一个模型"，配额耗尽时会连续失败到 `retryLimit`。
+**后续**：模型降级链在 N5 落地（见下），provider 拒绝不再只是"重试同一个模型"；仍未做的是退避等待（现在靠换模型绕过，链走完就按 `retryLimit` 计失败）。
 
 ### N3 `blocked` 是死胡同
 
@@ -96,6 +96,16 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 **症状**：一个 provider 的配额耗尽 → 整个任务阻塞 9 分钟并 `blocked`。
 
 **方案**：`reviewerModels: ["…", "…"]` 顺序降级；429 时等待并切换下一个 provider；`reviewerModel` 与 `model` 强制不同 provider（可用 `--allow-same-provider` 覆盖），否则"独立复核"名存实亡。本次救急时两者被迫都用了 `deepseek-v4.1-flash`。
+
+**实现进度：降级链已做，provider 强制分离未做。**
+
+1. `taskctl.json` 新增 `modelFallbacks` / `reviewerModelFallbacks`（`string[]`）；链条 = 主模型（任务 frontmatter 的 `model` 优先）+ 备用列表，去重去空。没有主模型时链条为空——备用列表只是追加，不会替人"选"一个没人配的模型
+2. 只有在 adapter 判定 `failure: "provider"` 时才轮转，并且**不消耗重试额度**：这一回合根本没干活，把额度花在必然不可用的模型上才是浪费。链条有限，走完照旧按 `retryLimit` 计失败
+3. 当前位置写 `tasks/<id>/models.json`（不是 `attempt.json`——它要活过自己触发的重试）；`taskctl retry` 把它和旧证据一起归档，回到链首，配额恢复后手动重开就从主模型重来
+4. `models.json` 是提示性状态不是证据：损坏按"从链首开始"，不阻塞任务；写失败才抛错（写失败说明目录不可写，那是真问题）
+5. 事件与 journal 都记 `model-fallback`（`from -> to` + 原因），`tests/model-fallback.test.ts` 8 条覆盖：worker 轮转不花额度（`retryLimit=1` 下仍能跑完）、链耗尽才 blocked、跨 attempt 保持当前位置、reviewer 轮转、损坏文件、无主模型时忽略备用列表
+
+**未做**：`reviewerModel` 与 `model` 强制不同 provider（担心把 `--allow-same-provider` 做成一个人人都会加的参数，不如在文档里写清"同 provider 的复核独立性存疑"）；退避等待。
 
 ### N6 没有 acceptance 就全靠模型复核
 
@@ -141,10 +151,10 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 | 优先级 | 项 | 工作量 | 状态 |
 | --- | --- | --- | --- |
 | P0 | N1 预留回滚 + workspace 诊断 | 0.5 天 | ✅ 回滚已修；list/prune 待做 |
-| P0 | N2 退出语义三分 | 1 天 | ❌ 本轮未改（两种试法都被否，见 N2） |
+| P0 | N2 退出语义三分 | 1 天 | ✅ 已实现（provider 拒绝标 `failure: "provider"`，不升级成 uncertain） |
 | P0 | N3 reconcile/retry | 1 天 | ✅ 已实现（cancel 已撤回） |
 | P1 | N4 外部漂移容忍 | 1.5 天 | 待做 |
-| P1 | N5 reviewer 降级链 | 0.5 天 | 待做 |
+| P1 | N5 reviewer 降级链 | 0.5 天 | ✅ 降级链已实现；同 provider 强制分离未做 |
 | P1 | N6 acceptance 生成器 | 1.5 天 | 待做 |
 | P2 | N7 证据自包含 | 0.5 天 | 待做 |
 | P2 | N8 进度可见 | 0.5 天 | 待做 |
@@ -177,3 +187,13 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 - `reconcile` 不再把"已 settled 但 pid 存活"判成待停止（那是 PID 复用），只在 attempt 未 settled 时提示
 - `retry` 的预留检查补上"attempt 没有 workspace 时用配置 workdir 解析"的兜底；两者都不可知时拒绝
 - `retry` 的检查与写入放进 `.mutation.lock` 并二次复核，避免守卫与写状态之间的时间窗
+
+### 第二轮补充（N2 / N5 落地）
+
+- `src/adapters/types.ts` + `src/adapters/opencode.ts`：`PromptResult.failure?: "provider"`，从 NDJSON error 事件与 stderr 识别 429 / 配额 / 鉴权 / 5xx
+- `src/worker.ts`：`controlled(..., acceptSettled)` 让"已结算的 provider 拒绝"跳过取消确认；`reviewStage` 透传 `ReviewResult.failure`；新增模型降级（`modelFor` / `fallBack`），`turn` 与复核都按链取模型
+- `src/models.ts`：新增模型链与轮转状态（`modelChain` / `modelAt` / `readModelRotation` / `rotateModel`）——`tasks/<id>/models.json`，损坏按链首处理
+- `src/cli.ts`：`modelFallbacks` / `reviewerModelFallbacks` 两个 `string[]` 字段的校验
+- `src/reconcile.ts`：`retry` 把 `models.json` 一并归档（手动重开 = 回到链首）
+- `tests/model-fallback.test.ts`：8 条；`tests/provider-failure.test.ts`：2 条对照；`tests/reconcile.test.ts` / `tests/cli-config.test.ts` 各补一条
+- 验证：`npx vitest run` **265 passed / 1 skipped**

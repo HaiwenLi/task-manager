@@ -11,6 +11,7 @@ import { reserveWorkspace, artifactDigest, type WorkspaceReservation } from "./w
 import { definitionDigest, readAttempt, readRuntime, writeRuntime, type AttemptRecord } from "./runtime.js";
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
+import { modelAt, modelChain, readModelRotation, rotateModel, type ModelRole } from "./models.js";
 import { startReview, type ReviewEvidence, type ReviewResult } from "./review.js";
 
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
@@ -29,6 +30,10 @@ export type WorkerConfig = {
   maxReviewRounds?: number;
   /** Optional separate model/effort for the reviewer session. */
   reviewerModel?: string; reviewerEffort?: string;
+  /** Models to try, in order, when a provider rejects the worker's model. */
+  modelFallbacks?: string[];
+  /** Models to try, in order, when a provider rejects the reviewer's model. */
+  reviewerModelFallbacks?: string[];
   /** How many tasks the scheduler may run at once (default 2). */
   parallel?: number;
 };
@@ -40,7 +45,7 @@ export type WorkerDeps = {
   review?: (evidence: ReviewEvidence) => Promise<ReviewResult>;
   onEvent?: (evt: WorkerEvent) => void;
 };
-export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost";
+export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
 export type TaskOutcome = "done" | "blocked" | "skipped" | "open" | "awaiting-human";
 export class WorkerTimeoutError extends Error {}
@@ -231,8 +236,42 @@ async function controlled<T>(
   } finally { r.execution = undefined; if (timer) clearTimeout(timer); }
 }
 
-async function turn(r: Run, text: string, sessionId?: string) {
-  const args = { sessionId, text, model: r.task.model ?? r.cfg.model, effort: r.task.effort ?? r.cfg.effort, title: r.task.title, cwd: r.cfg.workdir };
+/** The worker's chain: the task's own model (else the config default), then fallbacks. */
+const workerChain = (r: Run): string[] => modelChain(r.task.model ?? r.cfg.model, r.cfg.modelFallbacks);
+/** The reviewer's chain: its own model, then its fallbacks — never the task's silently. */
+const reviewerChain = (r: Run): string[] => modelChain(r.cfg.reviewerModel, r.cfg.reviewerModelFallbacks);
+
+/** The model a role should use now, per the rotation recorded for this task. */
+async function modelFor(r: Run, role: ModelRole): Promise<string | undefined> {
+  const chain = role === "worker" ? workerChain(r) : reviewerChain(r);
+  const rotation = await readModelRotation(r.cfg.tasksDir, r.task.id);
+  return modelAt(chain, rotation[role]);
+}
+
+/**
+ * Hand a role to the next model in its chain after a provider rejection.
+ *
+ * Returns whether the work moved. A handover does not spend a retry: the
+ * attempt never reached the work, and the alternative is spending the whole
+ * budget on the one model that is provably unavailable. The chain is finite, so
+ * this stays bounded; running out of models spends retries as before.
+ */
+async function fallBack(r: Run, role: ModelRole, reason: string): Promise<boolean> {
+  const chain = role === "worker" ? workerChain(r) : reviewerChain(r);
+  const handover = await owned(r, () => rotateModel(r.cfg.tasksDir, r.task.id, role, chain, reason));
+  if (handover === null) return false;
+  const detail = `${handover.from || "(default)"} -> ${handover.to}`;
+  emit(r, "model-fallback", `${role}: ${detail}`);
+  await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
+    stage: role === "worker" ? "worker" : "review",
+    event: "model-fallback",
+    detail: `${detail} (${reason})`,
+  }));
+  return true;
+}
+
+async function turn(r: Run, text: string, model: string | undefined, sessionId?: string) {
+  const args = { sessionId, text, model, effort: r.task.effort ?? r.cfg.effort, title: r.task.title, cwd: r.cfg.workdir };
   try {
     return { ...await controlled(r, "agent turn", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT,
       () => r.deps.adapter.start ? r.deps.adapter.start(args) : legacyExecution(() => r.deps.adapter.prompt(args)),
@@ -251,7 +290,8 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
   for (;;) {
     const note = await latestNote(r.cfg.tasksDir, r.task.id);
     const prompt = buildWorkerPrompt(r.task, { handoff: note?.markdown, workdir: r.cfg.workdir, tasksDir: r.cfg.tasksDir });
-    const result = await turn(r, prompt, sessionId);
+    const model = await modelFor(r, "worker");
+    const result = await turn(r, prompt, model, sessionId);
     await owned(r, async () => {
       if (result.sessionId && result.sessionId !== recordedSession) {
         await r.deps.store.appendSession(r.task.id, result.sessionId);
@@ -264,7 +304,9 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
     if (result.exitCode !== 0) {
       await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
       emit(r, "turn-failed", result.timedOut ? "turn timed out; shutdown confirmed" : `exit ${result.exitCode}`);
-      if (await fail(r)) return "blocked";
+      const handedOver = result.failure === "provider"
+        && await fallBack(r, "worker", `turn rejected by ${model ?? "(default)"}`);
+      if (!handedOver && await fail(r)) return "blocked";
     } else if (await owned(r, () => r.deps.store.readDoneMarker(r.task.id))) {
       await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
       const verdict = await accept(r);
@@ -273,8 +315,8 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
     } else if (turns >= (r.cfg.maxTurnsPerSession ?? MAX_TURNS_PER_SESSION_DEFAULT)) {
       if (await fail(r)) return "blocked";
       fresh = true;
-    } else if (await overBudget(r, sessionId)) {
-      const wrap = await turn(r, WRAP_UP_INSTRUCTION, sessionId);
+    } else if (await overBudget(r, sessionId, model)) {
+      const wrap = await turn(r, WRAP_UP_INSTRUCTION, model, sessionId);
       const after = await latestNote(r.cfg.tasksDir, r.task.id);
       if (!after || after.seq <= (note?.seq ?? 0)) {
         if (!wrap.timedOut) await owned(r, () => writeNote(r.cfg.tasksDir, fallbackNote(r.task, note?.seq ?? 0, wrap.text)));
@@ -374,13 +416,14 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
     await r.deps.store.setStatus(id, "review");
     await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "started", detail: `criteria=${r.task.criteria.length}` });
   });
+  const reviewerModel = await modelFor(r, "reviewer");
   const result = await controlled(r, "review", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT, () =>
     r.deps.review
       ? legacyExecution(() => r.deps.review!(evidence))
       : startReview({
           adapter: r.deps.adapter,
           cwd: r.cfg.workdir,
-          model: r.cfg.reviewerModel,
+          model: reviewerModel,
           effort: r.cfg.reviewerEffort,
           title: r.task.title,
         }, evidence),
@@ -400,9 +443,10 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
       event: "provider-failed",
       detail: result.summary,
     }));
-    if (await fail(r)) return "blocked";
+    const handedOver = await fallBack(r, "reviewer", `review rejected by ${reviewerModel ?? "(default)"}`);
+    if (!handedOver && await fail(r)) return "blocked";
     await owned(r, () => r.deps.store.setStatus(id, "open"));
-    emit(r, "rework", "reviewer provider failure; retrying");
+    emit(r, "rework", handedOver ? "reviewer provider failure; retrying with the next model" : "reviewer provider failure; retrying");
     return "open";
   }
 
@@ -480,8 +524,7 @@ function reviewNote(task: Task, seq: number, result: ReviewResult): HandoffNote 
   };
 }
 
-async function overBudget(r: Run, sessionId?: string): Promise<boolean> {
-  const model = r.task.model ?? r.cfg.model;
+async function overBudget(r: Run, sessionId: string | undefined, model: string | undefined): Promise<boolean> {
   if (!sessionId || !model) return false;
   // Telemetry is not allowed to hang indefinitely outside the lease/cancel boundary.
   try {

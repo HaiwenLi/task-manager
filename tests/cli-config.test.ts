@@ -16,6 +16,23 @@ describe("resolveConfig", () => {
     expect(cfg.maxReviewRounds).toBeUndefined();
   });
 
+  it("accepts a model fallback chain for each role", () => {
+    const cfg = resolveConfig({
+      model: "a/one",
+      modelFallbacks: ["b/two", "c/three"],
+      reviewerModel: "r/one",
+      reviewerModelFallbacks: ["r/two"],
+    }, "taskctl.json");
+    expect(cfg.modelFallbacks).toEqual(["b/two", "c/three"]);
+    expect(cfg.reviewerModelFallbacks).toEqual(["r/two"]);
+  });
+
+  it("rejects fallback lists that are not non-empty strings", () => {
+    expect(() => resolveConfig({ modelFallbacks: "b/two" }, "taskctl.json")).toThrow(/array of non-empty strings/);
+    expect(() => resolveConfig({ modelFallbacks: [""] }, "taskctl.json")).toThrow(/array of non-empty strings/);
+    expect(() => resolveConfig({ reviewerModelFallbacks: [1] }, "taskctl.json")).toThrow(/array of non-empty strings/);
+  });
+
   it("rejects a non-positive parallel count", () => {
     expect(() => resolveConfig({ parallel: 0 }, "taskctl.json")).toThrow(/positive/);
   });
