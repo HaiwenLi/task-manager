@@ -11,7 +11,7 @@ type AcceptanceFile = {
 };
 
 type ReviewFile = {
-  verdict?: string; summary?: string; defects?: string[];
+  verdict?: string; summary?: string; defects?: string[]; model?: string; externalChanges?: string[];
   criteria?: Array<{ id?: string; pass?: boolean; evidence?: string }>;
 };
 
@@ -32,6 +32,7 @@ export async function buildReport(tasksDir: string, id: string): Promise<string[
     `task ${id}: ${task.title}`,
     `status ${task.status}  retries ${task.retries}  reviewRounds ${task.reviewRounds}  sessions ${task.sessions.length}`,
     `complexity ${task.complexity}  risk ${task.risk}  humanCheck ${task.humanCheck}`,
+    ...(task.tolerate.length > 0 ? [`tolerate ${task.tolerate.join(", ")}`] : []),
     "",
     "## spec",
     ...(spec === null ? ["(no spec)"] : [firstLine(spec)]),
@@ -50,11 +51,15 @@ export async function buildReport(tasksDir: string, id: string): Promise<string[
     ...(review === null
       ? ["(no reviewer verdict recorded)"]
       : [
-          `verdict  ${review.verdict ?? "?"}  ${review.summary ?? ""}`,
+          `verdict  ${review.verdict ?? "?"}  ${review.summary ?? ""}${review.model === undefined ? "" : `  model ${review.model}`}`,
           ...(review.criteria ?? []).map(
             (criterion) => `  [${criterion.pass === true ? "x" : " "}] ${criterion.id ?? "?"} ${firstLine(criterion.evidence ?? "")}`,
           ),
           ...((review.defects ?? []).length > 0 ? [`defects  ${(review.defects ?? []).join("; ")}`] : []),
+          ...((review.externalChanges ?? []).length > 0
+            ? ["tolerated (attributed to someone else, not this task):",
+               ...(review.externalChanges ?? []).map((change) => `  ~ ${firstLine(change)}`)]
+            : []),
         ]),
     "",
     "## journal",

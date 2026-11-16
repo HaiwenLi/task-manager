@@ -43,6 +43,7 @@ const pass = async () => ({ passed: true, skipped: false as const, exitCode: 0, 
 const passReview = async () => ({
   verdict: "pass" as const,
   criteria: [{ id: "C1", pass: true, evidence: "fixture" }],
+  externalChanges: [],
   defects: [],
   summary: "ok",
 });

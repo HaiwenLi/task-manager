@@ -1,6 +1,6 @@
 import type { AgentAdapter, PromptResult } from "./adapters/types.js";
 import type { Execution } from "./execution.js";
-import type { Task } from "./task-file.js";
+import { DRIFT_HINTS, type Task } from "./task-file.js";
 
 export type Verdict = "pass" | "fail" | "unclear";
 
@@ -17,6 +17,12 @@ export type ReviewResult = {
   criteria: CriterionResult[];
   defects: string[];
   summary: string;
+  /**
+   * Differences the reviewer attributed to someone else and excused under the
+   * task's `tolerate` declaration. Recorded, never silent: a tolerated change is
+   * still a fact a human should be able to read back from `review.json`.
+   */
+  externalChanges: string[];
   raw?: string;
   /** The backend rejected the review turn itself (quota/auth/5xx); no judging happened. */
   failure?: "provider";
@@ -28,6 +34,12 @@ export type ReviewEvidence = {
   acceptanceMarkdown: string;
   handoff: string | null;
   journal: string[];
+  /**
+   * When this attempt started and when the work was handed to the review. The
+   * reviewer needs both edges to tell "this changed while the task ran" from
+   * "this was never done": the first is drift, the second is a defect.
+   */
+  window: { startedAt: string; finishedAt: string };
 };
 
 /**
@@ -53,6 +65,15 @@ export function buildReviewPrompt(evidence: ReviewEvidence): string {
     "## 执行者的交接笔记",
     evidence.handoff?.trim() || "(没有交接笔记)",
     "",
+    "## 容忍的外部变更",
+    ...(evidence.task.tolerate.length > 0
+      ? evidence.task.tolerate.map((kind) => `- ${kind}：${DRIFT_HINTS[kind]}`)
+      : ["(本任务没有声明；任何附带改动都按原规则判定)"]),
+    "",
+    "## 时间窗口",
+    `本次执行开始：${evidence.window.startedAt}`,
+    `交给复核：${evidence.window.finishedAt}`,
+    "",
     "## 运行日志尾部",
     ...(evidence.journal.length > 0 ? evidence.journal : ["(空)"]),
     "",
@@ -61,9 +82,12 @@ export function buildReviewPrompt(evidence: ReviewEvidence): string {
     "2. 证据不足以下结论时判 unclear，不要为了给出结论而猜。",
     "3. 不要评价你没看到的实现细节，也不要要求额外的材料。",
     "4. 只输出一个 JSON 对象，不要写解释、不要用代码块包裹。",
+    "5. 只有「容忍的外部变更」里列出的类别可以归因为外部变更；清单外的结构变化（删列、改表头含义等）仍按原规则判 fail。",
+    "6. 归因为外部变更的差异写进 externalChanges，说明它影响了哪条验收标准；这类差异本身不构成 fail 的理由。",
+    "7. 本任务自己该写的东西没写、写错、写少了，必须 fail——外部变更不能当挡箭牌。",
     "",
     "JSON 形状：",
-    `{"verdict":"pass|fail|unclear","criteria":[{"id":"C1","pass":true,"evidence":"依据"}],"defects":["必须修的点"],"summary":"一句话"}`,
+    `{"verdict":"pass|fail|unclear","criteria":[{"id":"C1","pass":true,"evidence":"依据"}],"externalChanges":["归因为外部变更的差异"],"defects":["必须修的点"],"summary":"一句话"}`,
   ].join("\n");
 }
 
@@ -103,21 +127,27 @@ export function parseVerdict(text: string, criteria: string[]): ReviewResult {
   const defects = Array.isArray(parsed.defects)
     ? parsed.defects.filter((defect): defect is string => typeof defect === "string")
     : [];
+  const externalChanges = Array.isArray(parsed.externalChanges)
+    ? parsed.externalChanges
+        .filter((change): change is string => typeof change === "string")
+        .map((change) => change.trim())
+        .filter((change) => change.length > 0)
+    : [];
   const summary = typeof parsed.summary === "string" ? parsed.summary : "";
   const allPassed = merged.every((criterion) => criterion.pass);
 
   if (missing || verdict === "unclear") {
-    return { verdict: "unclear", criteria: merged, defects, summary, raw: text };
+    return { verdict: "unclear", criteria: merged, defects, summary, externalChanges, raw: text };
   }
   if (verdict === "fail" && allPassed) {
-    return { verdict: "unclear", criteria: merged, defects, summary, raw: text };
+    return { verdict: "unclear", criteria: merged, defects, summary, externalChanges, raw: text };
   }
   // A "pass" that contradicts its own criterion results is a fail: the
   // per-criterion evidence is the specific claim, the overall word is not.
   if (verdict === "pass" && !allPassed) {
-    return { verdict: "fail", criteria: merged, defects, summary, raw: text };
+    return { verdict: "fail", criteria: merged, defects, summary, externalChanges, raw: text };
   }
-  return { verdict, criteria: merged, defects, summary, raw: text };
+  return { verdict, criteria: merged, defects, summary, externalChanges, raw: text };
 }
 
 /** Run one review turn in a fresh session and parse its verdict. */
@@ -171,6 +201,7 @@ function degraded(ids: string[], reason: string): ReviewResult {
   return {
     verdict: "unclear",
     criteria: ids.map((id) => ({ id, pass: false, evidence: reason })),
+    externalChanges: [],
     defects: [],
     summary: reason,
   };

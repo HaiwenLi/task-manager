@@ -91,6 +91,15 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 2. 复核改用**分段基线**：只对"写入窗口（before-write → after-readback）"断言零附带改动；窗口之外的差异一律归因为外部变更，逐条列出而不是判失败
 3. 基线记录 `takenAt` + 每张表的 `sha256`，复核时按时间切片比对
 
+**实现进度：声明 + 证据窗口 + 复核规则已做；"每张表 sha256 按时间切片"未做，理由是它假装认识远程表格。**
+
+1. `tasks/<id>.md` 新增 `tolerate`（`external_cell_change` / `new_column` / `deleted_row` / `extra_file`）。未知值直接报错——打错字不该变成"声明了但什么都没容忍"，那会让人以为复核无视了自己的声明。它是**定义的一部分**（进 `definitionDigest`）：运行中放宽 `tolerate` 会让既有验收失效，而不是悄悄沿用
+2. 复核证据新增执行窗口 `{startedAt, finishedAt}`（attempt 开始 → 交给复核），验收记录补 `startedAt`/`finishedAt`/`model`。复核因此能区分"运行期间变的"与"本来就没做"，这是分段基线真正需要的那一半信息
+3. 复核提示词新增「容忍的外部变更」「时间窗口」两节，加三条规则：只有词表内的类别可以归因为外部变更；归因的差异写进 `externalChanges` 并说明影响了哪条验收标准；本任务该写的东西没写全必须 fail，外部变更不能当挡箭牌
+4. 被容忍的差异不做静默处理：进 `review.json`、journal 记 `verdict external=N`、`report` 里逐条列出（`~ ` 前缀）。"容忍"是记录，不是遗忘
+5. 没有做第 3 点（表的 sha256 时间切片）：taskctl 不认识在线表格/xlsx，也没有读取权限，编一个做不到的"基线哈希"只会给出虚假的确信。它能负责的是时间边界、词表和记录；判断留给复核，结论留给 `report` 里那几行。本地文件那一半本来就有验收前后的产物摘要兜着
+6. `tests/drift-tolerance.test.ts` 7 条：词表解析/去重/未知值报错/往返/定义摘要随 `tolerate` 变化；带容忍的 `pass` 会落库并出现在 `report`；`tolerate` 不会把 fail 变 pass（17 行 ≠ 32 行照样返工）；证据里的窗口两端不同且带模型
+
 ### N5 reviewer 是单点
 
 **症状**：一个 provider 的配额耗尽 → 整个任务阻塞 9 分钟并 `blocked`。
@@ -156,7 +165,7 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 | P0 | N1 预留回滚 + workspace 诊断 | 0.5 天 | ✅ 回滚已修；list/prune 待做 |
 | P0 | N2 退出语义三分 | 1 天 | ✅ 已实现（provider 拒绝标 `failure: "provider"`，不升级成 uncertain） |
 | P0 | N3 reconcile/retry | 1 天 | ✅ 已实现（cancel 已撤回） |
-| P1 | N4 外部漂移容忍 | 1.5 天 | 待做 |
+| P1 | N4 外部漂移容忍 | 1.5 天 | ✅ 声明/窗口/复核规则已实现；表的哈希切片明确不做（见 N4） |
 | P1 | N5 reviewer 降级链 | 0.5 天 | ✅ 降级链已实现；同 provider 强制分离未做 |
 | P1 | N6 acceptance 生成器 | 1.5 天 | 待做 |
 | P2 | N7 证据自包含 | 0.5 天 | 待做 |
@@ -202,3 +211,13 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 - 独立复核（`docs/reviews/2026-11-17-model-fallback-review.md`）判为 ship with fixes，四条阻断项已按上表修正：`turn` 返回类型补 `PromptResult`、`models.json` 读全量容错且写失败不外抛、复核原地重试、换模型即换会话
 - 复核的复检（同文件 "Re-check" 节）判为 ship，并指出三条值得修的：两个换模型循环的终止都依赖"读回刚写的位置"，在缓存/同步文件系统上可能读到旧位置而无限循环且不花重试额度 → 改为按链长显式设上限；`fallBack` 把 `OwnershipLostError` 当写失败吞掉 → 改为透传，租约丢失按 skip 处理而不是记成 I/O 问题；`tests/scheduler.test.ts` 的并发断言靠 20ms 睡眠窗口，而它的 fake adapter 从不提交完成请求，每个任务实际空转满 40 个回合（4 次全量跑 2 红 2 绿）→ 改为"等对端进入"的屏障 + `maxTurnsPerSession: 1`，该文件从 11s 降到 2.7s
 - 验证：`npx vitest run` **270 passed / 1 skipped**，连续三次全绿
+
+### 第三轮补充（N4 落地）
+
+- `src/task-file.ts`：新增 `DriftKind` / `DRIFT_HINTS` / `Task.tolerate`，解析与序列化；未知值报 `TaskFileError`
+- `src/runtime.ts`：`tolerate` 进 `definitionDigest`（运行中放宽容忍 = 新任务）
+- `src/review.ts`：`ReviewEvidence.window`；提示词新增「容忍的外部变更」「时间窗口」两节与规则 5–7；`ReviewResult.externalChanges`（解析、去空、degraded 时为空）
+- `src/worker.ts`：证据带执行窗口；验收记录补 `startedAt`/`finishedAt`/`model`；journal 记 `verdict external=N`，事件详情带容忍条数
+- `src/report.ts`：`tolerate` 一行 + `tolerated` 逐条列表 + 复核模型
+- `tests/drift-tolerance.test.ts`：7 条；`tests/review.test.ts` 补一条提示词断言；`tests/helpers/task-fixture.ts` / `tests/worker*.test.ts` / `tests/lifecycle-safety.test.ts` 的 `Task`/`ReviewResult` fixture 补齐新必填字段
+- 验证：`npx vitest run` **278 passed / 1 skipped**

@@ -11,6 +11,7 @@ export function buildTaskFile(overrides: Partial<Task> & { id: string; title?: s
     workdir: undefined,
     dependsOn: [],
     humanCheck: false,
+    tolerate: [],
     reviewRounds: 0,
     sessions: [],
     retries: 0,

@@ -52,5 +52,8 @@ export function definitionDigest(task: Task): string {
     description: task.description, acceptance: task.acceptance, model: task.model, effort: task.effort,
     // Criteria and the human gate are part of what "done" means: changing them
     // mid-run must invalidate the acceptance, not silently grandfather it in.
-    criteria: task.criteria, risk: task.risk, humanCheck: task.humanCheck, dependsOn: task.dependsOn })).digest("hex");
+    // A tolerated drift kind is the same kind of change: it decides what the
+    // reviewer may excuse, so widening it after the fact would be a new task.
+    criteria: task.criteria, risk: task.risk, humanCheck: task.humanCheck, dependsOn: task.dependsOn,
+    tolerate: task.tolerate })).digest("hex");
 }

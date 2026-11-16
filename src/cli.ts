@@ -239,6 +239,7 @@ async function addCommand(
     ...(acceptance !== undefined && { acceptance }),
     dependsOn: [],
     humanCheck: false,
+    tolerate: [],
     reviewRounds: 0,
     sessions: [],
     retries: 0,

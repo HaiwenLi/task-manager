@@ -86,6 +86,7 @@ const verdict = (result: ReviewResult) => async () => result;
 const okReview: ReviewResult = {
   verdict: "pass",
   criteria: [{ id: "C1", pass: true, evidence: "ok" }],
+  externalChanges: [],
   defects: [],
   summary: "ok",
 };
@@ -103,6 +104,7 @@ describe("worker review stage", () => {
     const failReview: ReviewResult = {
       verdict: "fail",
       criteria: [{ id: "C1", pass: false, evidence: "exit 1" }],
+      externalChanges: [],
       defects: ["宽度仍写死"],
       summary: "未达 C1",
     };
@@ -132,7 +134,7 @@ describe("worker review stage", () => {
 
   it("an unclear verdict goes to awaiting-human instead of retrying", async () => {
     await seed();
-    const unclear: ReviewResult = { verdict: "unclear", criteria: [], defects: [], summary: "证据不足" };
+    const unclear: ReviewResult = { verdict: "unclear", criteria: [], externalChanges: [], defects: [], summary: "证据不足" };
     const deps = { store, adapter: adapter(), acceptance: pass, review: verdict(unclear) };
     await runTask(config(), deps, await store.get("a"), "w1");
     expect((await store.get("a")).status).toBe("awaiting-human");
@@ -143,6 +145,7 @@ describe("worker review stage", () => {
     const failReview: ReviewResult = {
       verdict: "fail",
       criteria: [{ id: "C1", pass: false, evidence: "x" }],
+      externalChanges: [],
       defects: [],
       summary: "未达",
     };

@@ -16,6 +16,28 @@ export type TaskComplexity = "simple" | "complex";
 export type TaskRisk = "normal" | "high";
 
 /**
+ * A kind of change a task declares it will not be blamed for.
+ *
+ * Work often runs against an artifact other people edit at the same time — a
+ * shared spreadsheet, a table someone adds a column to. Without a declaration,
+ * every such difference looks like the task's own careless edit, and the
+ * reviewer has no choice but to fail it. The declaration is the operator's, not
+ * the model's: it is parsed here, it is part of the task definition, and the
+ * reviewer may only excuse the kinds listed.
+ */
+export type DriftKind = "external_cell_change" | "new_column" | "deleted_row" | "extra_file";
+
+/** How each tolerated kind reads to a human and to the reviewer. */
+export const DRIFT_HINTS: Record<DriftKind, string> = {
+  external_cell_change: "别的单元格被改了，不是本任务写的那几个",
+  new_column: "表里多出一列（表头/列序变了）",
+  deleted_row: "不是本任务写入的行消失了",
+  extra_file: "工作目录里多出不是本任务写的文件",
+};
+
+const DRIFT_KINDS = Object.keys(DRIFT_HINTS) as DriftKind[];
+
+/**
  * A task as stored in `tasks/<id>.md`: YAML frontmatter + markdown body.
  * The body is the description; `model` is `provider/model`; `effort` maps to
  * the OpenCode variant of that model.
@@ -43,6 +65,8 @@ export type Task = {
   dependsOn: string[];
   /** Explicit human sign-off regardless of risk. */
   humanCheck: boolean;
+  /** External changes this task agrees to tolerate; see {@link DriftKind}. */
+  tolerate: DriftKind[];
   /** How many review rounds have failed so far. */
   reviewRounds: number;
   /** Session ids that have worked on this task, oldest first. */
@@ -100,6 +124,7 @@ export function parseTaskFile(raw: string, id: string): Task {
     workdir: optionalString(data, "workdir", id),
     dependsOn: parseDependsOn(data, id),
     humanCheck: parseHumanCheck(data, id),
+    tolerate: parseTolerate(data, id),
     reviewRounds: parseReviewRounds(data, id),
     sessions: parseSessions(data, id),
     retries: parseRetries(data, id),
@@ -125,6 +150,7 @@ export function serializeTaskFile(task: Task): string {
     ...(task.workdir !== undefined && { workdir: task.workdir }),
     ...(task.dependsOn.length > 0 && { depends_on: task.dependsOn }),
     ...(task.humanCheck && { human_check: task.humanCheck }),
+    ...(task.tolerate.length > 0 && { tolerate: task.tolerate }),
     sessions: task.sessions,
     retries: task.retries,
     review_rounds: task.reviewRounds,
@@ -203,6 +229,32 @@ function parseDependsOn(data: Record<string, unknown>, id: string): string[] {
     throw new TaskFileError(`task file ${id}: depends_on must not include itself`);
   }
   return [...value];
+}
+
+/**
+ * Tolerated drift kinds. An unknown kind is an error, not a silent no-op: a typo
+ * in `new_colunm` would otherwise look like a declaration while excusing
+ * nothing, and the operator would read the rework as the reviewer ignoring them.
+ */
+function parseTolerate(data: Record<string, unknown>, id: string): DriftKind[] {
+  const value = data.tolerate;
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new TaskFileError(`task file ${id}: field tolerate must be a list of kinds`);
+  }
+  const kinds: DriftKind[] = [];
+  for (const item of value) {
+    const kind = typeof item === "string" ? item.trim() : "";
+    if (!(DRIFT_KINDS as readonly string[]).includes(kind)) {
+      throw new TaskFileError(
+        `task file ${id}: unknown tolerate kind "${typeof item === "string" ? item : String(item)}" (expected one of: ${DRIFT_KINDS.join(", ")})`,
+      );
+    }
+    if (!kinds.includes(kind as DriftKind)) kinds.push(kind as DriftKind);
+  }
+  return kinds;
 }
 
 function parseHumanCheck(data: Record<string, unknown>, id: string): boolean {

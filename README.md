@@ -86,11 +86,12 @@ retries: 0
 | `workdir` | | 本任务的工作目录（相对配置里的 `workdir`）；同一目录同时只跑一个任务 |
 | `depends_on` | | 依赖的任务 id；全部 `done` 才会被领取，成环直接报错 |
 | `human_check` | | `true` 时无论风险都要人工放行 |
+| `tolerate` | | 声明**容忍的外部变更种类**：`external_cell_change`、`new_column`、`deleted_row`、`extra_file`。只写这几个值，写错直接报错（打错字不该变成"声明了但什么都没容忍"）。见下节 |
 | `review_rounds` | ✓ | 复核失败次数，由 worker 维护 |
 | `sessions` | ✓ | 会话 id 链（按时间顺序追加），由 worker 维护 |
 | `retries` | ✓ | 失败尝试计数，由 worker 维护 |
 
-辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`acceptance.json`（命令、时间、输出、身份摘要与实际使用的模型）、`review.json`（复核判决与模型）、`models.json`（模型降级链的当前位置）、`done.requested`（完成请求）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
+辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`acceptance.json`（命令、时间、输出、身份摘要与实际使用的模型）、`review.json`（复核判决、模型与被容忍的外部变更）、`models.json`（模型降级链的当前位置）、`done.requested`（完成请求）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
 
 ## 复核流水线
 
@@ -113,7 +114,8 @@ taskctl template --type …   看某类任务的必答/可推/补问模板
 要点：
 
 - **复杂度**：意图里明说「简单任务」或加 `--simple` 才会跳过签字；不说就按复杂处理。简单任务同样出 spec，只是不等签字。
-- **复核是独立会话**：新会话、不给执行者的对话，只给 spec、验收命令与结果、产物摘要、交接笔记、日志尾部。输出必须是 JSON；解析不了按 `unclear` 转人工，不会当成失败去重跑。
+- **复核是独立会话**：新会话、不给执行者的对话，只给 spec、验收命令与结果、产物摘要、交接笔记、日志尾部，以及本次执行的时间窗口。输出必须是 JSON；解析不了按 `unclear` 转人工，不会当成失败去重跑。
+- **容忍的外部变更**：任务可以声明 `tolerate`，告诉复核"这些差异不是我干的"。声明之外的结构变化（删列、改表头含义等）仍按原规则判 fail；本任务自己该写的内容没写全，**不能**拿外部变更当挡箭牌。被容忍的差异不做静默处理：写进 `review.json` 的 `externalChanges`、journal 记一条 `verdict external=N`、`report` 里逐条列出来。为什么需要它：真跑过的表格任务里，运行期间别人加了 1 列、删了 1 行、改了 4 个单元格，复核按"零附带改动"判 fail，白跑 20 分钟一轮。`tolerate` 是**定义的一部分**（进 `definitionDigest`），运行中放宽会让既有验收失效，不会被悄悄沿用。
 - **返工**：复核不过会写一条 `review-failed` 笔记并回到 `open`；连续 `maxReviewRounds` 轮（默认 2）后 `blocked`。
 - **人工节点**：`risk: high`、`human_check: true`、以及复核无法判定的任务停在 `awaiting-human`，只有 `accept` 能放行。
 - **归因**：`reject`/`audit` 都会记录问题出在 `clarify`（标准本身错）、`worker`（没做到）、还是 `reviewer`（漏判），`metrics` 按环节汇总。

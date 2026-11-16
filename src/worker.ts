@@ -459,6 +459,7 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
     acceptanceMarkdown: acceptance === null ? "" : renderAcceptance(acceptance),
     handoff: (await latestNote(r.cfg.tasksDir, id))?.markdown ?? null,
     journal: await journalTail(r.cfg.tasksDir, id, 30),
+    window: { startedAt: r.record.startedAt, finishedAt: new Date().toISOString() },
   };
   emit(r, "reviewing");
   await owned(r, async () => {
@@ -494,9 +495,19 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
       // Which model judged is part of the evidence: work passed by a fallback is
       // not the same claim as work passed by the model the operator chose.
       await writeRuntime(r.cfg.tasksDir, id, "review.json", { ...result, model: reviewerModel, at: new Date().toISOString() });
-      await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "verdict", detail: result.verdict });
+      await appendJournal(r.cfg.tasksDir, id, {
+        stage: "review",
+        event: "verdict",
+        // Tolerated drift is recorded, never silent: the count is in the journal
+        // and the changes themselves are in review.json.
+        detail: result.externalChanges.length > 0
+          ? `${result.verdict} external=${result.externalChanges.length}`
+          : result.verdict,
+      });
     });
-    emit(r, "reviewed", result.verdict);
+    emit(r, "reviewed", result.externalChanges.length > 0
+      ? `${result.verdict} (${result.externalChanges.length} external change(s) tolerated)`
+      : result.verdict);
 
     if (result.failure !== "provider") return await judge(r, result);
     await owned(r, () => appendJournal(r.cfg.tasksDir, id, {
@@ -577,8 +588,12 @@ function renderAcceptance(record: Record<string, unknown>): string {
     `command: ${value("command")}`,
     `result: ${outcome}`,
     `exitCode: ${value("exitCode")}`,
+    // The acceptance window is the narrowest slice the reviewer can trust: a
+    // workspace that changed outside it changed while someone else had it open.
+    `windows: startedAt ${value("startedAt")} finishedAt ${value("finishedAt")}`,
     `artifactBefore: ${value("artifactBefore")}`,
     `artifactAfter: ${value("artifactAfter")}`,
+    `model: ${value("model")}`,
     ...(record.note === undefined ? [] : [`note: ${value("note")}`]),
     `output: ${value("output")}`,
   ].join("\n");

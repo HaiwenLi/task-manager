@@ -76,11 +76,38 @@ describe("buildReviewPrompt", () => {
       acceptanceMarkdown: "command npm test\nexit 0",
       handoff: "## Done\n改好了",
       journal: ["2026-11-16T00:00:00.000Z  worker  running"],
+      window: { startedAt: "2026-11-16T00:00:00.000Z", finishedAt: "2026-11-16T00:20:00.000Z" },
     });
     expect(prompt).toContain("## 验收标准");
     expect(prompt).toContain("command npm test");
     expect(prompt).toContain("改好了");
     expect(prompt).toContain("只输出一个 JSON");
     expect(prompt).not.toContain("sessionId");
+  });
+
+  it("states the tolerated drift and the window, and says so when nothing is tolerated", () => {
+    const base = {
+      spec: "",
+      acceptanceMarkdown: "",
+      handoff: null,
+      journal: [],
+      window: { startedAt: "2026-11-16T00:00:00.000Z", finishedAt: "2026-11-16T00:20:00.000Z" },
+    };
+    const tolerated = parseTaskFile(
+      "---\ntitle: 填表\nstatus: running\ncriteria:\n  - C1 填了 32 行\ntolerate:\n  - new_column\n  - external_cell_change\nsessions: []\nretries: 0\n---\n正文",
+      "002-b",
+    );
+    const withDrift = buildReviewPrompt({ ...base, task: tolerated });
+    expect(withDrift).toContain("## 容忍的外部变更");
+    expect(withDrift).toContain("new_column");
+    expect(withDrift).toContain("external_cell_change");
+    expect(withDrift).toContain("2026-11-16T00:20:00.000Z");
+    expect(withDrift).toContain("externalChanges");
+
+    const strict = parseTaskFile(
+      "---\ntitle: 填表\nstatus: running\ncriteria:\n  - C1 填了 32 行\nsessions: []\nretries: 0\n---\n正文",
+      "003-c",
+    );
+    expect(buildReviewPrompt({ ...base, task: strict })).toContain("(本任务没有声明");
   });
 });

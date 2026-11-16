@@ -93,6 +93,7 @@ class FakeAdapter implements AgentAdapter {
 const passReview = async () => ({
   verdict: "pass" as const,
   criteria: [{ id: "C1", pass: true, evidence: "fixture" }],
+  externalChanges: [],
   defects: [],
   summary: "ok",
 });
@@ -108,6 +109,7 @@ function task(overrides: Partial<Task> = {}): Task {
     risk: "normal",
     dependsOn: [],
     humanCheck: false,
+    tolerate: [],
     reviewRounds: 0,
     sessions: [],
     retries: 0,
