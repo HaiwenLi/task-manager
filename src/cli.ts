@@ -15,7 +15,7 @@ import type { AcceptanceResult } from "./acceptance.js";
 import { renderBoardMarkdown, renderBoardTable, writeBoard } from "./board.js";
 import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
-import { cancelTask, reconcileTask, retryTask } from "./reconcile.js";
+import { reconcileTask, retryTask } from "./reconcile.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
 export type CliDeps = {
@@ -49,7 +49,6 @@ const USAGE = [
   "  taskctl metrics [--tasks-dir <dir>]",
   "  taskctl reconcile --task <id> [--tasks-dir <dir>]",
   "  taskctl retry --task <id> [--tasks-dir <dir>]",
-  "  taskctl cancel --task <id> [--tasks-dir <dir>]",
   "  taskctl learn --note \"<原话 → 改法>\" [--tasks-dir <dir>]",
   "  taskctl template [--type code|office|research|design]",
 ].join("\n");
@@ -67,6 +66,12 @@ async function tasksDirFor(flags: Map<string, string>): Promise<string> {
     return explicit;
   }
   return resolveConfig(await readConfig(flags.get("config") ?? "taskctl.json"), "taskctl.json").tasksDir;
+}
+
+/** Resolve the config file for commands that need settings beyond `tasksDir`. */
+async function configFor(flags: Map<string, string>): Promise<ResolvedConfig> {
+  const path = flags.get("config") ?? "taskctl.json";
+  return resolveConfig(await readConfig(path), path);
 }
 
 /**
@@ -154,9 +159,6 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "retry":
       checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return retryCommand(flags, log);
-    case "cancel":
-      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
-      return cancelCommand(flags, log);
     case "template":
       checkFlags(command, flags, ["type", "tasks-dir", "config"], []);
       return templateCommand(flags, log);
@@ -553,35 +555,30 @@ async function templateCommand(flags: Map<string, string>, log: (line: string) =
  */
 async function reconcileCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
   const tasksDir = await tasksDirFor(flags);
-  const findings = await reconcileTask(tasksDir, flags.get("task")!);
-  log(`${findings.id}  status=${findings.status}  attempt=${findings.attempt?.phase ?? "none"}  lock=${findings.lockLive ? "live" : "free"}  pid=${findings.pid ?? "-"}  reservations=${findings.reservations.length}`);
+  const cfg = await configFor(flags);
+  const findings = await reconcileTask(tasksDir, flags.get("task")!, { baseWorkdir: cfg.workdir });
+  log(`${findings.id}  status=${findings.status}  attempt=${findings.attempt?.phase ?? "none"}  lock=${findings.lockLive ? "live" : "free"}  reservations=${findings.reservations.length}`);
   for (const note of findings.notes) log(`  - ${note}`);
   for (const reservation of findings.reservations) log(`  reservation ${reservation.token} -> ${reservation.cwd}`);
   log(`  verdict: ${findings.verdict}`);
-  if (findings.verdict === "stop-process-first") log(`  next: taskctl cancel --task ${findings.id}`);
   if (findings.verdict === "retry-allowed") log(`  next: taskctl retry --task ${findings.id}`);
+  if (findings.verdict === "manual-review") {
+    log("  next: confirm the execution is really gone, then reconcile the evidence by hand (ADR-0007)");
+  }
   return 0;
 }
 
 /** `taskctl retry --task <id>` — reopen a blocked task once nothing is running. */
 async function retryCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
   const tasksDir = await tasksDirFor(flags);
-  const outcome = await retryTask(tasksDir, flags.get("task")!);
+  const cfg = await configFor(flags);
+  const outcome = await retryTask(tasksDir, flags.get("task")!, { baseWorkdir: cfg.workdir });
   if (!outcome.ok) {
     log(`retry refused: ${outcome.reason}`);
     return 1;
   }
   log(`reopened; previous attempt archived to ${outcome.archive}`);
   return 0;
-}
-
-/** `taskctl cancel --task <id>` — stop the process tree recorded in attempt.json. */
-async function cancelCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
-  const tasksDir = await tasksDirFor(flags);
-  const outcome = await cancelTask(tasksDir, flags.get("task")!);
-  log(outcome.stopped ? `cancelled: ${outcome.reason}` : `not cancelled: ${outcome.reason}`);
-  if (outcome.stopped) log(`next: taskctl reconcile --task ${flags.get("task")}`);
-  return outcome.stopped ? 0 : 1;
 }
 
 /** `--flag value` tokens into a map; bare tokens become positionals. */

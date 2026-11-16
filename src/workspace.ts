@@ -173,15 +173,21 @@ export async function reserveWorkspace(
       await writeFile(marker, owner, { flag: "wx" });
       markerIdentity = await lstat(marker);
     } catch (error) {
-      // Acquisition failed after the record was published. Roll it back: an
-      // orphaned record has no owner, so nothing can ever release it, and it
-      // blocks every later attempt for this path range (observed live: three
-      // leaked records and a stale lock dir permanently wedged a workspace).
-      await writeRegistry(registryDir, records);
+      // Acquisition failed after the record was published. Undo the local
+      // artifacts first (verifying they are ours), then the record: an orphaned
+      // record has no owner, so nothing can ever release it and every later
+      // attempt for this path range is refused (observed live: three leaked
+      // records and a stale lock dir permanently wedged a workspace).
       if (created) {
-        await unlink(marker).catch(() => {});
-        await rmdir(lock).catch(() => {});
+        const current = await lstat(lock).catch(() => null);
+        const ours = current !== null && current.isDirectory() &&
+          current.dev === identity.dev && current.ino === identity.ino;
+        if (ours) {
+          await unlink(marker).catch(() => {});
+          await rmdir(lock).catch(() => {});
+        }
       }
+      await writeRegistry(registryDir, records).catch(() => {});
       if (code(error) === "EEXIST") return null;
       throw error;
     }
@@ -223,6 +229,18 @@ export async function reservationsFor(
   registryDir: string = DEFAULT_REGISTRY,
 ): Promise<ReservationRecord[]> {
   const canonical = await realpath(cwd).catch(() => cwd);
+  // Mirror reserveWorkspace: a repository's common dir is part of the range, so
+  // worktrees sharing metadata must count as covered even when their own paths
+  // do not nest. A path that no longer exists (deleted workspace, renamed
+  // checkout) has no metadata to read: fall back to the plain path comparison
+  // instead of failing the diagnosis.
+  let common: string | null = null;
+  try {
+    common = await gitCommonDir(canonical);
+  } catch {
+    common = null;
+  }
+  const requested = common === null ? [canonical] : [canonical, common];
   let records: ReservationRecord[] = [];
   try {
     records = await readRegistry(registryDir);
@@ -233,7 +251,7 @@ export async function reservationsFor(
   }
   return records.filter((record) => {
     const held = record.gitCommonDir === null ? [record.cwd] : [record.cwd, record.gitCommonDir];
-    return held.some((path) => within(path, canonical) || within(canonical, path));
+    return requested.some((a) => held.some((b) => within(a, b) || within(b, a)));
   });
 }
 

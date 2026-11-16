@@ -1,34 +1,44 @@
-import { spawn } from "node:child_process";
 import { mkdir, rename } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { LOCK_TTL_MS_DEFAULT, lockLive } from "./claim.js";
 import { appendJournal } from "./journal.js";
-import { readAttempt, writeRuntime, type AttemptRecord } from "./runtime.js";
+import { withMutex } from "./mutex.js";
+import { readAttempt, type AttemptRecord } from "./runtime.js";
 import { TaskStore } from "./task-store.js";
-import type { TaskStatus } from "./task-file.js";
+import type { Task } from "./task-file.js";
 import { reservationsFor } from "./workspace.js";
 
 /**
  * Operator reconciliation for `blocked` tasks.
  *
  * The controller never retries an interrupted or uncertain execution on its own
- * (ADR-0007). These helpers turn the manual recovery procedure from the README
- * into commands, while keeping the same rules: an execution that may still be
- * running is never replayed, and a retry only ever starts from evidence that
- * nothing is left to run.
+ * (ADR-0007). This module turns the *safe half* of the manual recovery procedure
+ * into commands: diagnose read-only, and reopen only when the evidence proves
+ * nothing is left to run. It deliberately does not kill processes by a recorded
+ * PID — ADR-0007 forbids that, because PIDs are reused and nothing in
+ * `attempt.json` proves the PID still belongs to that execution.
  */
-export type ReconcileVerdict = "retry-allowed" | "stop-process-first" | "already-terminal" | "manual-review";
+export type ReconcileVerdict = "retry-allowed" | "already-terminal" | "manual-review";
 
 export type ReconcileFindings = {
   id: string;
-  status: TaskStatus;
+  status: Task["status"];
   attempt: AttemptRecord | null;
   lockLive: boolean;
+  /** Path whose reservations were inspected, or null when it cannot be known. */
+  workspace: string | null;
   reservations: Array<{ token: string; cwd: string }>;
   pid: number | null;
   pidAlive: boolean;
   verdict: ReconcileVerdict;
   notes: string[];
+};
+
+export type ReconcileOptions = {
+  ttlMs?: number;
+  registryDir?: string;
+  /** Configured base workdir, used to resolve `task.workdir` when the attempt has none. */
+  baseWorkdir?: string;
 };
 
 function processAlive(pid: number | undefined): boolean {
@@ -41,50 +51,64 @@ function processAlive(pid: number | undefined): boolean {
   }
 }
 
+/** The path an execution of this task would own, as far as it can be known. */
+export function ownedPath(task: Task, attempt: AttemptRecord | null, baseWorkdir?: string): string | null {
+  if (attempt?.workspace !== undefined) return attempt.workspace;
+  if (baseWorkdir === undefined) return null;
+  return task.workdir === undefined ? baseWorkdir : resolve(baseWorkdir, task.workdir);
+}
+
 /** Read-only diagnosis: what would a retry have to clear, and is it safe yet? */
 export async function reconcileTask(
   tasksDir: string,
   id: string,
-  ttlMs: number = LOCK_TTL_MS_DEFAULT,
-  registryDir?: string,
+  options: ReconcileOptions = {},
 ): Promise<ReconcileFindings> {
+  const ttlMs = options.ttlMs ?? LOCK_TTL_MS_DEFAULT;
   const store = new TaskStore(tasksDir);
   const task = await store.get(id);
   const attempt = await readAttempt(tasksDir, id);
   const live = await lockLive(tasksDir, id, ttlMs);
-  const alive = processAlive(attempt?.pid);
-  const reservations = attempt?.workspace === undefined ? [] : await reservationsFor(attempt.workspace, registryDir);
+  const workspace = ownedPath(task, attempt, options.baseWorkdir);
+  const reservations = workspace === null ? [] : await reservationsFor(workspace, options.registryDir);
+  const settled = attempt !== null && attempt.phase === "settled";
+  const pidAlive = processAlive(attempt?.pid);
 
   const notes: string[] = [];
-  if (attempt === null) notes.push("no attempt.json: a retry only has to reopen the task");
-  if (attempt !== null && attempt.phase !== "settled") {
-    notes.push(`attempt phase is ${attempt.phase} (${attempt.operation})`);
-  }
+  if (attempt === null) notes.push("no attempt.json: reopening only has to flip the status");
+  if (attempt !== null && !settled) notes.push(`attempt phase is ${attempt.phase} (${attempt.operation}); it is not settled`);
   if (live) notes.push("a live task lock is still held");
-  if (alive) notes.push(`attempt pid ${attempt!.pid} is still alive`);
-  if (reservations.length > 0) {
-    notes.push(`${reservations.length} workspace reservation(s) still cover ${attempt!.workspace}`);
+  if (settled && pidAlive) {
+    notes.push(`recorded pid ${attempt!.pid} is alive but the attempt is settled: treat it as PID reuse and do not kill it`);
   }
-  if (task.status === "done" || task.status === "review" || task.status === "awaiting-human") {
-    notes.push(`task is ${task.status}; nothing to reconcile`);
+  if (!settled && pidAlive) {
+    notes.push(`recorded pid ${attempt!.pid} is alive; taskctl cannot verify it is still this execution, stop it outside taskctl only after checking`);
   }
+  if (workspace === null) notes.push("the owned path cannot be determined, so reservations cannot be checked");
+  else if (reservations.length > 0) notes.push(`${reservations.length} workspace reservation(s) still cover ${workspace} (${reservations.map((r) => r.token).join(", ")})`);
 
   let verdict: ReconcileVerdict;
-  if (task.status === "open" || task.status === "running") verdict = "manual-review";
-  else if (task.status === "done" || task.status === "review" || task.status === "awaiting-human") verdict = "already-terminal";
-  else if (alive) verdict = "stop-process-first";
-  else if (attempt !== null && attempt.phase !== "settled") verdict = "manual-review";
-  else if (live || reservations.length > 0) verdict = "manual-review";
-  else verdict = "retry-allowed";
+  if (task.status === "done" || task.status === "review" || task.status === "awaiting-human") {
+    verdict = "already-terminal";
+  } else if (task.status !== "blocked") {
+    verdict = "manual-review";
+  } else if (attempt !== null && !settled) {
+    verdict = "manual-review";
+  } else if (live || reservations.length > 0 || workspace === null) {
+    verdict = "manual-review";
+  } else {
+    verdict = "retry-allowed";
+  }
 
   return {
     id,
     status: task.status,
     attempt,
     lockLive: live,
+    workspace,
     reservations: reservations.map((record) => ({ token: record.token, cwd: record.cwd })),
     pid: attempt?.pid ?? null,
-    pidAlive: alive,
+    pidAlive,
     verdict,
     notes,
   };
@@ -92,100 +116,70 @@ export async function reconcileTask(
 
 export type RetryOutcome = { ok: true; archive: string } | { ok: false; reason: string };
 
+/** Files belonging to one attempt; archiving them clears the evidence trail for a rerun. */
+const ATTEMPT_EVIDENCE = ["attempt.json", "acceptance.json", "review.json"] as const;
+
 /**
- * Reopen a blocked task after the operator has confirmed nothing is still
- * running: archive the previous attempt evidence, reset the attempt counters and
- * set the task back to `open`. Refuses whenever any evidence of a live execution
- * remains — that is the whole point of the guard.
+ * Reopen a blocked task whose previous attempt is settled and unreferenced.
+ *
+ * Guards, in order: blocked status, settled (or absent) attempt, no live task
+ * lock, and no workspace reservation for the path this task would own. The
+ * checks and the writes run under the same task mutation mutex the controller
+ * uses, so a concurrent claim cannot slip between them.
  */
 export async function retryTask(
   tasksDir: string,
   id: string,
-  ttlMs: number = LOCK_TTL_MS_DEFAULT,
-  now: Date = new Date(),
-  registryDir?: string,
+  options: ReconcileOptions & { now?: Date } = {},
 ): Promise<RetryOutcome> {
-  const store = new TaskStore(tasksDir);
-  const task = await store.get(id);
-  if (task.status !== "blocked") {
-    return { ok: false, reason: `task ${id} is ${task.status}; retry only reopens blocked tasks` };
-  }
-  const attempt = await readAttempt(tasksDir, id);
-  if (attempt !== null && attempt.phase !== "settled") {
-    return { ok: false, reason: `attempt ${attempt.attemptId} is ${attempt.phase}; stop the execution and reconcile first` };
-  }
-  if (await lockLive(tasksDir, id, ttlMs)) {
-    return { ok: false, reason: "a live task lock is still held" };
-  }
-  if (attempt?.workspace !== undefined) {
-    const covered = await reservationsFor(attempt.workspace, registryDir);
-    if (covered.length > 0) {
-      return {
-        ok: false,
-        reason: `workspace ${attempt.workspace} is still reserved (${covered.map((record) => record.token).join(", ")})`,
-      };
-    }
-  }
+  const ttlMs = options.ttlMs ?? LOCK_TTL_MS_DEFAULT;
+  const now = options.now ?? new Date();
+  const refusal = await retryRefusal(tasksDir, id, options, ttlMs);
+  if (refusal !== null) return { ok: false, reason: refusal };
 
-  const stamp = now.toISOString().replace(/[:.]/g, "-");
-  const archive = join(tasksDir, id, "archive", stamp);
-  await mkdir(archive, { recursive: true });
-  for (const name of ["attempt.json", "acceptance.json", "review.json"]) {
-    await rename(join(tasksDir, id, name), join(archive, name)).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") throw error;
-    });
-  }
-  await store.updateFields(id, { retries: 0, reviewRounds: 0 });
-  await store.setStatus(id, "open");
-  await appendJournal(tasksDir, id, { stage: "human", event: "retry", detail: `archived to ${archive}` });
-  return { ok: true, archive };
+  return withMutex(join(tasksDir, id, ".mutation.lock"), async (): Promise<RetryOutcome> => {
+    // Re-read inside the mutex: the guards above ran against an earlier snapshot.
+    const again = await retryRefusal(tasksDir, id, options, ttlMs);
+    if (again !== null) return { ok: false, reason: again };
+
+    const stamp = now.toISOString().replace(/[:.]/g, "-");
+    const archive = join(tasksDir, id, "archive", stamp);
+    await mkdir(archive, { recursive: true });
+    for (const name of ATTEMPT_EVIDENCE) {
+      await rename(join(tasksDir, id, name), join(archive, name)).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+    }
+    const store = new TaskStore(tasksDir);
+    await store.updateFields(id, { retries: 0, reviewRounds: 0 });
+    await store.setStatus(id, "open");
+    await appendJournal(tasksDir, id, { stage: "human", event: "retry", detail: `archived to ${archive}` });
+    return { ok: true, archive };
+  });
 }
 
-export type CancelOutcome = { stopped: boolean; reason: string; pid: number | null };
-
-/** Stop the recorded execution tree, then mark the attempt uncertain for review. */
-export async function cancelTask(
+/** Every reason a retry must be refused, or null when it is safe. */
+async function retryRefusal(
   tasksDir: string,
   id: string,
-  now: Date = new Date(),
-): Promise<CancelOutcome> {
-  const attempt = await readAttempt(tasksDir, id);
-  if (attempt?.pid === undefined) {
-    return { stopped: false, reason: "no pid recorded in attempt.json; nothing to stop", pid: null };
-  }
-  if (!processAlive(attempt.pid)) {
-    return { stopped: true, reason: `pid ${attempt.pid} already gone`, pid: attempt.pid };
-  }
-  const killed = await killTree(attempt.pid);
-  if (!killed) {
-    return { stopped: false, reason: `could not stop pid ${attempt.pid}; reconcile manually`, pid: attempt.pid };
-  }
-  await writeRuntime(tasksDir, id, "attempt.json", {
-    ...attempt,
-    phase: "uncertain",
-    reason: `operator cancelled at ${now.toISOString()}`,
-    updatedAt: now.toISOString(),
-  });
-  await appendJournal(tasksDir, id, { stage: "human", event: "cancel", detail: `stopped pid ${attempt.pid}` });
-  return { stopped: true, reason: `stopped pid ${attempt.pid}`, pid: attempt.pid };
-}
+  options: ReconcileOptions,
+  ttlMs: number,
+): Promise<string | null> {
+  const store = new TaskStore(tasksDir);
+  const task = await store.get(id);
+  if (task.status !== "blocked") return `task ${id} is ${task.status}; retry only reopens blocked tasks`;
 
-function killTree(pid: number): Promise<boolean> {
-  if (process.platform === "win32") {
-    return new Promise((resolvePromise) => {
-      const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
-        shell: false,
-        stdio: "ignore",
-        windowsHide: true,
-      });
-      killer.once("error", () => resolvePromise(false));
-      killer.once("close", (code) => resolvePromise(code === 0));
-    });
+  const attempt = await readAttempt(tasksDir, id);
+  if (attempt !== null && attempt.phase !== "settled") {
+    return `attempt ${attempt.attemptId} is ${attempt.phase}; confirm the execution is gone and settle it manually first`;
   }
-  try {
-    process.kill(-pid, "SIGKILL");
-    return Promise.resolve(true);
-  } catch {
-    return Promise.resolve(false);
+  if (await lockLive(tasksDir, id, ttlMs)) return "a live task lock is still held";
+
+  const workspace = ownedPath(task, attempt, options.baseWorkdir);
+  if (workspace === null) return "the owned workspace path cannot be determined; pass --config with workdir";
+  const covered = await reservationsFor(workspace, options.registryDir);
+  if (covered.length > 0) {
+    return `workspace ${workspace} is still reserved (${covered.map((record) => record.token).join(", ")})`;
   }
+  return null;
 }

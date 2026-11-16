@@ -51,23 +51,27 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 
 同时把 provider 的 `429/5xx/rate_limit` 识别为 `external-transient`：不消耗 `retryLimit`、不退化成 `uncertain`，走带退避的重试并允许切换模型。
 
-**实现进度**：已先落一步——`controlled()` 现在记录"结果是否由执行本身结算"（`settledByResult`），结算过就直接把错误原样抛出，不再走取消判定。这一步不改变 `cancel()` 的安全语义，因此不破坏既有测试"父进程先消失时不得声称已确认停止"。**剩余部分（429 归类、三分语义）本轮未改**，原因如下。
+**实现进度：本轮未改。** 试过两种做法都被否掉：
 
-**改不动的原因（重要）**：曾尝试让 `cancel()` 对"已退出"的进程直接返回 `true`，结果 `tests/execution.test.ts` 里那条既有测试立刻失败——它守的是一条真实安全性质：父进程在请求取消前就消失时，Windows 无法再定位其子进程树，此时若声称"已确认停止"，就可能把仍在跑的后端会话当成已停。所以正确做法不是放宽 `cancel()`，而是让 **adapter 明确报告"这次是 provider 侧失败"**（例如在 `PromptResult` 上带 `failure: "provider"`），让 `controlled()` 在不调用 `cancel()` 的前提下计一次可重试失败。这条要改 adapter 契约，需单独评审。
+1. 让 `cancel()` 对"已退出"的进程直接返回 `true` —— 仓库里既有测试立刻失败，它守的是真实安全性质：父进程在请求取消前就消失时，Windows 无法再定位其子进程树，此时声称"已确认停止"可能把仍在跑的后端会话当已停。
+2. 在 `controlled()` 里加 `settledByResult`（结果已结算就跳过取消判定）—— 评审指出它是**惰性的**：失败回合的 `inspect().state` 本来就是 `uncertain`，第一个不确定检查在标志被读取前就抛出了；它唯一改变的分支是"result 被 reject 而进程还在"，那里反而跳过了 `cancel()` 与 `state === "exited"` 校验。已在评审后撤回。
+
+**正确做法**：让 adapter 明确报告"这次是 provider 侧失败"（例如 `PromptResult` 带 `failure: "provider"`），`controlled()` 据此计一次可重试失败而不进入取消判定；provider 429/5xx 归为 `external-transient`，不消耗 `retryLimit`、优先切换模型。这要改 adapter 契约，需单独评审。
 
 ### N3 `blocked` 是死胡同
 
 **症状**：本次 3 次 `blocked` 全部由人工改文件恢复（归档 `attempt.json`、清注册表、改 frontmatter 状态）。README 里写的就是手工流程，但没有任何命令支撑。
 
-**方案**：把手工流程产品化，三个命令（全部写 journal，全部幂等）：
+**方案**：把手工流程里"可安全自动化"的部分产品化，两个命令（写 journal）：
 
-- `taskctl reconcile <id>`：只读诊断——lock/attempt/acceptance/预留/进程存活，给出"可 retry / 必须先停进程"的结论
-- `taskctl cancel <id>`：按 `attempt.pid` 停进程树 → 标 `uncertain` → 提示 reconcile
-- `taskctl retry <id>`：仅当 `phase=settled`、无活跃锁、无匹配预留时，归档 `attempt.json`/`acceptance.json` 到 `archive/<ts>/`，状态回 `open`
+- `taskctl reconcile <id>`：只读诊断——锁、attempt 阶段、归属路径、匹配预留、pid 存活，给出 `retry-allowed` / `manual-review` / `already-terminal`
+- `taskctl retry <id>`：仅当 `blocked`、attempt 已 `settled`、无活跃锁、归属路径确定且无匹配预留时，归档 `attempt/acceptance/review` 到 `archive/<ts>/`、重置计数、状态回 `open`
 
-**状态：已实现**（`src/reconcile.ts` + CLI + `tests/reconcile.test.ts`，9 条测试）。守卫：非 `blocked` 拒绝、`attempt` 未 `settled` 拒绝、活跃锁拒绝、工作目录仍被预留拒绝；`retry` 只改 Markdown 状态与归档证据，不绕过验收。
+**明确不做 `cancel`（原方案里的第三条）**：评审查明它会按记录的 PID 直接 `taskkill /T /F`，而这正是 ADR-0007 明令禁止的（PID 会被复用，无法证明仍属该次执行）；并且它对"父进程已消失"会返回"已停止"，与 `execution.ts` 的保守语义相反，可能让人据此归档并重放一个仍在跑的子树。同时 `cancel` 若把 attempt 标成 `uncertain`，`retry` 就永久拒绝，形成死路。故本轮撤回，留作带前置条件的设计：记录 `pidStartedAt` + 校验镜像名 + 显式 `--pid` 确认，并且先补齐"人工确认后把 uncertain 合法转成 settled"的受控转移。
 
-**遗留边界**：`reservationsFor()` 在注册表损坏时 fail closed（抛错），这是对的；但 `reconcile` 现在会直接抛栈而不是把"注册表损坏"作为结论展示。下一步把注册表错误分类后交给诊断命令输出。
+**状态**：`reconcile` / `retry` 已实现（`src/reconcile.ts` + CLI + `tests/reconcile.test.ts`，9 条测试）。守卫逐条有测试：非 `blocked`、attempt 未 `settled`、活跃锁、归属路径被预留、归属路径不可知。`retry` 只改 Markdown 状态与归档证据，不绕过验收；检查与写入都在 `.mutation.lock` 内并二次复核。
+
+**遗留边界**：注册表损坏时 `reservationsFor()` fail closed（抛错），这是对的，但 `reconcile` 会直接抛栈而不是把"注册表损坏"作为结论展示；下一步把注册表错误分类后交给诊断命令输出。另外 `retry` 只重置计数，不重置会话链——因会话预算耗尽而 blocked 的任务会再次 blocked，需要 `--reset-sessions` 或文档说明。
 
 ### N4 共享表在任务运行期被人工编辑是常态
 
@@ -131,8 +135,8 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 | 优先级 | 项 | 工作量 | 状态 |
 | --- | --- | --- | --- |
 | P0 | N1 预留回滚 + workspace 诊断 | 0.5 天 | ✅ 回滚已修；list/prune 待做 |
-| P0 | N2 退出语义三分 | 1 天 | 🟡 仅 `settledByResult` 一步；provider 失败分类待做 |
-| P0 | N3 reconcile/cancel/retry | 1.5 天 | ✅ 已实现（9 条测试） |
+| P0 | N2 退出语义三分 | 1 天 | ❌ 本轮未改（两种试法都被否，见 N2） |
+| P0 | N3 reconcile/retry | 1 天 | ✅ 已实现（cancel 已撤回） |
 | P1 | N4 外部漂移容忍 | 1.5 天 | 待做 |
 | P1 | N5 reviewer 降级链 | 0.5 天 | 待做 |
 | P1 | N6 acceptance 生成器 | 1.5 天 | 待做 |
@@ -152,11 +156,18 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 
 ## 附录 A：本次代码改动
 
-- `src/workspace.ts`：`reserveWorkspace` 失败路径回滚注册表记录，并清理本次创建的 marker/锁目录；新增只读的 `reservationsFor()` 供诊断使用
-- `src/reconcile.ts`：新增 `reconcileTask` / `retryTask` / `cancelTask`
-- `src/cli.ts`：新增 `reconcile` / `retry` / `cancel` 三个子命令
-- `src/worker.ts`：`controlled()` 记录 `settledByResult`，结果已结算时不再走取消判定
+- `src/workspace.ts`：`reserveWorkspace` 失败路径先清理本次创建的 marker/锁目录（校验 dev/ino），再回滚注册表记录；新增只读 `reservationsFor()`，与预留判定一致地把 Git common dir 纳入路径区间比较
+- `src/reconcile.ts`：新增 `reconcileTask` / `retryTask`（不含 kill 语义）
+- `src/cli.ts`：新增 `reconcile` / `retry` 两个子命令
 - `src/task-store.ts`：`TaskFieldsPatch` 增加 `retries` / `reviewRounds`，供 retry 重置计数
 - `tests/workspace.test.ts`：回归测试「stale 锁目录 → 预留失败 → 注册表必须为空 → 清理后可预留」
-- `tests/reconcile.test.ts`：9 条测试覆盖诊断结论、四类 retry 守卫、cancel 的两种结局
-- 验证：`npx vitest run` **249 passed / 1 skipped**；`tsc --noEmit` 在本机受 TSD 透明加密影响不可用（`TS1490: File appears to be binary`），需在未加密环境复验
+- `tests/reconcile.test.ts`：9 条测试覆盖诊断结论（含已 settled 但 pid 存活的复用情形、归属路径不可知）与 retry 的四类守卫 + 归档/重开
+- 验证：`npx vitest run` 全绿；`tsc --noEmit` 在本机受 TSD 透明加密影响不可用（`TS1490: File appears to be binary`），需在未加密环境复验
+
+### 评审后的修正（同一轮内）
+
+- 撤回 `taskctl cancel`：按记录的 PID 杀进程违反 ADR-0007，且与 `execution.ts` 的保守语义冲突
+- 撤回 `controlled()` 的 `settledByResult`：评审证明它惰性且跳过了一处校验
+- `reconcile` 不再把"已 settled 但 pid 存活"判成待停止（那是 PID 复用），只在 attempt 未 settled 时提示
+- `retry` 的预留检查补上"attempt 没有 workspace 时用配置 workdir 解析"的兜底；两者都不可知时拒绝
+- `retry` 的检查与写入放进 `.mutation.lock` 并二次复核，避免守卫与写状态之间的时间窗
