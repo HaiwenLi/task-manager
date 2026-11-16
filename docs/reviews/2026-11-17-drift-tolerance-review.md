@@ -192,3 +192,67 @@ The five Goldfish stages were condensed into one pass because the target is a co
 4. Cheap and worth doing in the same pass: print the tolerated list in `taskctl accept` (M2); drop or narrow `extra_file` (M1); sort `tolerate` before hashing (M5); add a `parseVerdict` test for `externalChanges` and a review-only-path test (test gaps 1-2); add `--tolerate` to `taskctl add` so an operator declaration is a journaled action (M4).
 
 After 1-3 this ships. Item 1 is the one I would not defer: without it the commit's stated containment does not exist on the path the real incident took, and I have the run that shows it.
+
+---
+
+# Re-check of `8262a1f` — 2026-11-17
+
+Scope: the three blocking defects and the cheap items from the minimum change set. M3/M4/M7 were declared out of scope by the author; they are assessed only for whether leaving them makes something blocking.
+Method: `git show 8262a1f`, re-read of every changed region in the fixed tree, targeted run (`tests/drift-tolerance.test.ts` + `tests/review.test.ts` → 20 tests green), full suite → **282 passed / 1 skipped, 31 files passed / 1 skipped, 40.46 s**, matching the commit message. `tsc` is still unavailable here (TSD/TS1490), and this section asserts no type-level finding. No source file was edited.
+
+## Verdict per finding
+
+| Finding | Verdict | Evidence in `8262a1f` |
+| --- | --- | --- |
+| B1 review-only digest check | **Resolved** | `requireUnchangedDefinition` (`worker.ts:381-393`) is called at `worker.ts:414`, after the criteria check (`:404-407`) and before the skipped acceptance record and `reviewStage` (`:416-420`). Journal line `definition-drift`, then `ReviewRequiredError`. |
+| B2 declaration recorded | **Resolved** | `review.json` now carries `tolerate` and `definitionDigest` (`worker.ts:520-526`); `report` prints `tolerate(at review)` and flags divergence (`report.ts:57,78-84`); `taskctl accept` prints the tolerated list before closing the gate (`cli.ts:454-461`). |
+| B3 prompt contradiction | **Resolved as stated**, with a new scoping defect (R1) | `new_column` hint rewritten (`task-file.ts:31-40`); rule 6 requires a criterion id; rule 8 makes the window binding (`review.ts:86-88`). |
+| M2 human gate | Resolved in the narrow sense | `cli.ts:456-461` prints the tolerated list; it still does not print criteria or defects, which is acceptable for a sign-off line. |
+| M5 digest order | **Resolved** | `tolerate: [...task.tolerate].sort()` in the digest (`runtime.ts:57-58`), with a unit test. |
+| M6 report cap | **Resolved** | `TOLERATED_SHOWN = 5` plus the `(+N more …)` line (`report.ts:86-98`). |
+
+**On B1's tests.** The two new cases assert `outcome === "blocked"`, `reviewed === 0` and the `definition-drift` journal line. `reviewed === 0` cannot hold without a throw before `reviewStage`, so they fail by construction if the call is removed; the author's "commented out → both went `done`" check is consistent with that. Both cases edit the file *after* writing `done.requested` and before the prompt resolves, so the edit is on disk when `accept()` reads it — the timing a real shell edit would have.
+
+## Answers to the three attacks
+
+**1. Is the check reachable on every path that reaches `reviewStage`?** Yes, for every in-tree path. `reviewStage` has exactly two call sites: `worker.ts:420` (review-only, immediately after the new check) and `worker.ts:459` (command path, guarded by the `definitionMatches` comparison computed inside the same `owned()` block as the acceptance write, `worker.ts:436-442`). The reviewer handover loop reuses the same evidence object, so it needs no second read — the reviewer already holds the attempt-time clone. A new attempt recomputes `r.definition` from the file at `worker.ts:110`, so an operator's edit between attempts is the new baseline rather than drift; that is the documented reading in the README. A task with no criteria never reaches `reviewStage` (it parks at `awaiting-human`).
+
+**The `status === "running"` clause.** No false negative that matters: a definition edit that leaves `status: running` is caught by the digest, which is the case the check exists for. False positives are limited to a human moving the status mid-run while leaving the definition alone; the block is still the right outcome (nothing should review a task a human just moved), but the message ("task definition changed") names the wrong cause. A status-only edit by the worker is blocked too, which is correct and untested. One nit: the read uses `store.list()` (`worker.ts:383`), which parses every task file, so a malformed edit makes `TaskFileError` leave `accept()` and become `uncertain` plus a leaked reservation instead of a clean `blocked`. `runTask:108` already does the same `list()`, so this is a pre-existing shape, not new exposure — but `store.get(id)` would be the right call for both.
+
+**Can it change after the check, before the reviewer reads `r.task`?** The reviewer is given the attempt-time clone (`worker.ts:477`), so the *content judged* is safe: an edit after the check cannot change the criteria or the tolerated kinds the reviewer works from. That closes the integrity hole and leaves an audit hole (R2): if the file changes again during the review turn, `judge()` writes `done` through `store.setStatus` (`worker.ts:578`), a read-modify-write from disk (`task-store.ts:115-123`), so the later edit survives into a `done` task the reviewer never saw. The verdict is still about the checked definition, so this is not a bad pass.
+
+**Should the check run at the top of `accept()` for both paths?** As an *additional* early guard, yes; as a replacement, no. On the command path the check currently sits after the acceptance command, so a drift discovered there has already spent up to `acceptanceTimeoutMs` (10 minutes default) running a command whose evidence is then discarded. An early check would fail fast. But the in-write check must stay: it is what records `definitionMatches: false` in `acceptance.json` for the audit (`worker.ts:438-441`). Add, do not move.
+
+**2. Can the recorded declaration disagree with what the reviewer saw?** Not within an attempt. `evidence.task` and `r.definition` are both derived from the same `current` clone at run start (`worker.ts:110`), and a reviewer handover reuses the same evidence object. A human editing `tolerate` *during* the review does not change `r.task`, so `review.json` records the declaration the reviewer actually worked under — which is the property B2 asked for, and it holds even under a concurrent edit. Across attempts `review.json` is overwritten by each verdict, so it reflects the last attempt; "changed since" then means "changed after the last verdict". That is accurate but can be read as "changed since this attempt's review" when the operator edited between attempts; printing the verdict time or the review round next to the line would remove the ambiguity. `declarationLines` returns nothing for pre-`8262a1f` records (`report.ts:79`), so old `review.json` files still print. One inconsistency worth noting: `report` caps at five entries while `taskctl accept` prints every one uncapped and untruncated (`cli.ts:458-461`). The gate should be complete and the report compact, so the asymmetry is the right way round.
+
+**3. Does rule 8 over-correct?** Yes, on one specific path — see R1. **Is "start the entry with `C1`" enough?** It is a readability convention, not a link: `parseVerdict` still accepts any non-empty string (`review.ts:130-135`), nothing checks that the named criterion is not simultaneously `pass: true`, and `externalChanges` has no `criterion` or `kind` field. It is enough for a human skimming the report and not enough for a machine check. If the intent is to make rule 6 enforceable, the shape needs `{"criterion":"C1","kind":"new_column","what":"…"}` and a parser check; today it remains prompt-level. Not blocking, because the current form improves what the report shows and does not pretend to a mechanism it lacks.
+
+## New findings
+
+### R1. Rule 8 has no time evidence on the path that motivated the feature (should fix, not blocking)
+
+Rule 8 (`review.ts:88`) says a difference the evidence cannot place after the attempt start is the task's problem, not drift. On the review-only path the acceptance record is `{command:"(none)", passed:false, skipped:true, exitCode:null, model, note, at}` (`worker.ts:416-419`) — no `startedAt`, no `finishedAt`, no artifact digests, because `artifactDigest` is only taken on the command path (`worker.ts:422,432`). `renderAcceptance` renders missing fields as `-` (`worker.ts:611-624`), so the reviewer's evidence block reads `windows: startedAt - finishedAt -`, `artifactBefore: -`, `artifactAfter: -`. The only timestamp it has is the task-level attempt window.
+
+For a local file the reviewer can stat the workspace and place a change. For the shared, cloud-hosted table in the motivating incident it cannot — taskctl has no access to that table (retro line 100 says so). Under rule 8 every attributed change in that case is unplaceable, so it becomes the task's problem, which kills rule 6 ("这类差异本身不构成 fail 的理由") on exactly the path the feature was built for. The original failure returns, in a milder form: `unclear` parks the task at `awaiting-human` instead of burning a 20-minute rework round.
+
+I do not call this blocking because the direction of error is safe — it can only stop a correct task, never pass incorrect work — and because `unclear` is a human decision rather than a wasted round. The fix is one of two: scope rule 8 ("证据里没有时间信息时，按规则 6 处理"), or give this path the write window the retro planned (a digest taken at attempt start and at handoff), which is M3's proper fix and makes rule 8 meaningful instead of decorative.
+
+### R2. The definition can still change after the check, and `done` is written under the new one (non-blocking)
+
+Covered under attack 1. The reviewer judges the checked definition, so no bad pass; the task record ends with frontmatter the reviewer never saw. Cheap fix: compare `definitionDigest(current)` against `r.definition` in `judge()` before `setStatus(id, "done")` (`worker.ts:578`), and park at `awaiting-human` on mismatch. The archived `definitionDigest` in `review.json` makes this comparison available for free; nothing reads it today.
+
+### Nits
+
+- `requireUnchangedDefinition` uses `store.list()` rather than `get(id)` (see attack 1); a malformed definition edit becomes `uncertain` + leaked reservation instead of `blocked`.
+- The block message says the definition changed even when only the status did.
+- `taskctl accept` prints `externalChanges` entries raw (no `firstLine` truncation), so a multi-line entry prints across several lines; `report` truncates, the gate does not. Confusing only in the pathological case.
+
+## M3 / M4 / M7 as declared
+
+- **M4, not blocking as declared.** A mid-attempt edit is now caught on both paths. An inter-attempt edit is the operator's re-approval, and the README names `taskctl retry` as that confirmation step. The one surviving route is a worker editing the file during a turn that then fails, followed by an operator `retry`; that is the human gate doing its job, not a hole.
+- **M7, not blocking as declared.** The vocabulary is conservative: an out-of-list change (deleted column, renamed sheet, modified file) must fail under rule 5, which costs false negatives, never false passes.
+- **M3, not blocking on its own, but now coupled to R1.** An unplaceable previous-attempt difference now defaults to the task's problem under rule 8, which is the safe direction. The problem is the converse: rule 8 assumes time evidence that the review-only path does not collect. The write-window digest is the change I would queue next; it closes M3 and R1 in one move.
+
+## Re-check verdict
+
+**Ship.** B1 and B2 are properly closed, the tests that cover them fail without the fix, and B3's contradiction is gone. One non-blocking scoping defect remains: rule 8 asks for time evidence the review-only path does not carry, so the shared-table case now parks as `unclear` instead of passing as tolerated — safe direction, wrong outcome for the feature's stated purpose. The clean fix is the write-window digest that M3 already describes.

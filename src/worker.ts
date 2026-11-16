@@ -378,14 +378,25 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
   }
 }
 
-/** Refuse to review work whose task definition moved under it. */
-async function requireUnchangedDefinition(r: Run): Promise<void> {
+/**
+ * True while the task still carries the definition this attempt started under.
+ *
+ * The status is part of the question: a human moving the task out from under a
+ * running attempt is the same kind of change as an edit to its criteria, and it
+ * must not be judged under rules the attempt never ran by.
+ */
+async function definitionIntact(r: Run, statuses: readonly Task["status"][]): Promise<boolean> {
   const current = await owned(r, async () => (await r.deps.store.list()).find((task) => task.id === r.task.id));
-  if (current && current.status === "running" && definitionDigest(current) === r.definition) return;
+  return !!current && statuses.includes(current.status) && definitionDigest(current) === r.definition;
+}
+
+/** Refuse to act on work whose task definition moved under it. */
+async function requireUnchangedDefinition(r: Run, statuses: readonly Task["status"][], detail: string): Promise<void> {
+  if (await definitionIntact(r, statuses)) return;
   await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
     stage: "review",
     event: "definition-drift",
-    detail: "the task definition changed during the attempt; refusing to review it",
+    detail,
   }));
   throw new ReviewRequiredError(
     "task definition changed during the attempt (criteria/tolerate/risk); re-approve before reviewing",
@@ -411,10 +422,15 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
     // the self-written definition. A definition is the operator's, and a change
     // to it invalidates the attempt rather than being reviewed under the new
     // rules.
-    await requireUnchangedDefinition(r);
+    await requireUnchangedDefinition(r, ["running"], "the task definition changed before the review; refusing to review it");
     emit(r, "acceptance-skipped", "no command; review-only");
     await owned(r, () => writeRuntime(r.cfg.tasksDir, r.task.id, "acceptance.json", {
       command: "(none)", passed: false, skipped: true, exitCode: null, model,
+      // The review-only path has no command window, so the attempt window is the
+      // only time evidence the reviewer will have. Without it every "was this
+      // there before the task started?" question is unanswerable, and a declared
+      // tolerance would have to be refused to stay safe.
+      startedAt: r.record.startedAt, finishedAt: new Date().toISOString(),
       note: "no acceptance command; review decides", at: new Date().toISOString(),
     }));
     return await reviewStage(r);
@@ -538,7 +554,13 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
       ? `${result.verdict} (${result.externalChanges.length} external change(s) tolerated)`
       : result.verdict);
 
-    if (result.failure !== "provider") return await judge(r, result);
+    if (result.failure !== "provider") {
+      // Checked again here: the pre-review check ran before this turn, and a task
+      // file edited while the reviewer was reading would otherwise be completed —
+      // or reopened for rework — under a definition the reviewer never saw.
+      await requireUnchangedDefinition(r, ["review"], "the task definition changed during the review; refusing to act on the verdict");
+      return await judge(r, result);
+    }
     await owned(r, () => appendJournal(r.cfg.tasksDir, id, {
       stage: "review",
       event: "provider-failed",

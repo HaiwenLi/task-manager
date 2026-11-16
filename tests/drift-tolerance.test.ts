@@ -186,6 +186,38 @@ describe("tolerated drift through the review stage", () => {
     expect(report).toContain("changed since; now new_column");
   });
 
+  it("records the attempt window on the review-only path", async () => {
+    await seedReviewOnly();
+    await runTask(config(), { store, adapter: adapter(), acceptance: pass, review: review(passedWithDrift) }, await store.get("a"), "w1");
+
+    // No command means no command window; without the attempt window the
+    // reviewer has no time evidence at all and every declared tolerance would
+    // have to be refused to stay safe.
+    const record = await readRuntime<{ startedAt?: string; finishedAt?: string; skipped?: boolean }>(tasks, "a", "acceptance.json");
+    expect(record?.skipped).toBe(true);
+    expect(record?.startedAt).toBeTruthy();
+    expect(record?.finishedAt).toBeTruthy();
+    expect((record?.startedAt ?? "") <= (record?.finishedAt ?? "")).toBe(true);
+  });
+
+  it("refuses a verdict reached while the definition was being rewritten", async () => {
+    await seed(["tolerate:", "  - new_column"]);
+    const drifting = async (): Promise<ReviewResult> => {
+      const current = await readFile(join(tasks, "a.md"), "utf8");
+      await writeFile(join(tasks, "a.md"), current.replace("  - new_column", "  - deleted_row"), "utf8");
+      return passedWithDrift;
+    };
+
+    const outcome = await runTask(config(), { store, adapter: adapter(), acceptance: pass, review: drifting }, await store.get("a"), "w1");
+
+    // The reviewer said pass, but the task file it was reading no longer exists
+    // in that shape: completing it would hand a human a `done` task judged
+    // against a definition nobody approved.
+    expect(outcome).toBe("blocked");
+    expect((await store.get("a")).status).toBe("blocked");
+    expect((await journalTail(tasks, "a", 20)).join("\n")).toContain("definition-drift");
+  });
+
   it("does not turn a failing verdict into a pass", async () => {
     await seed(["tolerate:", "  - new_column"]);
     const failed: ReviewResult = {
