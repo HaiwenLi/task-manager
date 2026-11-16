@@ -8,7 +8,14 @@ type PromptArgs = Parameters<AgentAdapter["prompt"]>[0];
 type PromptResult = Awaited<ReturnType<AgentAdapter["prompt"]>>;
 
 /** A parsed NDJSON event line from `opencode run --format json`. */
-type RunEvent = { sessionID?: unknown; type?: unknown; text?: unknown; part?: unknown };
+type RunEvent = { sessionID?: unknown; type?: unknown; text?: unknown; part?: unknown; error?: unknown };
+
+/**
+ * Backend rejections that mean "this turn never got to do work": quotas, rate
+ * limits, auth and 5xx. They are retryable external failures, not evidence that
+ * a session is still running.
+ */
+const PROVIDER_REJECTION = /rate.?limit|quota|usage limit|用量上限|insufficient|unauthorized|\b401\b|\b429\b|\b5\d\d\b/i;
 
 /** A parsed `{"location":…,"data":…}` envelope from `opencode api`. */
 type ApiEnvelope = { data?: unknown };
@@ -79,6 +86,7 @@ export class OpenCodeAdapter implements AgentAdapter {
       let text = "";
       const decoder = new StringDecoder("utf8");
       let buffered = "";
+      let providerFailure = false;
 
       // stderr MUST be drained: a verbose child (auth warnings, LSP logs)
       // fills the pipe buffer and blocks forever otherwise. Captured so a
@@ -100,6 +108,13 @@ export class OpenCodeAdapter implements AgentAdapter {
           // 首个含 sessionID 的行记录 id；流里的 id 优先于传入的续接 id
           sessionId = event.sessionID;
           sawSessionId = true;
+        }
+        if (event.type === "error") {
+          // opencode reports a rejected turn as an error event (provider quota,
+          // auth, 5xx). Remember it so the caller can retry instead of treating
+          // the turn as an unverifiable interruption.
+          if (PROVIDER_REJECTION.test(JSON.stringify(event))) providerFailure = true;
+          return;
         }
         if (event.type === "text") {
           // opencode >= 2.2 nests the payload under `part`; older builds put
@@ -128,7 +143,13 @@ export class OpenCodeAdapter implements AgentAdapter {
           consume(buffered);
         }
         const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
-        resolve({ sessionId, exitCode: code ?? -1, text: code === 0 ? text : withStderr(text, stderr) });
+        const rejected = code !== 0 && (providerFailure || PROVIDER_REJECTION.test(stderr));
+        resolve({
+          sessionId,
+          exitCode: code ?? -1,
+          text: code === 0 ? text : withStderr(text, stderr),
+          ...(rejected ? { failure: "provider" as const } : {}),
+        });
       });
     });
     const execution = processExecution(child, result, true);

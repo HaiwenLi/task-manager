@@ -1,4 +1,4 @@
-import type { AgentAdapter } from "./adapters/types.js";
+import type { AgentAdapter, PromptResult } from "./adapters/types.js";
 import type { Execution } from "./execution.js";
 import type { Task } from "./task-file.js";
 
@@ -12,7 +12,15 @@ export type CriterionResult = { id: string; pass: boolean; evidence: string };
  * for a human instead of spending a retry on a guess. `raw` keeps the model's
  * actual words so a parse failure can be diagnosed instead of guessed at.
  */
-export type ReviewResult = { verdict: Verdict; criteria: CriterionResult[]; defects: string[]; summary: string; raw?: string };
+export type ReviewResult = {
+  verdict: Verdict;
+  criteria: CriterionResult[];
+  defects: string[];
+  summary: string;
+  raw?: string;
+  /** The backend rejected the review turn itself (quota/auth/5xx); no judging happened. */
+  failure?: "provider";
+};
 
 export type ReviewEvidence = {
   task: Task;
@@ -135,13 +143,16 @@ export function startReview(deps: ReviewDeps, evidence: ReviewEvidence): Executi
     effort: deps.effort,
     title: `review: ${deps.title ?? evidence.task.title}`,
   };
-  const finish = (result: { exitCode: number; text: string }): ReviewResult =>
-    result.exitCode !== 0
-      ? degraded(
-          evidence.task.criteria.map((criterion) => criterion.split(/\s+/)[0]!),
-          `review turn failed with exit ${result.exitCode}`,
-        )
-      : parseVerdict(result.text, evidence.task.criteria);
+  const finish = (result: PromptResult): ReviewResult => {
+    if (result.exitCode === 0) return parseVerdict(result.text, evidence.task.criteria);
+    const degradedResult = degraded(
+      evidence.task.criteria.map((criterion) => criterion.split(/\s+/)[0]!),
+      `review turn failed with exit ${result.exitCode}`,
+    );
+    // A backend rejection is not a verdict: the worker must retry, not ask a
+    // human to judge work the reviewer never looked at.
+    return result.failure === "provider" ? { ...degradedResult, failure: "provider" } : degradedResult;
+  };
 
   if (deps.adapter.start) {
     const inner = deps.adapter.start(args);

@@ -174,7 +174,18 @@ function legacyExecution<T>(fn: () => Promise<T>): Execution<T> {
   return { result, inspect: () => ({ state }), cancel: async () => false };
 }
 
-async function controlled<T>(r: Run, label: string, ms: number, start: () => Execution<T>): Promise<T> {
+/**
+ * Run one controlled turn. `acceptSettled` marks results that are themselves a
+ * complete, retryable outcome (a provider rejection): those need no
+ * cancellation proof, because the backend refused the turn before doing work.
+ */
+async function controlled<T>(
+  r: Run,
+  label: string,
+  ms: number,
+  start: () => Execution<T>,
+  acceptSettled?: (value: T) => boolean,
+): Promise<T> {
   if (!await heartbeat(r.cfg.tasksDir, r.task.id, r.owner)) throw new OwnershipLostError();
   await checkpoint(r, "active", label);
   let execution: Execution<T> | undefined;
@@ -193,7 +204,13 @@ async function controlled<T>(r: Run, label: string, ms: number, start: () => Exe
       timer = setTimeout(() => reject(new WorkerTimeoutError(`${label} timed out after ${ms}ms`)), ms);
     });
     const lost = r.loss.then(() => { throw new OwnershipLostError(); });
-    const value = await Promise.race([execution!.result, timeout, lost]);
+    let settled = false;
+    const tracked = execution!.result.then(
+      (value) => { settled = true; return value; },
+      (error) => { throw error; },
+    );
+    const value = await Promise.race([tracked, timeout, lost]);
+    if (settled && acceptSettled?.(value) === true) return value;
     if (execution!.inspect().state !== "exited") throw new UncertainExecutionError(`${label}: execution termination is uncertain`);
     return value;
   } catch (err) {
@@ -218,7 +235,8 @@ async function turn(r: Run, text: string, sessionId?: string) {
   const args = { sessionId, text, model: r.task.model ?? r.cfg.model, effort: r.task.effort ?? r.cfg.effort, title: r.task.title, cwd: r.cfg.workdir };
   try {
     return { ...await controlled(r, "agent turn", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT,
-      () => r.deps.adapter.start ? r.deps.adapter.start(args) : legacyExecution(() => r.deps.adapter.prompt(args))), timedOut: false };
+      () => r.deps.adapter.start ? r.deps.adapter.start(args) : legacyExecution(() => r.deps.adapter.prompt(args)),
+      (result) => result.failure === "provider"), timedOut: false };
   } catch (err) {
     if (!(err instanceof WorkerTimeoutError)) throw err;
     // Only reached if cancellation was positively confirmed.
@@ -366,12 +384,27 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
           effort: r.cfg.reviewerEffort,
           title: r.task.title,
         }, evidence),
+    (review) => review.failure === "provider",
   );
   await owned(r, async () => {
     await writeRuntime(r.cfg.tasksDir, id, "review.json", { ...result, at: new Date().toISOString() });
     await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "verdict", detail: result.verdict });
   });
   emit(r, "reviewed", result.verdict);
+
+  // A provider rejection is not a verdict: the reviewer never got to judge.
+  // Spend an attempt (not a review round) and reopen for a rerun.
+  if (result.failure === "provider") {
+    await owned(r, () => appendJournal(r.cfg.tasksDir, id, {
+      stage: "review",
+      event: "provider-failed",
+      detail: result.summary,
+    }));
+    if (await fail(r)) return "blocked";
+    await owned(r, () => r.deps.store.setStatus(id, "open"));
+    emit(r, "rework", "reviewer provider failure; retrying");
+    return "open";
+  }
 
   if (result.verdict === "unclear") {
     await owned(r, () => r.deps.store.setStatus(id, "awaiting-human"));

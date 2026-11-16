@@ -51,12 +51,16 @@ Scope: 两个真实任务（`docs-table`、`trim-prefix`）的完整运行记录
 
 同时把 provider 的 `429/5xx/rate_limit` 识别为 `external-transient`：不消耗 `retryLimit`、不退化成 `uncertain`，走带退避的重试并允许切换模型。
 
-**实现进度：本轮未改。** 试过两种做法都被否掉：
+**实现进度：已修（第二轮）**。做法不是放宽 `cancel()`，而是把"后端拒绝了这一回合"从"进程死了"里分出来：
 
-1. 让 `cancel()` 对"已退出"的进程直接返回 `true` —— 仓库里既有测试立刻失败，它守的是真实安全性质：父进程在请求取消前就消失时，Windows 无法再定位其子进程树，此时声称"已确认停止"可能把仍在跑的后端会话当已停。
-2. 在 `controlled()` 里加 `settledByResult`（结果已结算就跳过取消判定）—— 评审指出它是**惰性的**：失败回合的 `inspect().state` 本来就是 `uncertain`，第一个不确定检查在标志被读取前就抛出了；它唯一改变的分支是"result 被 reject 而进程还在"，那里反而跳过了 `cancel()` 与 `state === "exited"` 校验。已在评审后撤回。
+1. adapter 契约新增 `PromptResult.failure?: "provider"`；OpenCode adapter 从 NDJSON 的 error 事件与 stderr 识别 429/配额/鉴权/5xx
+2. `controlled()` 新增 `acceptSettled` 判定：结果已结算且被判定为 provider 拒绝时，直接返回该结果，**不进入**"状态是否 exited → 取消 → 确认停止"那条链
+3. worker 回合：与普通失败一样计 `retryLimit`，不再落成 uncertain
+4. 复核阶段：`ReviewResult.failure` 透传，复核被拒时计一次重试并回到 `open`，而不是转 `awaiting-human`
 
-**正确做法**：让 adapter 明确报告"这次是 provider 侧失败"（例如 `PromptResult` 带 `failure: "provider"`），`controlled()` 据此计一次可重试失败而不进入取消判定；provider 429/5xx 归为 `external-transient`，不消耗 `retryLimit`、优先切换模型。这要改 adapter 契约，需单独评审。
+测试 `tests/provider-failure.test.ts` 用同一个 fake adapter 跑了对照组：带 `failure: "provider"` 时 blocked 原因是 `retry limit`、`cancel` 零调用；不带时仍是 `shutdown unconfirmed` 且 `cancel` 被调用——两条路径不会互相污染。
+
+**未做**：provider 失败后的模型降级链（`reviewerModels` 轮转）与退避。现在是"重试同一个模型"，配额耗尽时会连续失败到 `retryLimit`。
 
 ### N3 `blocked` 是死胡同
 
