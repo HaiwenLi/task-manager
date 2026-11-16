@@ -149,6 +149,20 @@ describe("retry", () => {
     expect(rendered).toContain("review_rounds: 0");
   });
 
+  it("reopens a blocked task that has no evidence directory yet", async () => {
+    await writeTask("blocked");
+    expect(await readdir(tasksDir)).toEqual(["t1.md"]);
+    const outcome = await retryTask(tasksDir, "t1", { registryDir, baseWorkdir: root });
+    expect(outcome.ok).toBe(true);
+  });
+
+  it("resolves the owned path from the task's own workdir", async () => {
+    await writeTask("blocked", { workdir: "sub" });
+    await writeAttempt("settled", undefined, null);
+    const findings = await reconcileTask(tasksDir, "t1", { registryDir, baseWorkdir: root });
+    expect(findings.workspace).toBe(join(root, "sub"));
+  });
+
   it("refuses tasks that are not blocked", async () => {
     await writeTask("done");
     const outcome = await retryTask(tasksDir, "t1", { registryDir });

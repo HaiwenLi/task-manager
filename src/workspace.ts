@@ -48,7 +48,10 @@ async function withRegistryMutex<T>(registryDir: string, action: () => Promise<T
       await mkdir(mutex);
       break;
     } catch (error) {
-      if (code(error) !== "EEXIST") throw error;
+      // Concurrent creation of the same name reports EEXIST on POSIX but can
+      // surface as EPERM/EBUSY on Windows. All three mean "someone else may
+      // hold it": retry within the deadline instead of failing the caller.
+      if (!["EEXIST", "EPERM", "EBUSY"].includes(code(error) ?? "")) throw error;
       if (Date.now() >= deadline) throw new Error("Workspace registry mutex is busy; no automatic stale-lock takeover");
       await delay(10);
     }
@@ -163,8 +166,8 @@ export async function reserveWorkspace(
     const lock = join(canonical, LOCK_NAME);
     const marker = join(lock, `${record.token}.json`);
     const owner = JSON.stringify({ ...record, attemptId });
-    let identity!: Awaited<ReturnType<typeof lstat>>;
-    let markerIdentity!: Awaited<ReturnType<typeof lstat>>;
+    let identity: Awaited<ReturnType<typeof lstat>> | null = null;
+    let markerIdentity: Awaited<ReturnType<typeof lstat>> | null = null;
     let created = false;
     try {
       await mkdir(lock);
@@ -179,9 +182,12 @@ export async function reserveWorkspace(
       // attempt for this path range is refused (observed live: three leaked
       // records and a stale lock dir permanently wedged a workspace).
       if (created) {
-        const current = await lstat(lock).catch(() => null);
-        const ours = current !== null && current.isDirectory() &&
-          current.dev === identity.dev && current.ino === identity.ino;
+        // The registry mutex is held, so a directory we created here cannot be
+        // a foreign one. Only compare identities when we actually read them:
+        // lstat itself may have been what failed.
+        const current = identity === null ? null : await lstat(lock).catch(() => null);
+        const ours = identity === null || (current !== null && current.isDirectory() &&
+          current.dev === identity.dev && current.ino === identity.ino);
         if (ours) {
           await unlink(marker).catch(() => {});
           await rmdir(lock).catch(() => {});
@@ -191,6 +197,11 @@ export async function reserveWorkspace(
       if (code(error) === "EEXIST") return null;
       throw error;
     }
+    if (identity === null || markerIdentity === null) {
+      throw new Error("workspace reservation lost its local identity during acquisition");
+    }
+    const dirIdentity = identity;
+    const markerId = markerIdentity;
     let released = false;
     return {
       cwd: canonical,
@@ -203,8 +214,8 @@ export async function reserveWorkspace(
           try {
             const current = await lstat(lock);
             const currentMarker = await lstat(marker);
-            if (!current.isDirectory() || current.dev !== identity.dev || current.ino !== identity.ino ||
-                !currentMarker.isFile() || currentMarker.dev !== markerIdentity.dev || currentMarker.ino !== markerIdentity.ino ||
+            if (!current.isDirectory() || current.dev !== dirIdentity.dev || current.ino !== dirIdentity.ino ||
+                !currentMarker.isFile() || currentMarker.dev !== markerId.dev || currentMarker.ino !== markerId.ino ||
                 await readFile(marker, "utf8") !== owner) return;
             await unlink(marker);
             await rmdir(lock);

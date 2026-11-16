@@ -137,6 +137,9 @@ export async function retryTask(
   const refusal = await retryRefusal(tasksDir, id, options, ttlMs);
   if (refusal !== null) return { ok: false, reason: refusal };
 
+  // A blocked task may have no evidence directory at all (hand-set status,
+  // archived by hand, copied in). withMutex creates the mutex dir non-recursively.
+  await mkdir(join(tasksDir, id), { recursive: true });
   return withMutex(join(tasksDir, id, ".mutation.lock"), async (): Promise<RetryOutcome> => {
     // Re-read inside the mutex: the guards above ran against an earlier snapshot.
     const again = await retryRefusal(tasksDir, id, options, ttlMs);

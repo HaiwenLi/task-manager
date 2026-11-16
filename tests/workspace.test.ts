@@ -58,6 +58,14 @@ describe("reserveWorkspace", () => {
     expect(await reserveWorkspace(cwd, "new")).toBeNull();
   });
 
+  it("leaves a foreign lock directory untouched when acquisition is refused", async () => {
+    const lock = join(cwd, ".taskctl-workspace.lock");
+    await mkdir(lock);
+    await writeFile(join(lock, "foreign.json"), "{}");
+    expect(await reserveWorkspace(cwd, "new")).toBeNull();
+    expect(await readdir(lock)).toEqual(["foreign.json"]);
+  });
+
   it("rolls back its registry record when the local marker cannot be created", async () => {
     // A stale lock directory makes acquisition fail after the registry record is
     // published. The record must not survive: nobody owns it, so no release can
