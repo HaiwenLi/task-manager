@@ -81,9 +81,8 @@ id         status          retries  sessions  note
 
 ## 4. 真实 opencode 会话（已跑通一次）
 
-本机 opencode 2.3.0，真实二进制
-`%APPDATA%\npm\node_modules\@opencode\cli\bin\opencode.exe`，任务目录在临时项目里，
-`taskctl` 通过一个 shim 暴露给 agent。
+本机 opencode 2.3.0，npm 全局安装的真实 `opencode.exe`（`.cmd` shim 不能被 `shell:false` 启动），
+任务目录在临时项目里，`taskctl` 通过一个 shim 暴露给 agent。
 
 第一次跑：agent 写出了 `hello.txt`，验收命令通过，但复核判 `unclear`，任务停在
 `awaiting-human`。查 `review.json` 的 `raw` 是空字符串——真实 opencode 的 NDJSON 里文本在
