@@ -58,6 +58,21 @@ describe("reserveWorkspace", () => {
     expect(await reserveWorkspace(cwd, "new")).toBeNull();
   });
 
+  it("rolls back its registry record when the local marker cannot be created", async () => {
+    // A stale lock directory makes acquisition fail after the registry record is
+    // published. The record must not survive: nobody owns it, so no release can
+    // ever clear it, and every later attempt would be refused forever.
+    const lock = join(cwd, ".taskctl-workspace.lock");
+    await mkdir(lock);
+    expect(await reserveWorkspace(cwd, "stale")).toBeNull();
+    expect(JSON.parse(await readFile(join(registryDir, "reservations.json"), "utf8"))).toEqual([]);
+    await rm(lock, { recursive: true, force: true });
+    const owner = await reserveWorkspace(cwd, "after-cleanup");
+    expect(owner).not.toBeNull();
+    await owner!.release();
+    expect(JSON.parse(await readFile(join(registryDir, "reservations.json"), "utf8"))).toEqual([]);
+  });
+
   it("coordinates separate processes and retains a crashed holder's reservation", async () => {
     const fixture = fileURLToPath(new URL("./workspace/reserve-child.ts", import.meta.url));
     const results = await Promise.all(Array.from({ length: 4 }, (_, i) =>

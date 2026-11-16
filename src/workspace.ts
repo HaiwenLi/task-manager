@@ -161,17 +161,30 @@ export async function reserveWorkspace(
     })) return null;
     await writeRegistry(registryDir, [...records, record]);
     const lock = join(canonical, LOCK_NAME);
+    const marker = join(lock, `${record.token}.json`);
+    const owner = JSON.stringify({ ...record, attemptId });
+    let identity!: Awaited<ReturnType<typeof lstat>>;
+    let markerIdentity!: Awaited<ReturnType<typeof lstat>>;
+    let created = false;
     try {
       await mkdir(lock);
+      created = true;
+      identity = await lstat(lock);
+      await writeFile(marker, owner, { flag: "wx" });
+      markerIdentity = await lstat(marker);
     } catch (error) {
+      // Acquisition failed after the record was published. Roll it back: an
+      // orphaned record has no owner, so nothing can ever release it, and it
+      // blocks every later attempt for this path range (observed live: three
+      // leaked records and a stale lock dir permanently wedged a workspace).
+      await writeRegistry(registryDir, records);
+      if (created) {
+        await unlink(marker).catch(() => {});
+        await rmdir(lock).catch(() => {});
+      }
       if (code(error) === "EEXIST") return null;
       throw error;
     }
-    const identity = await lstat(lock);
-    const marker = join(lock, `${record.token}.json`);
-    const owner = JSON.stringify({ ...record, attemptId });
-    await writeFile(marker, owner, { flag: "wx" });
-    const markerIdentity = await lstat(marker);
     let released = false;
     return {
       cwd: canonical,
