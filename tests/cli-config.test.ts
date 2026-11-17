@@ -27,6 +27,17 @@ describe("resolveConfig", () => {
     expect(cfg.reviewerModelFallbacks).toEqual(["r/two"]);
   });
 
+  it("accepts an artifactIgnore pattern list and leaves it undefined when absent", () => {
+    const cfg = resolveConfig({ artifactIgnore: ["reports/*.json", "timing/**"] }, "taskctl.json");
+    expect(cfg.artifactIgnore).toEqual(["reports/*.json", "timing/**"]);
+    expect(resolveConfig({}, "taskctl.json").artifactIgnore).toBeUndefined();
+  });
+
+  it("rejects artifactIgnore entries that are not non-empty strings", () => {
+    expect(() => resolveConfig({ artifactIgnore: "reports" }, "taskctl.json")).toThrow(/array of non-empty strings/);
+    expect(() => resolveConfig({ artifactIgnore: [""] }, "taskctl.json")).toThrow(/array of non-empty strings/);
+  });
+
   it("rejects fallback lists that are not non-empty strings", () => {
     expect(() => resolveConfig({ modelFallbacks: "b/two" }, "taskctl.json")).toThrow(/array of non-empty strings/);
     expect(() => resolveConfig({ modelFallbacks: [""] }, "taskctl.json")).toThrow(/array of non-empty strings/);
