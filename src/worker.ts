@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import { claim, heartbeat, lockLive, release, withOwnership, OwnershipLostError } from "./claim.js";
 import { latestNote, writeNote, type HandoffNote } from "./handoff.js";
 import { startAcceptance, type AcceptanceResult } from "./acceptance.js";
@@ -13,6 +15,7 @@ import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
 import { chainPosition, modelAt, modelChain, readModelRotation, rotateModel, type Handover, type ModelRole } from "./models.js";
 import { startReview, type ReviewEvidence, type ReviewResult } from "./review.js";
+import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck } from "./render.js";
 
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
 export const ACCEPTANCE_TIMEOUT_MS_DEFAULT = 10 * 60_000;
@@ -20,6 +23,12 @@ export const MAX_SESSIONS_PER_TASK_DEFAULT = 20;
 export const MAX_TURNS_PER_SESSION_DEFAULT = 40;
 export const MAX_REVIEW_ROUNDS_DEFAULT = 2;
 export const WRAP_UP_INSTRUCTION = "上下文预算告急。请立即运行一次 taskctl note（详尽记录进展），然后只回复 HANDOFF_READY";
+
+/**
+ * A worker may append `ESCALATE: <reason>` to a turn to say the work is bigger
+ * than the task it was given. See {@link escalate}: it can only raise the bar.
+ */
+const ESCALATE_MARKER = /(?:^|\n)\s*ESCALATE:\s*(.+)/;
 
 export type WorkerConfig = {
   tasksDir: string; workdir: string; agent: string; model?: string; effort?: string;
@@ -36,6 +45,10 @@ export type WorkerConfig = {
   reviewerModelFallbacks?: string[];
   /** How many tasks the scheduler may run at once (default 2). */
   parallel?: number;
+  /** Viewports a `verify: render` task must pass (default 1440x900 and 390x844). */
+  renderViewports?: string[];
+  /** Browser binary for render checks; auto-detected when absent. */
+  chromeBin?: string;
 };
 export type WorkerStore = Pick<TaskStore, "list" | "setStatus" | "appendSession" | "incRetries" | "readDoneMarker" | "clearDoneMarker" | "incReviewRounds">;
 export type WorkerDeps = {
@@ -45,7 +58,7 @@ export type WorkerDeps = {
   review?: (evidence: ReviewEvidence) => Promise<ReviewResult>;
   onEvent?: (evt: WorkerEvent) => void;
 };
-export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost";
+export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
 export type TaskOutcome = "done" | "blocked" | "skipped" | "open" | "awaiting-human";
 export class WorkerTimeoutError extends Error {}
@@ -56,6 +69,11 @@ type Run = {
   cfg: WorkerConfig; deps: WorkerDeps; task: Task; owner: string; definition: string;
   record: AttemptRecord; lost: boolean; notifyLost: () => void; loss: Promise<void>;
   execution?: Execution<unknown>;
+  /**
+   * Set once the work outgrows the lane it was captured in. It never turns back
+   * off for this attempt: an escalated run may not finish on its own evidence.
+   */
+  escalated: boolean;
 };
 const emit = (r: Run, type: WorkerEventType, detail?: string) => r.deps.onEvent?.({ type, taskId: r.task.id, detail });
 const owned = <T>(r: Run, fn: () => Promise<T>) => withOwnership(r.cfg.tasksDir, r.task.id, r.owner, fn);
@@ -79,7 +97,7 @@ export async function runTask(cfg: WorkerConfig, deps: WorkerDeps, task: Task, w
   let notifyLost!: () => void;
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
   const now = new Date().toISOString();
-  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss,
+  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false,
     record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing" } };
   let reservation: WorkspaceReservation | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -170,6 +188,22 @@ async function fail(r: Run): Promise<boolean> {
     await r.deps.store.setStatus(r.task.id, "blocked");
     emit(r, "blocked", "retry limit reached"); return true;
   });
+}
+
+/**
+ * Record that the work outgrew the lane it was captured in.
+ *
+ * Nothing in the task file changes: `verify` is still what the operator chose and
+ * the definition digest is untouched. What changes is the bar for finishing this
+ * attempt — from here it has to survive the reviewer, whatever evidence the task
+ * normally accepts. Escalation only ever moves up, and only once per attempt, so
+ * a worker cannot use it as a lever to shorten its own run.
+ */
+async function escalate(r: Run, reason: string): Promise<void> {
+  if (r.escalated) return;
+  r.escalated = true;
+  await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, { stage: "worker", event: "escalated", detail: reason }));
+  emit(r, "escalated", reason);
 }
 
 /** A cooperative legacy adapter can complete normally, but cannot prove cancellation. */
@@ -334,6 +368,11 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       }
     });
     turns++;
+    // The worker is allowed to report that the work is bigger than the task it
+    // was given. That claim is not taken on trust for anything except the bar it
+    // raises: it can only add a review, never remove one.
+    const marker = ESCALATE_MARKER.exec(result.text ?? "");
+    if (marker) await escalate(r, marker[1]!.trim());
     let fresh = false;
     // A failed/aborted turn cannot submit successful completion even if it wrote a marker.
     if (result.exitCode !== 0) {
@@ -351,9 +390,13 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       if (verdict !== "retry") return verdict;
       fresh = true;
     } else if (turns >= (r.cfg.maxTurnsPerSession ?? MAX_TURNS_PER_SESSION_DEFAULT)) {
+      // Running out of turns is evidence about the task, not just about the
+      // session: whatever this was, it did not fit in one go.
+      await escalate(r, "session turn budget exhausted");
       if (await fail(r)) return "blocked";
       fresh = true;
     } else if (await overBudget(r, sessionId, model)) {
+      await escalate(r, "context budget exhausted; a session handoff was needed");
       const wrap = await turn(r, WRAP_UP_INSTRUCTION, model, sessionId);
       const after = await latestNote(r.cfg.tasksDir, r.task.id);
       if (!after || after.seq <= (note?.seq ?? 0)) {
@@ -404,15 +447,24 @@ async function requireUnchangedDefinition(r: Run, statuses: readonly Task["statu
 }
 
 async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "awaiting-human"> {
-  const command = r.task.acceptance?.trim();
   // Which model produced the work is part of the evidence: after a handover it
   // is no longer the model the operator configured.
   const model = await modelFor(r, "worker");
+  if (r.task.verify === "render") return await acceptRender(r, model);
+  const command = r.task.acceptance?.trim();
   if (!command) {
     // No command and no criteria: nothing can judge this task, so it waits for
     // a human. With criteria, the reviewer is the gate — office, design and
     // research tasks rarely have a shell command that means "done".
     if (r.task.criteria.length === 0) {
+      // A quick task never wrote criteria down in the first place, so there is
+      // nothing for a reviewer to judge it against. Waiting for a human is its
+      // terminus, not a failure of the run.
+      if (r.task.quick) {
+        await owned(r, () => r.deps.store.setStatus(r.task.id, "awaiting-human"));
+        emit(r, "awaiting-human", "quick task has no criteria; a human decides");
+        return "awaiting-human";
+      }
       emit(r, "acceptance-skipped", "missing acceptance requires review");
       throw new ReviewRequiredError("missing acceptance criteria; review required");
     }
@@ -449,7 +501,7 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
   // All controller writers use the same mutex as takeover for final validation/write.
   // The review runs outside this guard: it takes the same mutex for its own
   // writes, and nesting would deadlock the task against itself.
-  const outcome = await owned(r, async (): Promise<"review" | "blocked" | "retry"> => {
+  const outcome = await owned(r, async (): Promise<"review" | "blocked" | "retry" | "done" | "awaiting-human"> => {
     const current = (await r.deps.store.list()).find(t => t.id === r.task.id);
     const definitionMatches = !!current && current.status === "running" && definitionDigest(current) === r.definition;
     const evidence = { attemptId: r.owner, definitionDigest: r.definition, artifactBefore, artifactAfter, command,
@@ -463,6 +515,12 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
       detail: `${result.passed ? "passed" : "failed"} exit=${result.exitCode ?? "null"}`,
     });
     if (result.passed) {
+      // The operator asked for the exit code to be the verdict, and it is: there is
+      // nothing left for a reviewer to add. An escalated run loses this shortcut,
+      // because escalation means the evidence stopped describing the work.
+      if (r.task.verify === "mechanical" && !r.escalated) {
+        return await finishVerified(r, "acceptance passed; verify=mechanical");
+      }
       return "review";
     }
     const retries = await r.deps.store.incRetries(r.task.id);
@@ -475,6 +533,88 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
     return await reviewStage(r);
   }
   return outcome;
+}
+
+/**
+ * Finish a task whose own evidence passed.
+ *
+ * The human gates are not relaxed by choosing a machine verdict: `risk: high` and
+ * `human_check` mean a person looks at it, and an exit code is a weaker claim than
+ * a reviewer's, not a stronger one.
+ */
+async function finishVerified(r: Run, detail: string): Promise<"done" | "awaiting-human"> {
+  if (r.task.risk === "high" || r.task.humanCheck) {
+    await r.deps.store.setStatus(r.task.id, "awaiting-human");
+    emit(r, "awaiting-human", `${detail}; human sign-off required`);
+    return "awaiting-human";
+  }
+  await r.deps.store.setStatus(r.task.id, "done");
+  await appendJournal(r.cfg.tasksDir, r.task.id, { stage: "worker", event: "done", detail });
+  emit(r, "done", detail);
+  return "done";
+}
+
+/**
+ * The render gate: open every declared target in a headless browser at every
+ * viewport and require that it draws, has something to read, and fits.
+ *
+ * It exists because a reviewer sees text. On the task that motivated this, the
+ * first build was blank (a script threw before first paint) and the second stuck
+ * 40px out of a phone viewport; both read as clean code and both were only ever
+ * caught by looking at the render.
+ */
+async function acceptRender(
+  r: Run,
+  model: string | undefined,
+): Promise<"done" | "blocked" | "retry" | "open" | "awaiting-human"> {
+  const id = r.task.id;
+  await requireUnchangedDefinition(r, ["running"], "the task definition changed before the render check; refusing to check it");
+  const evidenceDir = join(r.cfg.tasksDir, id, "evidence");
+  await mkdir(evidenceDir, { recursive: true });
+  let check: RenderCheck;
+  try {
+    check = await checkRender({
+      targets: r.task.renderTargets.map((target) => join(r.cfg.workdir, target)),
+      ...(r.cfg.renderViewports === undefined ? {} : { viewports: r.cfg.renderViewports }),
+      evidenceDir,
+      ...(r.cfg.chromeBin === undefined ? {} : { chromeBin: r.cfg.chromeBin }),
+    });
+  } catch (err) {
+    if (err instanceof RenderUnavailableError) {
+      await owned(r, () => appendJournal(r.cfg.tasksDir, id, {
+        stage: "worker",
+        event: "render-unavailable",
+        detail: err.message,
+      }));
+      // A check that could not run is not a pass, and the reviewer cannot see the
+      // page either. Park it for an operator instead of letting it through.
+      throw new ReviewRequiredError(`render check could not run: ${err.message}`);
+    }
+    throw err;
+  }
+  await owned(r, () => writeRuntime(r.cfg.tasksDir, id, "render.json", {
+    ...check, model, definitionDigest: r.definition, escalated: r.escalated,
+  }));
+  if (check.ok) {
+    emit(r, "acceptance", `render ok (${check.views.length} view(s))`);
+    await owned(r, () => appendJournal(r.cfg.tasksDir, id, {
+      stage: "worker",
+      event: "acceptance",
+      detail: `render ok views=${check.views.length}`,
+    }));
+    if (r.escalated) return "review";
+    const finished = await owned(r, () => finishVerified(r, "render check passed"));
+    return finished;
+  }
+  const failures = describeFailures(check);
+  emit(r, "acceptance", `render failed: ${failures[0] ?? "unknown"}`);
+  await owned(r, () => appendJournal(r.cfg.tasksDir, id, {
+    stage: "worker",
+    event: "acceptance",
+    detail: `render failed: ${failures.join(" | ")}`,
+  }));
+  if (await fail(r)) return "blocked";
+  return "retry";
 }
 
 /**

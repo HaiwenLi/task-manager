@@ -16,6 +16,18 @@ export type TaskComplexity = "simple" | "complex";
 export type TaskRisk = "normal" | "high";
 
 /**
+ * What has to agree that the work is finished.
+ *
+ * `human` is the reviewer's verdict and stays the default. `mechanical` and
+ * `render` replace that verdict with evidence the orchestrator produces itself:
+ * a command that exits zero, or a headless render of the page that shows up and
+ * fits. They exist because a reviewer reads code and diffs and never pixels — a
+ * blank HTML page passes a code review, which is exactly what happened on the
+ * task this was written for.
+ */
+export type TaskVerify = "human" | "mechanical" | "render";
+
+/**
  * A kind of change a task declares it will not be blamed for.
  *
  * Work often runs against an artifact other people edit at the same time — a
@@ -73,6 +85,17 @@ export type Task = {
   humanCheck: boolean;
   /** External changes this task agrees to tolerate; see {@link DriftKind}. */
   tolerate: DriftKind[];
+  /**
+   * Captured without a clarify session and without a spec: the intent itself is
+   * the definition. Cheap to start, and the cost is that nothing was written down
+   * to check the work against — which is why a quick task is never left to finish
+   * on its own say-so.
+   */
+  quick: boolean;
+  /** What stands in for the reviewer's verdict; see {@link TaskVerify}. */
+  verify: TaskVerify;
+  /** Files a `render` check opens, relative to the workdir; empty otherwise. */
+  renderTargets: string[];
   /** How many review rounds have failed so far. */
   reviewRounds: number;
   /** Session ids that have worked on this task, oldest first. */
@@ -92,6 +115,7 @@ export class TaskFileError extends Error {
 const STATUSES: readonly TaskStatus[] = ["draft", "open", "running", "review", "awaiting-human", "done", "blocked"];
 const COMPLEXITIES: readonly TaskComplexity[] = ["simple", "complex"];
 const RISKS: readonly TaskRisk[] = ["normal", "high"];
+const VERIFIES: readonly TaskVerify[] = ["human", "mechanical", "render"];
 
 /**
  * Parse the contents of `tasks/<id>.md`. `id` comes from the filename, not the
@@ -116,6 +140,13 @@ export function parseTaskFile(raw: string, id: string): Task {
   }
 
   const data = parsed.data ?? {};
+  // A render check with no target would report success having opened nothing, so
+  // the pairing is validated here rather than at the point of use.
+  const verify = parseEnum(data, "verify", VERIFIES, "human", id);
+  const renderTargets = parseStringList(data, "render_targets", id);
+  if (verify === "render" && renderTargets.length === 0) {
+    throw new TaskFileError(`task file ${id}: verify render needs at least one render_targets entry`);
+  }
   return {
     id,
     title: requiredString(data, "title", id),
@@ -131,6 +162,9 @@ export function parseTaskFile(raw: string, id: string): Task {
     dependsOn: parseDependsOn(data, id),
     humanCheck: parseHumanCheck(data, id),
     tolerate: parseTolerate(data, id),
+    quick: parseQuick(data, id),
+    verify,
+    renderTargets,
     reviewRounds: parseReviewRounds(data, id),
     sessions: parseSessions(data, id),
     retries: parseRetries(data, id),
@@ -157,6 +191,9 @@ export function serializeTaskFile(task: Task): string {
     ...(task.dependsOn.length > 0 && { depends_on: task.dependsOn }),
     ...(task.humanCheck && { human_check: task.humanCheck }),
     ...(task.tolerate.length > 0 && { tolerate: task.tolerate }),
+    ...(task.quick && { quick: task.quick }),
+    ...(task.verify !== "human" && { verify: task.verify }),
+    ...(task.renderTargets.length > 0 && { render_targets: task.renderTargets }),
     sessions: task.sessions,
     retries: task.retries,
     review_rounds: task.reviewRounds,
@@ -272,6 +309,28 @@ function parseHumanCheck(data: Record<string, unknown>, id: string): boolean {
     throw new TaskFileError(`task file ${id}: field human_check must be a boolean`);
   }
   return value;
+}
+
+function parseQuick(data: Record<string, unknown>, id: string): boolean {
+  const value = data.quick;
+  if (value === undefined) {
+    return false;
+  }
+  if (typeof value !== "boolean") {
+    throw new TaskFileError(`task file ${id}: field quick must be a boolean`);
+  }
+  return value;
+}
+
+function parseStringList(data: Record<string, unknown>, key: string, id: string): string[] {
+  const value = data[key];
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.length === 0)) {
+    throw new TaskFileError(`task file ${id}: field ${key} must be a list of non-empty strings`);
+  }
+  return [...value];
 }
 
 function parseReviewRounds(data: Record<string, unknown>, id: string): number {

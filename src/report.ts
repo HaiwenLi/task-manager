@@ -34,6 +34,8 @@ export async function buildReport(tasksDir: string, id: string): Promise<string[
     `task ${id}: ${task.title}`,
     `status ${task.status}  retries ${task.retries}  reviewRounds ${task.reviewRounds}  sessions ${task.sessions.length}`,
     `complexity ${task.complexity}  risk ${task.risk}  humanCheck ${task.humanCheck}`,
+    `verify ${task.verify}${task.quick ? "  (quick lane: no spec)" : ""}` +
+      (task.renderTargets.length > 0 ? `  targets ${task.renderTargets.join(", ")}` : ""),
     ...(task.tolerate.length > 0 ? [`tolerate ${task.tolerate.join(", ")}`] : []),
     "",
     "## spec",

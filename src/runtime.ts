@@ -55,6 +55,10 @@ export function definitionDigest(task: Task): string {
     // A tolerated drift kind is the same kind of change: it decides what the
     // reviewer may excuse, so widening it after the fact would be a new task.
     criteria: task.criteria, risk: task.risk, humanCheck: task.humanCheck, dependsOn: task.dependsOn,
+    // What has to agree the work is done is part of the definition: switching a
+    // task from a reviewer's verdict to a render check mid-attempt changes the
+    // bar, and must invalidate the attempt rather than be reviewed under it.
+    verify: task.verify, renderTargets: [...task.renderTargets],
     // Sorted: the same set of tolerated kinds in a different order is the same
     // declaration, and must not invalidate an attempt.
     tolerate: [...task.tolerate].sort() })).digest("hex");

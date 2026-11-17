@@ -110,6 +110,9 @@ function task(overrides: Partial<Task> = {}): Task {
     dependsOn: [],
     humanCheck: false,
     tolerate: [],
+    quick: false,
+    verify: "human",
+    renderTargets: [],
     reviewRounds: 0,
     sessions: [],
     retries: 0,
@@ -809,8 +812,13 @@ describe("runWorker — 逐事件日志（Plan Task 9 / ADR-0006 告警）", () 
     const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance: passGate, review: passReview, ...sink });
 
     expect(result).toEqual({ done: ["a"], blocked: [] });
-    expect(sink.events.map((e) => e.type)).toEqual(["claimed", "running", "handoff", "acceptance", "reviewing", "reviewed", "done"]);
-    expect(sink.events[2]).toMatchObject({ type: "handoff", taskId: "a", detail: "ses-A" });
+    // A handoff is also evidence the work did not fit one session, so the run is
+    // escalated before it hands over (see `escalate`): the sequence carries it.
+    expect(sink.events.map((e) => e.type)).toEqual([
+      "claimed", "running", "escalated", "handoff", "acceptance", "reviewing", "reviewed", "done",
+    ]);
+    expect(sink.events[2]).toMatchObject({ type: "escalated", taskId: "a" });
+    expect(sink.events[3]).toMatchObject({ type: "handoff", taskId: "a", detail: "ses-A" });
   });
 
   it("重试额度耗尽 → blocked 事件（带详情）", async () => {

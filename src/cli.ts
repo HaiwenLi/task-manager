@@ -7,7 +7,8 @@ import { runWorker, type WorkerConfig } from "./worker.js";
 import { runScheduler } from "./scheduler.js";
 import { OpenCodeAdapter } from "./adapters/opencode.js";
 import type { AgentAdapter } from "./adapters/types.js";
-import { serializeTaskFile, type Task } from "./task-file.js";import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, TEMPLATES, type TaskType } from "./intake.js";
+import { serializeTaskFile, type Task, type TaskVerify } from "./task-file.js";
+import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, TEMPLATES, type TaskType } from "./intake.js";
 import { appendObservation, readProfile } from "./profile.js";
 import { extractCriteria, readSpec, writeSpec } from "./spec.js";
 import { appendJournal } from "./journal.js";
@@ -17,6 +18,8 @@ import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
 import { readRuntime } from "./runtime.js";
 import { reconcileTask, retryTask } from "./reconcile.js";
+import { checkRender, describeFailures, RenderUnavailableError, DEFAULT_VIEWPORTS } from "./render.js";
+import { taskWorkdir } from "./scheduler.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
 export type CliDeps = {
@@ -35,10 +38,11 @@ class UsageError extends Error {}
 
 const USAGE = [
   "usage:",
-  "  taskctl add \"<意图>\" [--type code|office|research|design] [--simple] [--id <id>] [--config taskctl.json]",
+  "  taskctl add \"<意图>\" [--type code|office|research|design] [--simple] [--quick] [--verify human|mechanical|render] [--target <a.html,b.html>] [--id <id>] [--config taskctl.json]",
   "  taskctl spec --task <id> [--tasks-dir <dir>]",
   "  taskctl approve --task <id> [--tasks-dir <dir>]",
   "  taskctl run [--config taskctl.json]",
+  "  taskctl verify --task <id> [--viewport 1440x900,390x844] [--config taskctl.json]",
   "  taskctl done --task <id> [--tasks-dir <dir>]",
   "  taskctl note --task <id> --status <s> --done <d> --found <f> --next <n> [--files <a,b>] [--tasks-dir <dir>]",
   "  taskctl status [--tasks-dir <dir>]",
@@ -107,7 +111,7 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
   }
   switch (command) {
     case "add":
-      checkFlags(command, flags, ["type", "simple", "id", "config", "risk", "workdir", "tasks-dir", "acceptance"], []);
+      checkFlags(command, flags, ["type", "simple", "quick", "verify", "target", "id", "config", "risk", "workdir", "tasks-dir", "acceptance"], []);
       return addCommand(positionals, flags, deps, log);
     case "spec":
       checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
@@ -118,6 +122,9 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "run":
       checkFlags(command, flags, ["config"], []);
       return runCommand(flags, deps, log);
+    case "verify":
+      checkFlags(command, flags, ["task", "viewport", "tasks-dir", "config"], ["task"]);
+      return verifyCommand(flags, log);
     case "done":
       checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return doneCommand(flags, deps, log);
@@ -197,9 +204,55 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   return 0;
 }
 
+/**
+ * `taskctl verify --task <id>` — run the same render check the worker will run,
+ * so an operator can see the page verdict before queueing anything.
+ */
+async function verifyCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const cfg = await configFor(flags);
+  const tasksDir = await tasksDirFor(flags);
+  const id = flags.get("task")!;
+  const task = await new TaskStore(tasksDir).get(id);
+  if (task.renderTargets.length === 0) {
+    throw new UsageError(`task ${id} declares no render targets; pass --target when adding it`);
+  }
+  const viewports = (flags.get("viewport") ?? (cfg.renderViewports ?? DEFAULT_VIEWPORTS).join(","))
+    .split(",")
+    .map((viewport) => viewport.trim())
+    .filter((viewport) => viewport.length > 0);
+  const evidenceDir = join(tasksDir, id, "evidence");
+  await mkdir(evidenceDir, { recursive: true });
+  const workdir = taskWorkdir(cfg.workdir, task);
+  let check;
+  try {
+    check = await checkRender({
+      targets: task.renderTargets.map((target) => join(workdir, target)),
+      viewports,
+      evidenceDir,
+      ...(cfg.chromeBin === undefined ? {} : { chromeBin: cfg.chromeBin }),
+    });
+  } catch (err) {
+    if (err instanceof RenderUnavailableError) {
+      log(`render-unavailable  ${err.message}`);
+      return 1;
+    }
+    throw err;
+  }
+  for (const view of check.views) {
+    log(`${view.ok ? "ok  " : "fail"}  ${view.target} @ ${view.viewport}  ` +
+      `${view.measurements.scrollWidth}/${view.measurements.clientWidth}px  ${view.screenshot}`);
+  }
+  if (check.ok) {
+    log(`render ok  ${check.views.length} view(s)`);
+    return 0;
+  }
+  log("render failed:");
+  for (const failure of describeFailures(check)) log(`  - ${failure}`);
+  return 1;
+}
+
 /** Rewrite the board from disk state; safe to call at any point. */
-async function refreshBoardFile(tasksDir: string): Promise<void> {
-  const tasks = await new TaskStore(tasksDir).list();
+async function refreshBoardFile(tasksDir: string): Promise<void> {  const tasks = await new TaskStore(tasksDir).list();
   const notes = await boardNotes(tasksDir, tasks);
   const highlighted = new Set(
     (await readAudits(tasksDir)).filter((record) => record.verdict === "pass" && record.highlight === true).map((record) => record.task),
@@ -225,9 +278,30 @@ async function addCommand(
   const store = new TaskStore(tasksDir);
   const id = flags.get("id") ?? (await nextTaskId(tasksDir, intent));
   const type = parseType(flags.get("type") ?? detectType(intent));
-  const complexity = flags.has("simple") ? "simple" : detectComplexity(intent);
-  const workdir = flags.get("workdir");
   const acceptance = flags.get("acceptance");
+  const quick = flags.has("quick");
+  const verify = parseVerify(flags.get("verify") ?? "human");
+  const risk: "normal" | "high" = flags.get("risk") === "high" ? "high" : "normal";
+  const renderTargets = (flags.get("target") ?? "")
+    .split(",")
+    .map((target) => target.trim())
+    .filter((target) => target.length > 0);
+  // A quick task is one nobody signs off and nobody reviews: pairing it with high
+  // risk would be two opposite promises in the same file.
+  if (quick && risk === "high") {
+    throw new UsageError("--quick cannot be combined with --risk high");
+  }
+  if (verify === "mechanical" && acceptance === undefined) {
+    throw new UsageError("--verify mechanical needs --acceptance: without a command there is nothing to verify");
+  }
+  if (verify === "render" && renderTargets.length === 0) {
+    throw new UsageError("--verify render needs at least one --target <file>");
+  }
+  // Quick means "do not wait for a signature", which is what `simple` already
+  // encodes; keeping them in one field avoids a task that claims to be complex
+  // while sitting in `open`.
+  const complexity = quick || flags.has("simple") ? "simple" : detectComplexity(intent);
+  const workdir = flags.get("workdir");
   const task: Task = {
     id,
     title: firstLine(intent).slice(0, 80),
@@ -235,17 +309,35 @@ async function addCommand(
     status: "draft",
     criteria: [],
     complexity,
-    risk: flags.get("risk") === "high" ? "high" : "normal",
+    risk,
     ...(workdir !== undefined && { workdir }),
     ...(acceptance !== undefined && { acceptance }),
     dependsOn: [],
     humanCheck: false,
     tolerate: [],
+    quick,
+    verify,
+    renderTargets,
     reviewRounds: 0,
     sessions: [],
     retries: 0,
   };
   await writeFile(join(tasksDir, `${id}.md`), serializeTaskFile(task), { encoding: "utf8", flag: "wx" });
+
+  if (quick) {
+    // No clarify session and no spec: the intent is the whole definition. This is
+    // the only lane cheap enough for a twenty-second task, and the price is that
+    // nothing was written down to check the work against — which is why the worker
+    // will not let a quick task finish on its own evidence.
+    await store.setStatus(id, "open");
+    await appendJournal(tasksDir, id, {
+      stage: "clarify",
+      event: "quick-lane",
+      detail: "no spec; the intent is the definition",
+    });
+    log(`${id}  open  quick${verify === "human" ? "" : ` verify=${verify}`}`);
+    return 0;
+  }
 
   const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
   const profile = await readProfile(tasksDir);
@@ -385,7 +477,7 @@ async function statusCommand(flags: Map<string, string>, log: (line: string) => 
 }
 
 /** Flags that stand alone, with no value token after them. */
-const BOOLEAN_FLAGS = new Set(["simple", "all", "apply", "json"]);
+const BOOLEAN_FLAGS = new Set(["simple", "quick", "all", "apply", "json"]);
 
 /** `taskctl board` — rewrite `.taskctl/board.md` and print the same content as a table. */
 async function boardCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
@@ -623,6 +715,15 @@ function parseType(value: string): TaskType {
   return value as TaskType;
 }
 
+/** `--verify`, validated here so a typo is a usage error and not a silent default. */
+function parseVerify(value: string): TaskVerify {
+  const allowed: TaskVerify[] = ["human", "mechanical", "render"];
+  if (!allowed.includes(value as TaskVerify)) {
+    throw new UsageError(`unknown --verify "${value}" (expected one of: ${allowed.join(", ")})`);
+  }
+  return value as TaskVerify;
+}
+
 /** First non-empty line, used as the task title. */
 function firstLine(text: string): string {
   return text.split(/\r?\n/).find((line) => line.trim().length > 0)?.trim() ?? "task";
@@ -693,6 +794,8 @@ const CONFIG_KEYS = new Set([
   "reviewerModelFallbacks",
   "parallel",
   "opencodeBin",
+  "chromeBin",
+  "renderViewports",
 ]);
 
 /** Merge config file over the defaults; every present field is validated. */
@@ -727,6 +830,8 @@ export function resolveConfig(raw: Record<string, unknown>, path: string): Resol
     reviewerModelFallbacks: stringArray(raw, "reviewerModelFallbacks", path),
     parallel: integer(raw, "parallel", path),
     opencodeBin: string(raw, "opencodeBin", path),
+    chromeBin: string(raw, "chromeBin", path),
+    renderViewports: stringArray(raw, "renderViewports", path),
   };
 }
 
