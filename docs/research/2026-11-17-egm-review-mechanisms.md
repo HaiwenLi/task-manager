@@ -258,3 +258,38 @@ EGM 的 `egm-resolve` 对每条 finding 四分类（`resolve/SKILL.md:56-82`）�
 - **P1** 无争议，立即做（改 `buildReviewPrompt` + verdict schema 向后兼容）。
 - **P2** 须按脚注 4 与补注 A 重定义收敛语义（对齐 taskctl 返工循环，非文档迭代）。
 - **P3** 须同时落地补注 B 的 disable-model-invocation 闸门，否则不做。
+
+---
+
+## 9. 落地记录（`feature/egm-review-p1` 分支，2026-11-17）
+
+### 已做：P1（提示词层，`8392a19` 之前的 `5c53308`）
+
+`buildReviewPrompt` 加四条，零 schema 迁移、零 consumer 改动：
+- 压力测试立场（默认先找做不到/说不通/缺证据）
+- 证据强制（evidence 引具体产物 + 观察；空 evidence → 该条 unclear）
+- defects 用 🔴/🟡/🟢 前缀标 severity，nit-only 不得 fail（保持 `string[]` 契约）
+- summary 先复述任务+判据再给结论，复述对不上 → unclear（喂 clarify 归因）
+
+### 已做：收敛语义 = 「返工价值判定」（`8392a19`）
+
+采纳第 8 节复核的方向修正——**不是照搬 EGM 的「两轮 clean 才收敛」，而是 taskctl 的「worker 是否在动」**：
+
+- 判定信号用**criteria 的 pass/fail 翻转**（criterion id 被 definitionDigest 锁死，跨轮稳定），**不比较 defects 自由文本**。
+- **空转**：fail 的 criterion 集合与上一轮完全相同 → 提前 `blocked`，journal 写清未变的 criterion，不再烧满 `maxReviewRounds`。
+- **逼近**：至少一个 criterion flip（fail→pass 或新 fail）→ 照常消耗一轮 rework。
+
+对应 EGM 的映射：settled/fixed 的「同 scope 同问题」在 taskctl 里就是「同一 criterion 连续 fail」；EGM 的「clean round」在 taskctl 里无对应物（返工后产物变了，不是抽样），所以**不做**「连续两轮 clean 才过」。
+
+### 明确不做 + 理由（避免未来误读为「欠着」）
+
+| 项 | 理由 |
+|---|---|
+| 结构化 severity（枚举 + 迁移 history review.json） | 提示词软约束已够，"机器识别 nit"是兼容债；准入二元（pass/fail/unclear），nit 误判由下一轮/人工放行兜底 |
+| 独立 `restated` 字段喂归因 | 判据是**给定的**（acceptance 命令 / criteria），不是 reviewer 要"理解一段文档"；复述的边际价值远小于 EGM 对设计文档的价值，P1 的 summary 软约束已拿 80% 收益 |
+| EGM 的「两轮 clean 收敛」 | taskctl 返工循环审查的是**每次不同的产物状态**，不是同一文档多轮抽样，语义错配 |
+| P3 透镜层 | 需先落地 disable-model-invocation 闸门 + 真实返工数据支撑"何时值得多 lens"，否则不做 |
+
+### 遗留（真正值得等数据再做的）
+
+「返工价值判定」目前只有空转/逼近二元。更细的判决（例如：逼近但逼近速度太慢要不要提前停、churn 检测"新问题落在刚修好的 scope"）需要**真实任务的返工分布数据**。这与本仓 backlog 里"分类器等 escalated 事件积累出比例"是同一个「先跑数据再设计」原则。
