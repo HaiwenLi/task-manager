@@ -56,6 +56,7 @@ npx tsx src/main.ts <子命令> [参数]
 | `opencodeBin` | string | `opencode` | opencode 可执行文件。**Windows 下 `.cmd` shim 无法被 `shell:false` 直接启动**，应在本地配置实际 `.exe`，不要提交机器专属路径 |
 | `chromeBin` | string | 自动探测 | 渲染验收用的浏览器可执行文件；也可用环境变量 `TASKCTL_CHROME`。找不到时渲染任务 `blocked`，不会当成通过 |
 | `renderViewports` | string[] | `["1440x900","390x844"]` | 渲染验收要过的视口列表 |
+| `artifactIgnore` | string[] | `[]` | 验收前后摘要**忽略的路径或 glob**（相对 workdir；`*` 不跨目录、`**` 跨目录、`?` 单字符，不支持字符类与取反，大小写敏感）。命中的文件——以及只装着命中文件的目录——不参与 drift 判定；见下文「验收的自生成产物」 |
 
 ## 任务文件
 
@@ -96,7 +97,7 @@ retries: 0
 | `sessions` | ✓ | 会话 id 链（按时间顺序追加），由 worker 维护 |
 | `retries` | ✓ | 失败尝试计数，由 worker 维护 |
 
-辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`acceptance.json`（命令、时间、输出、身份摘要与实际使用的模型）、`review.json`（复核判决、模型与被容忍的外部变更）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`done.requested`（完成请求）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
+辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`acceptance.json`（命令、验收模式、时间、输出、身份摘要与实际使用的模型）、`review.json`（复核判决、模型、被容忍的外部变更与实际注入的改动证据）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`done.requested`（完成请求）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
 
 ## 车道与验收方式
 
@@ -144,7 +145,7 @@ taskctl template --type …   看某类任务的必答/可推/补问模板
 要点：
 
 - **复杂度**：意图里明说「简单任务」或加 `--simple` 才会跳过签字；不说就按复杂处理。简单任务同样出 spec，只是不等签字。
-- **复核是独立会话**：新会话、不给执行者的对话，只给 spec、验收命令与结果、产物摘要、交接笔记、日志尾部，以及本次执行的时间窗口。输出必须是 JSON；解析不了按 `unclear` 转人工，不会当成失败去重跑。
+- **复核是独立会话**：新会话、不给执行者的对话，只给 spec、验收命令与结果、产物摘要、交接笔记、日志尾部、工作区改动清单（`git status --porcelain` 与 `git diff --stat`，各截断至 200 行、超长标注），以及本次执行的时间窗口。输出必须是 JSON；解析不了按 `unclear` 转人工，不会当成失败去重跑。实际注入的改动清单原文记在 `review.json` 的 `evidence` 字段，复盘复核误判时可以核对 reviewer 当时到底看到了什么；非 git 工作目录会显式标注「不可用」而不是中断复核。
 - **容忍的外部变更**：任务可以声明 `tolerate`，告诉复核"这些差异不是我干的"。声明之外的结构变化（删列、改表头含义等）仍按原规则判 fail；本任务自己该写的内容没写全，**不能**拿外部变更当挡箭牌；涉及交付内容（该写的行、该改对的单元格）时判不出先后的，也按本任务的问题处理。被容忍的差异不做静默处理：写进 `review.json` 的 `externalChanges`、journal 记一条 `verdict external=N`、`report` 里逐条列出，`taskctl accept` 放行前也会打印一遍（人工闸门是最后一道）。为什么需要它：真跑过的表格任务里，运行期间别人加了 1 列、删了 1 行、改了 4 个单元格，复核按"零附带改动"判 fail，白跑 20 分钟一轮。
 - **定义不能被被审对象自己改**：`tolerate`、`criteria`、`risk` 等都属于任务定义，进 `definitionDigest`。执行回合里改了它（哪怕是 worker 自己 shell 出去改 frontmatter），本次验收直接作废、任务 `blocked` 等人工重新确认——否则"给自己放宽判定标准"就成了合法动作。复核判决里记录的是**当时那份声明**，事后把 `tolerate` 收窄不会让旧判决看起来像是被允许过更多。
 - **返工**：复核不过会写一条 `review-failed` 笔记并回到 `open`；连续 `maxReviewRounds` 轮（默认 2）后 `blocked`。
@@ -172,7 +173,35 @@ npx tsx src/main.ts run [--config taskctl.json]
 
 按文件名顺序处理 `open` 任务：领锁 → 独占工作目录 → 持久化执行身份 → `running` → 会话/交接 → 完成请求 → 验收。全过程打印 `[<id>] <状态> [详情]`。缺少验收时输出 `acceptance-skipped` 并阻塞待审。`running` 孤儿任务只有已确认上一执行结束才能恢复；活跃/不确定记录或缺少执行身份的旧任务会阻塞，不盲目重跑。
 
-同一实际工作目录（含路径别名）不可并行执行；共享 Git common directory 的 worktree 暂按串行处理。当前不自动创建/合并 worktree。验收前后对源码产物做摘要；验收命令改变产物会要求复核，不会把旧检查套到新版本。摘要排除 Git 内部、依赖目录及任务运行时目录；详见 `src/workspace.ts`。
+同一实际工作目录（含路径别名）不可并行执行；共享 Git common directory 的 worktree 暂按串行处理。当前不自动创建/合并 worktree。验收前后对源码产物做摘要；验收命令改变产物会要求复核，不会把旧检查套到新版本。摘要排除 Git 内部、依赖目录及任务运行时目录（另可用 `artifactIgnore` 忽略任务自产物的路径，见下节）；详见 `src/workspace.ts`。
+
+#### 验收的自生成产物：`artifactIgnore` 与 `TASKCTL_ACCEPTANCE_MODE`
+
+有些任务的验收命令会**按 spec 生成产物**——`report.json`、`timing.json`、`perf.json` 之类。这类命令一旦在验收门里重新生成文件，就被自己的写入判成 drift（`acceptance evidence invalidated by … artifact drift`）。两条互补的解法：
+
+- **`artifactIgnore`（路径级忽略）**：`taskctl.json` 里声明验收命令**自己会写**的路径。命中的文件不参与验收前后哈希，重写它们不算 drift；未命中的路径照常判定。适合「产物本来就是任务交付物、每次运行都会重写」的场景。
+
+  ```json
+  { "artifactIgnore": ["reports/*.json", "timing/**"] }
+  ```
+
+  语义：相对 workdir 的路径或 glob（`*` 不跨目录、`**` 跨目录、`?` 单字符；`\` 与 `/` 等价；不支持 `[abc]` 字符类和 `!` 取反；大小写敏感）。一个只装着被忽略文件的目录整体不注册——验收命令新建 `timing/` 并写入被忽略的 JSON，摘要不变。能匹配整个工作区的模式（如 `**`）在配置处直接报错，不让 drift 检查被无声架空。**不要把源码路径放进来**：这个开关绕过的是「验收命令自己写自己」的判定，不是「任务该改的没改」的判定。
+
+- **`TASKCTL_ACCEPTANCE_MODE=generate|check`（生成/检查分离）**：taskctl 给验收命令注入这个环境变量。**门（taskctl 跑的验收）注入 `check`**——命令只读不写，`artifactBefore == artifactAfter` 自然成立；**worker（agent 干活时自跑验收命令）不注入或注入 `generate`**（默认值）——命令可以生成/刷新产物，写入发生在尝试窗口内，不进摘要比较。
+
+  推荐写法：验收命令开头判断模式——
+
+  ```bash
+  #!/bin/sh
+  if [ "$TASKCTL_ACCEPTANCE_MODE" != "check" ]; then
+    node scripts/build-report.js   # generate：产出 report.json / timing.json
+  fi
+  node scripts/verify-report.js    # check：只回读校验，退出码即判决
+  ```
+
+  推荐流程：worker 在会话里以 generate 自跑一次验收命令产出报告（或把产物路径进 `artifactIgnore`），再 `taskctl done`；门以 check 重放同一命令，零写入、按退出码判决。两条路子可以单独用也可以叠加：`artifactIgnore` 管「写不写都行」，`check` 管「门内不许写」。门侧的 mode 会记进 `acceptance.json`（`mode: "check"`）。
+
+  边界：taskctl 不验证命令在 check 模式下**真的**没写文件——写了又没进 `artifactIgnore`，照样判 drift 拦下（fail closed）。check 模式的合规是命令作者的责任。
 
 工作目录预留同时保存在 `<workdir>/.taskctl-workspace.lock/` 和用户临时目录 `opencode/taskctl-workspaces/reservations.json`。注册表检查父子目录及 Git 元数据路径的重叠，即使运行期间执行 `git init` / 新建 linked worktree 也不能绕过既有预留。只删本地锁不会清除不确定执行的预留。
 
