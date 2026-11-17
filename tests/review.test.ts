@@ -116,4 +116,73 @@ describe("buildReviewPrompt", () => {
     );
     expect(buildReviewPrompt({ ...base, task: strict })).toContain("(本任务没有声明");
   });
+
+  it("sets a stress-testing stance, not a lenient one", () => {
+    const task = parseTaskFile(
+      "---\ntitle: 登录改版\nstatus: running\ncriteria:\n  - C1 npm test 全绿\nsessions: []\nretries: 0\n---\n正文",
+      "004-d",
+    );
+    const prompt = buildReviewPrompt({
+      task,
+      spec: "",
+      acceptanceMarkdown: "",
+      handoff: null,
+      journal: [],
+      window: { startedAt: "2026-11-16T00:00:00.000Z", finishedAt: "2026-11-16T00:20:00.000Z" },
+    });
+    expect(prompt).toContain("压力测试");
+    expect(prompt).toContain("先找做不到");
+  });
+
+  it("demands evidence to cite a concrete artifact, and ties empty evidence to unclear", () => {
+    const task = parseTaskFile(
+      "---\ntitle: 登录改版\nstatus: running\ncriteria:\n  - C1 npm test 全绿\nsessions: []\nretries: 0\n---\n正文",
+      "005-e",
+    );
+    const prompt = buildReviewPrompt({
+      task,
+      spec: "",
+      acceptanceMarkdown: "",
+      handoff: null,
+      journal: [],
+      window: { startedAt: "2026-11-16T00:00:00.000Z", finishedAt: "2026-11-16T00:20:00.000Z" },
+    });
+    expect(prompt).toContain("读了哪个产物/文件");
+    expect(prompt).toContain("空 evidence 的那条标准判 unclear");
+  });
+
+  it("tells defects to carry severity, and says a nit-only verdict must not fail", () => {
+    const task = parseTaskFile(
+      "---\ntitle: 登录改版\nstatus: running\ncriteria:\n  - C1 npm test 全绿\nsessions: []\nretries: 0\n---\n正文",
+      "006-f",
+    );
+    const prompt = buildReviewPrompt({
+      task,
+      spec: "",
+      acceptanceMarkdown: "",
+      handoff: null,
+      journal: [],
+      window: { startedAt: "2026-11-16T00:00:00.000Z", finishedAt: "2026-11-16T00:20:00.000Z" },
+    });
+    expect(prompt).toContain("🔴");
+    expect(prompt).toContain("🟢");
+    expect(prompt).toContain("只有 🟢，不要 fail");
+  });
+
+  it("asks the reviewer to restate the task and criteria, and to go unclear on a mismatch", () => {
+    const task = parseTaskFile(
+      "---\ntitle: 登录改版\nstatus: running\ncriteria:\n  - C1 npm test 全绿\nsessions: []\nretries: 0\n---\n正文",
+      "007-g",
+    );
+    const prompt = buildReviewPrompt({
+      task,
+      spec: "",
+      acceptanceMarkdown: "",
+      handoff: null,
+      journal: [],
+      window: { startedAt: "2026-11-16T00:00:00.000Z", finishedAt: "2026-11-16T00:20:00.000Z" },
+    });
+    expect(prompt).toContain("先写你对本任务和验收标准的复述");
+    expect(prompt).toContain("判 unclear");
+  });
 });
