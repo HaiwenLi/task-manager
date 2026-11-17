@@ -35,6 +35,13 @@ export type ReviewEvidence = {
   handoff: string | null;
   journal: string[];
   /**
+   * What changed in the workdir (`git status --porcelain` + `git diff --stat`,
+   * line-capped), or null when it was never collected. It is a footprint, not
+   * a deliverable list: absent files may be tolerated external drift, present
+   * files may still be wrong.
+   */
+  changes?: { status: string; diffStat: string } | null;
+  /**
    * When this attempt started and when the work was handed to the review. The
    * reviewer needs both edges to tell "this changed while the task ran" from
    * "this was never done": the first is drift, the second is a defect.
@@ -63,6 +70,12 @@ export function buildReviewPrompt(evidence: ReviewEvidence): string {
     "## 验收命令与结果",
     evidence.acceptanceMarkdown.trim() || "(没有验收记录)",
     "",
+    "## 工作区改动清单（git status --porcelain）",
+    evidence.changes?.status.trim() || "(未收集)",
+    "",
+    "## 改动统计（git diff --stat）",
+    evidence.changes?.diffStat.trim() || "(未收集)",
+    "",
     "## 执行者的交接笔记",
     evidence.handoff?.trim() || "(没有交接笔记)",
     "",
@@ -90,6 +103,7 @@ export function buildReviewPrompt(evidence: ReviewEvidence): string {
     "9. 每条 evidence 必须写清楚「读了哪个产物/文件的哪一部分、实际看到了什么」，拿出处和观察说话。只在说不到具体产物、说不出观察时，才允许 evidence 为空——空 evidence 的那条标准判 unclear。",
     "10. 每个 defects 条目用严重级前缀开头：🔴 是必须返工才能过、🟡 是明显缺陷、🟢 是无关痛痒的挑剔。只有 🔴 或 🟡 可以当作 fail 的理由；如果只有 🟢，不要 fail。",
     "11. summary 先写你对本任务和验收标准的复述（我要求它做什么、做到什么算过），再写结论。如果你连任务和判据都复述不清楚，或者复述和上面给出的标准对不上，判 unclear——那不是产物的问题，是判据本身没写清楚。",
+    "12. 「工作区改动清单／改动统计」是执行足迹的线索，不是验收依据：不在清单里的差异可能是被容忍的外部变更（按容忍规则归因），在清单里也不等于符合标准；结论仍以产物本身为准。清单标注「不可用」或「截断」时，按信息缺失处理，不要猜。",
     "",
     "JSON 形状：",
     `{"verdict":"pass|fail|unclear","criteria":[{"id":"C1","pass":true,"evidence":"读了 <文件>，看到 <事实>"}],"externalChanges":["归因为外部变更的差异"],"defects":["🔴 必须修的点 / 🟢 挑剔项"],"summary":"一句话复述你怎么理解本任务与判据，再给结论"}`,

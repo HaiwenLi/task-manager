@@ -6,7 +6,7 @@
 
 更新方式：每跑完一批真实任务，把新发现的问题加进来、把已经不再需要的划掉。**不做**不等于**忘了**，也不需要为了列表变短而做。
 
-最后更新：2026-11-16（`main@d058caa` 之后；车道与验收方式见 [ADR-0009](adr/0009-lanes-and-verification.md)）
+最后更新：2026-11-17（车道与验收方式见 [ADR-0009](adr/0009-lanes-and-verification.md)；本轮落地 `artifactIgnore` / `TASKCTL_ACCEPTANCE_MODE` / 复核改动证据，边界见第 4 节）
 
 ---
 
@@ -70,6 +70,12 @@
 - 时间窗口是 **per-attempt**：返工一轮后，上一轮造成的损伤会被读成"本来就有"。真正的"写入窗口"没做
 - 界限：只有声明的类别可以归因为外部变更；证据说明不了先后的**交付内容**按本任务的问题处理；被容忍的差异会记录（`review.json`、journal、`report`、`accept` 打印），但"容忍"本身是声明，不是模型的自证
 - 定义（`criteria` / `tolerate` / `risk` / `human_check` 等）在执行期被改 → 本次验收作废并 `blocked`，包括 worker 自己改自己的 frontmatter
+
+**验收的自生成产物（`artifactIgnore` / `TASKCTL_ACCEPTANCE_MODE`）**
+- glob 方言是手写的最小集：`*`（不跨目录）、`**`（跨目录）、`?`（单字符）；没有 `[abc]` 字符类、没有 `!` 取反、大小写敏感、只认相对 workdir 的模式（绝对路径写进来会静默不命中任何东西）。引入新依赖前不打算扩
+- digest 格式从 v1 升到 v2：目录行移到子项之后、纯忽略目录整体不注册（连带**空目录**也不再注册——建空目录不再算 drift；与 git 一样看不见空目录）。v1/v2 摘要不可比，但摘要只在单次验收内前后比，无存量影响
+- taskctl 不验证命令在 check 模式下真的没写文件：写了又不在 `artifactIgnore` 里，按 drift 拦下（fail closed）。check 合规是命令作者的责任，文档只给了推荐写法
+- 复核的改动清单只有 `git status --porcelain` + `git diff --stat`，各截断至 200 行；非 git 工作目录显式「不可用」。二进制产物的变更只有状态行没有内容视图；review.json 的 `evidence` 记的是注入原文（复盘用），不是全集
 
 **blocked 与恢复**
 - 不按记录的 PID 杀进程（PID 复用无法证明归属，ADR-0007）
