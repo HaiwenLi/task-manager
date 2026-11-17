@@ -263,8 +263,8 @@ describe("runWorker — 队列与生命周期", () => {
   });
 
   it("损坏的任务文件 → list() 的 TaskFileError 直接上抛（fail loud）", async () => {
-    // 缺 title：YAML 合法但字段校验失败
-    await writeFile(join(tasksDir, "broken.md"), "---\nstatus: open\nsessions: []\nretries: 0\n---\n正文", "utf8");
+    // 缺 title：YAML 合法但字段校验失败（schema 已声明，所以它确实是一个任务）
+    await writeFile(join(tasksDir, "broken.md"), "---\nschema: taskctl/v1\nstatus: open\nsessions: []\nretries: 0\n---\n正文", "utf8");
     const store = new TaskStore(tasksDir);
     const adapter = new FakeAdapter(() => ({ sessionId: "s", exitCode: 0, text: "" }));
 

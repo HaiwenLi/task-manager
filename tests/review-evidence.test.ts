@@ -140,6 +140,7 @@ describe("review.json records what the reviewer saw (C3, worker level)", () => {
     await mkdir(tasksDir, { recursive: true });
     await writeFile(join(tasksDir, "a.md"), [
       "---",
+      "schema: taskctl/v1",
       "title: Review evidence task",
       "status: open",
       'acceptance: "check"',

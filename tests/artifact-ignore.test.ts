@@ -110,6 +110,7 @@ describe("artifactDigest ignore patterns (C1)", () => {
 async function seedTask(tasksDir: string, acceptance: string | undefined): Promise<void> {
   const lines = [
     "---",
+    "schema: taskctl/v1",
     "title: Gate task",
     "status: open",
     ...(acceptance === undefined ? [] : [`acceptance: ${JSON.stringify(acceptance)}`]),
