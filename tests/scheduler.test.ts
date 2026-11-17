@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskStore } from "../src/task-store.js";
@@ -37,6 +37,7 @@ afterEach(async () => {
 async function seed(id: string, extra: string[] = []): Promise<void> {
   const lines = [
     "---",
+    "schema: taskctl/v1",
     `title: ${id}`,
     "status: open",
     'acceptance: "check"',
@@ -174,5 +175,30 @@ describe("runScheduler", () => {
     await runScheduler(config({ parallel: 2 }), { store, adapter: adapter(), acceptance: failGate });
     expect(await store.get("001-a")).toMatchObject({ status: "draft" });
     expect(await store.get("002-b")).toMatchObject({ status: "awaiting-human" });
+  });
+
+  it("never schedules a Markdown file that does not declare the task schema", async () => {
+    // The incident: a hand-taken snapshot dropped into `tasks/` was read as a new
+    // open task and ran six times before anyone looked. Being in the directory is
+    // not a declaration; `schema: taskctl/v1` in the frontmatter is.
+    const snapshot = join(tasks, "013-snapshot-at-relaunch.md");
+    const contents = ["---", "title: snapshot", "status: open", "sessions: []", "retries: 0", "---", "手工快照", ""].join("\n");
+    await writeFile(snapshot, contents, "utf8");
+    let turns = 0;
+    const counting: AgentAdapter = {
+      prompt: async () => {
+        turns += 1;
+        return { sessionId: "s", text: "done", exitCode: 0 };
+      },
+      contextUsage: async () => 0,
+      contextLimit: async () => 100,
+    };
+
+    const result = await runScheduler(config(), { store, adapter: counting, acceptance: failGate });
+
+    expect(turns).toBe(0);
+    expect(result).toEqual({ done: [], blocked: [] });
+    expect(await readFile(snapshot, "utf8")).toBe(contents);
+    expect((await store.scan()).ignored).toEqual(["013-snapshot-at-relaunch.md"]);
   });
 });

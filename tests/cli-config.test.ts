@@ -33,6 +33,23 @@ describe("resolveConfig", () => {
     expect(() => resolveConfig({ reviewerModelFallbacks: [1] }, "taskctl.json")).toThrow(/array of non-empty strings/);
   });
 
+  it("accepts a dispatch chain and a failure-fingerprint limit", () => {
+    const cfg = resolveConfig({
+      model: "a/one",
+      modelChain: ["a/one", "b/two", "c/three"],
+      failureFingerprintLimit: 2,
+    }, "taskctl.json");
+    expect(cfg.modelChain).toEqual(["a/one", "b/two", "c/three"]);
+    expect(cfg.failureFingerprintLimit).toBe(2);
+    // Absent stays absent: the worker's own default (3) then applies.
+    expect(resolveConfig({}, "taskctl.json").failureFingerprintLimit).toBeUndefined();
+  });
+
+  it("rejects a malformed dispatch chain", () => {
+    expect(() => resolveConfig({ modelChain: "a/one" }, "taskctl.json")).toThrow(/array of non-empty strings/);
+    expect(() => resolveConfig({ modelChain: ["a/one", ""] }, "taskctl.json")).toThrow(/array of non-empty strings/);
+  });
+
   it("rejects a non-positive parallel count", () => {
     expect(() => resolveConfig({ parallel: 0 }, "taskctl.json")).toThrow(/positive/);
   });

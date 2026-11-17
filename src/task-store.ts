@@ -1,10 +1,20 @@
 import { readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { parseTaskFile, serializeTaskFile } from "./task-file.js";
+import { declaredTaskSchema, parseTaskFile, serializeTaskFile, TASK_SCHEMA } from "./task-file.js";
 import type { Task, TaskStatus } from "./task-file.js";
 
 /** Marker file (in `tasks/<id>/`) written by `taskctl done`, polled by the worker. */
 const DONE_MARKER = "done.requested";
+
+/** What one pass over `tasks/` found: registered tasks, and files it refused. */
+export type TaskScan = {
+  tasks: Task[];
+  /**
+   * `.md` files that did not declare {@link TASK_SCHEMA}, by filename. They are
+   * reported once by `taskctl status` and never parsed, scheduled, or rewritten.
+   */
+  ignored: string[];
+};
 
 /** The pipeline fields a caller may patch in one guarded write. */
 export type TaskFieldsPatch = Partial<
@@ -21,18 +31,39 @@ export type TaskFieldsPatch = Partial<
 export class TaskStore {
   constructor(private readonly tasksDir: string) {}
 
-  /** All tasks, sorted by filename. Only `*.md` files count as tasks. */
-  async list(): Promise<Task[]> {
+  /**
+   * All registered tasks, sorted by filename, plus the files that were refused
+   * registration. Only `*.md` files count; among those, only one whose
+   * frontmatter declares {@link TASK_SCHEMA} is a task (ADR-0001's "Markdown is
+   * the source of truth" is about content, not about the directory being a
+   * task inbox). Anything else — a hand-taken snapshot, a scratch note, a draft
+   * nobody has declared — is reported and left alone.
+   */
+  async scan(): Promise<TaskScan> {
     const entries = await readdir(this.tasksDir, { withFileTypes: true });
     const names = entries
       .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
       .map((entry) => entry.name)
       .sort();
     const tasks: Task[] = [];
+    const ignored: string[] = [];
     for (const name of names) {
-      tasks.push(await this.get(idFromFilename(name)));
+      const id = idFromFilename(name);
+      const raw = await readFile(this.taskFile(id), "utf8");
+      // A file that does not declare the schema is not parsed at all: its body
+      // is somebody's notes, not a task description with fields.
+      if (declaredTaskSchema(raw) !== TASK_SCHEMA) {
+        ignored.push(name);
+        continue;
+      }
+      tasks.push(parseTaskFile(raw, id));
     }
-    return tasks;
+    return { tasks, ignored };
+  }
+
+  /** All registered tasks, sorted by filename. */
+  async list(): Promise<Task[]> {
+    return (await this.scan()).tasks;
   }
 
   /** Read one task; `id` is the filename stem of `tasks/<id>.md`. */

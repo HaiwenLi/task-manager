@@ -86,6 +86,7 @@ async function seedTask(
 ): Promise<void> {
   const { status = "open", sessions = [], retries = 0 } = fields;
   const fm = [
+    "schema: taskctl/v1",
     `id: ${id}`,
     `title: 任务${id}`,
     `status: ${status}`,
@@ -213,6 +214,22 @@ describe("taskctl note", () => {
 });
 
 describe("taskctl status", () => {
+  it("lists the Markdown files it refused to register, once, after the table", async () => {
+    await seedTask("alpha");
+    await writeFile(join(tasksDir, "013-snapshot-at-relaunch.md"), "---\ntitle: snapshot\nstatus: open\nsessions: []\nretries: 0\n---\n快照\n", "utf8");
+    const cap = capture();
+
+    const code = await runCli(["status", "--tasks-dir", tasksDir], cap.deps);
+
+    expect(code).toBe(0);
+    const out = cap.lines.join("\n");
+    expect(out).toContain("alpha");
+    expect(out).toContain("ignored (no `schema: taskctl/v1` in frontmatter): 013-snapshot-at-relaunch.md");
+    // Reported, not treated as a task row and not an error.
+    expect(out.split("\n").filter((line) => line.includes("013-snapshot-at-relaunch.md"))).toHaveLength(1);
+    expect(cap.errors).toEqual([]);
+  });
+
   it("表格输出每任务：id、status、retries、sessions 数、最新 note 的 Status 行（捕获 console）", async () => {
     await seedTask("alpha", { status: "running", sessions: ["s1", "s2"], retries: 1 });
     await seedTask("beta");

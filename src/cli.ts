@@ -7,7 +7,7 @@ import { runWorker, type WorkerConfig } from "./worker.js";
 import { runScheduler } from "./scheduler.js";
 import { OpenCodeAdapter } from "./adapters/opencode.js";
 import type { AgentAdapter } from "./adapters/types.js";
-import { serializeTaskFile, type Task, type TaskVerify } from "./task-file.js";
+import { serializeTaskFile, type Task, type TaskVerify, TASK_SCHEMA } from "./task-file.js";
 import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, TEMPLATES, type TaskType } from "./intake.js";
 import { appendObservation, readProfile } from "./profile.js";
 import { extractCriteria, readSpec, writeSpec } from "./spec.js";
@@ -454,11 +454,11 @@ async function noteCommand(flags: Map<string, string>, log: (line: string) => vo
   return 0;
 }
 
-/** `taskctl status` — one table row per task. */
+/** `taskctl status` — one table row per task, then the files it refused to register. */
 async function statusCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
   const tasksDir = await tasksDirFor(flags);
   const store = new TaskStore(tasksDir);
-  const tasks = await store.list();
+  const { tasks, ignored } = await store.scan();
   const rows: string[][] = [["id", "status", "retries", "sessions", "note"]];
   for (const task of tasks) {
     const note = await latestNote(tasksDir, task.id);
@@ -472,6 +472,13 @@ async function statusCommand(flags: Map<string, string>, log: (line: string) => 
   }
   for (const line of renderTable(rows)) {
     log(line);
+  }
+  // Listed once, at the end, and never as an error: an unregistered Markdown
+  // file in `tasks/` is not a broken task, it is not a task. Saying so is how a
+  // hand-taken snapshot stops being scheduled instead of silently disappearing.
+  if (ignored.length > 0) {
+    log("");
+    log(`ignored (no \`schema: ${TASK_SCHEMA}\` in frontmatter): ${ignored.join(", ")}`);
   }
   return 0;
 }
@@ -792,6 +799,8 @@ const CONFIG_KEYS = new Set([
   "reviewerEffort",
   "modelFallbacks",
   "reviewerModelFallbacks",
+  "modelChain",
+  "failureFingerprintLimit",
   "parallel",
   "opencodeBin",
   "chromeBin",
@@ -828,6 +837,8 @@ export function resolveConfig(raw: Record<string, unknown>, path: string): Resol
     reviewerEffort: string(raw, "reviewerEffort", path),
     modelFallbacks: stringArray(raw, "modelFallbacks", path),
     reviewerModelFallbacks: stringArray(raw, "reviewerModelFallbacks", path),
+    modelChain: stringArray(raw, "modelChain", path),
+    failureFingerprintLimit: integer(raw, "failureFingerprintLimit", path),
     parallel: integer(raw, "parallel", path),
     opencodeBin: string(raw, "opencodeBin", path),
     chromeBin: string(raw, "chromeBin", path),
