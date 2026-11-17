@@ -14,7 +14,7 @@ import { definitionDigest, readAttempt, readRuntime, writeRuntime, type AttemptR
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
 import { chainPosition, modelAt, modelChain, readModelRotation, rotateModel, type Handover, type ModelRole } from "./models.js";
-import { startReview, type ReviewEvidence, type ReviewResult } from "./review.js";
+import { startReview, type CriterionResult, type ReviewEvidence, type ReviewResult } from "./review.js";
 import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck } from "./render.js";
 
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
@@ -644,6 +644,12 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
     await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "started", detail: `criteria=${r.task.criteria.length}` });
   });
 
+  // The previous review's criterion outcomes, if any, are read before the next
+  // verdict overwrites review.json below. They anchor the stall check: a
+  // reviewer can only be asked "did anything change since last time" if the
+  // last round's per-criterion facts are still in scope.
+  const prevCriteria = (await readRuntime<{ criteria?: CriterionResult[] }>(r.cfg.tasksDir, id, "review.json"))?.criteria ?? null;
+
   // A provider rejection is not a verdict: the reviewer never got to judge. The
   // review is retried in place — with the next model when the chain has one —
   // and the task does not go back through the worker, because re-executing the
@@ -699,7 +705,7 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
       // file edited while the reviewer was reading would otherwise be completed —
       // or reopened for rework — under a definition the reviewer never saw.
       await requireUnchangedDefinition(r, ["review"], "the task definition changed during the review; refusing to act on the verdict");
-      return await judge(r, result);
+      return await judge(r, result, prevCriteria);
     }
     await owned(r, () => appendJournal(r.cfg.tasksDir, id, {
       stage: "review",
@@ -723,7 +729,11 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
 }
 
 /** Act on a verdict that actually judged the work. */
-async function judge(r: Run, result: ReviewResult): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
+async function judge(
+  r: Run,
+  result: ReviewResult,
+  prevCriteria: CriterionResult[] | null,
+): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
   const id = r.task.id;
   if (result.verdict === "unclear") {
     await owned(r, () => r.deps.store.setStatus(id, "awaiting-human"));
@@ -744,7 +754,29 @@ async function judge(r: Run, result: ReviewResult): Promise<"done" | "blocked" |
     return "done";
   }
 
-  // Verdict is `fail`: spend a review round, or block once rounds are exhausted.
+  // Verdict is `fail`. Before spending another rework round, ask whether the
+  // worker is moving or spinning in place. The only stable signal across
+  // rounds is the per-criterion pass/fail edge: criterion ids are locked by the
+  // definition digest, so "the same criterion failed both times" is a fact,
+  // not a paraphrase. A worker that changed nothing (no criterion flipped, no
+  // new failure appeared) is stalled — one more rework round would replay the
+  // same result — so it stops early instead of burning every allotted round.
+  if (prevCriteria !== null && stalled(prevCriteria, result.criteria)) {
+    const rounds = r.task.reviewRounds; // not yet incremented: the stall is its own outcome
+    await owned(r, async () => {
+      await r.deps.store.setStatus(id, "blocked");
+      await appendJournal(r.cfg.tasksDir, id, {
+        stage: "review",
+        event: "blocked",
+        detail: `stalled: the failing criteria are unchanged from round ${rounds} (${result.criteria.filter((c) => !c.pass).map((c) => c.id).join(", ")})`,
+      });
+    });
+    emit(r, "blocked", `rework stalled after ${rounds} round(s): no criterion changed`);
+    return "blocked";
+  }
+
+  // The worker moved (a criterion flipped, or a new one failed): spend a
+  // rework round, or block once rounds are exhausted.
   const rounds = await owned(r, () => r.deps.store.incReviewRounds(id));
   const limit = r.cfg.maxReviewRounds ?? MAX_REVIEW_ROUNDS_DEFAULT;
   if (rounds > limit) {
@@ -767,6 +799,22 @@ async function judge(r: Run, result: ReviewResult): Promise<"done" | "blocked" |
   });
   emit(r, "rework", `round ${rounds}: ${result.defects.join("; ") || result.summary}`);
   return "open";
+}
+
+/**
+ * A rework round is stalled when nothing moved since the previous review: no
+ * previously-failing criterion passed, and no new criterion failed. Set
+ * identity ignores ids that are absent from one side (the criteria list is
+ * locked, so a mismatch means drift, not progress — and drift is handled
+ * upstream by requireUnchangedDefinition).
+ */
+function stalled(prev: CriterionResult[], curr: CriterionResult[]): boolean {
+  const prevFail = new Set(prev.filter((c) => !c.pass).map((c) => c.id));
+  const currFail = new Set(curr.filter((c) => !c.pass).map((c) => c.id));
+  // Same failing set ⇒ nothing flipped either direction.
+  if (prevFail.size !== currFail.size) return false;
+  for (const id of prevFail) if (!currFail.has(id)) return false;
+  return true;
 }
 
 /** One line per acceptance fact the reviewer may rely on. */
