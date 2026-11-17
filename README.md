@@ -57,6 +57,7 @@ npx tsx src/main.ts <子命令> [参数]
 | `chromeBin` | string | 自动探测 | 渲染验收用的浏览器可执行文件；也可用环境变量 `TASKCTL_CHROME`。找不到时渲染任务 `blocked`，不会当成通过 |
 | `renderViewports` | string[] | `["1440x900","390x844"]` | 渲染验收要过的视口列表 |
 | `artifactIgnore` | string[] | `[]` | 验收前后摘要**忽略的路径或 glob**（相对 workdir；`*` 不跨目录、`**` 跨目录、`?` 单字符，不支持字符类与取反，大小写敏感）。命中的文件——以及只装着命中文件的目录——不参与 drift 判定；见下文「验收的自生成产物」 |
+| `artifacts` | object | `{"sweep": true, "scratchPatterns": ["*.log","*.tmp","_*","*.sha","*.txt"]}` | **产物卫生**（见下文「产物卫生」）：`sweep` 关闭回合后清扫；`scratchPatterns` 是算作杂物的根目录文件名 glob（与 `artifactIgnore` 同一套 glob 方言）。子字段写错直接报配置错误 |
 
 ## 任务文件
 
@@ -87,6 +88,7 @@ retries: 0
 | `complexity` | | `simple`（不停下等签字）或 `complex`（默认，出稿等签字） |
 | `risk` | | `high` 时复核通过也要人工 `accept` |
 | `workdir` | | 本任务的工作目录（相对配置里的 `workdir`）；同一目录同时只跑一个任务 |
+| `keep_at_root` | | 根目录文件名 glob 列表，命中者**豁免回合后清扫**（如 `run.log`）。不进 `definitionDigest`：它决定杂物停哪儿，不决定"做完"是什么 |
 | `depends_on` | | 依赖的任务 id；全部 `done` 才会被领取，成环直接报错 |
 | `human_check` | | `true` 时无论风险都要人工放行 |
 | `tolerate` | | 声明**容忍的外部变更种类**：`external_cell_change`、`new_column`、`deleted_row`、`extra_file`。只写这几个值，写错直接报错（打错字不该变成"声明了但什么都没容忍"）。见下节 |
@@ -97,7 +99,7 @@ retries: 0
 | `sessions` | ✓ | 会话 id 链（按时间顺序追加），由 worker 维护 |
 | `retries` | ✓ | 失败尝试计数，由 worker 维护 |
 
-辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`acceptance.json`（命令、验收模式、时间、输出、身份摘要与实际使用的模型）、`review.json`（复核判决、模型、被容忍的外部变更与实际注入的改动证据）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`done.requested`（完成请求）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
+辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`acceptance.json`（命令、验收模式、时间、输出、身份摘要与实际使用的模型）、`review.json`（复核判决、模型、被容忍的外部变更与实际注入的改动证据）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`done.requested`（完成请求）、`logs/`（控制器逐任务日志与 worker 的 `$TASKCTL_LOG_DIR`）、`scratch/`（回合后清扫的落点，只进不出）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
 
 ## 车道与验收方式
 
@@ -168,12 +170,31 @@ taskctl template --type …   看某类任务的必答/可推/补问模板
 ### taskctl run — 派发
 
 ```bash
-npx tsx src/main.ts run [--config taskctl.json]
+npx tsx src/main.ts run [--log <file>] [--config taskctl.json]
 ```
 
 按文件名顺序处理 `open` 任务：领锁 → 独占工作目录 → 持久化执行身份 → `running` → 会话/交接 → 完成请求 → 验收。全过程打印 `[<id>] <状态> [详情]`。缺少验收时输出 `acceptance-skipped` 并阻塞待审。`running` 孤儿任务只有已确认上一执行结束才能恢复；活跃/不确定记录或缺少执行身份的旧任务会阻塞，不盲目重跑。
 
 同一实际工作目录（含路径别名）不可并行执行；共享 Git common directory 的 worktree 暂按串行处理。当前不自动创建/合并 worktree。验收前后对源码产物做摘要；验收命令改变产物会要求复核，不会把旧检查套到新版本。摘要排除 Git 内部、依赖目录及任务运行时目录（另可用 `artifactIgnore` 忽略任务自产物的路径，见下节）；详见 `src/workspace.ts`。
+
+**控制器日志（`--log`）**：`--log <file>` 把每个 `[<id>] …` 事件行连时间戳 tee 进指定文件（stdout 照常输出；文件目录不存在会自动创建）。不指定时，每个任务的事件行缺省写进它自己的 `tasks/<id>/logs/run-<ISO>.log`（ISO 是本次 run 的启动时刻，`:` 换成 `-` 以便 Windows 文件名）。这取代了以前"外部 `Tee-Object` 到仓库根目录"的做法——控制器日志从此落在任务目录里，不再污染工作区。日志写失败只忽略，不会拖垮 run。
+
+### 产物卫生：LOG_DIR 约定与回合后清扫
+
+真实任务跑完后，工作目录根上常堆着 `_accept_*.log`、`_diag_*.m` 之类的杂物——协议只说"只在此目录内改动"，没说临时文件写哪里。三层解法（`gc` 子命令另立任务）：
+
+1. **约定 + 环境变量**：每个 worker 回合注入 `TASKCTL_TASK_DIR`（= `tasks/<id>`）与 `TASKCTL_LOG_DIR`（= `tasks/<id>/logs`，控制器保证回合前已创建）。工作规则里写死一条：**临时文件与日志一律写 `$TASKCTL_LOG_DIR`；工作目录根目录只放交付物**。worker 会话及其子进程（验收命令、脚本）都能读到这两个变量。
+2. **控制器日志**：见上文 `--log`；缺省逐任务落 `tasks/<id>/logs/`。
+3. **回合后清扫**：每个 worker 回合前后，taskctl 对工作目录**根目录**（非递归）做快照，回合结束后把同时满足以下条件的文件**移动**（只移动，永不删除）到 `tasks/<id>/scratch/`，并在 journal 记 `artifact-swept <from> -> <to>`：
+
+   - 本回合**新增**（回合前快照里没有）；
+   - **未跟踪**（`git status` 报 `??` 或 `!!`——被 `.gitignore` 忽略的也算未跟踪，本机制不依赖 .gitignore）；
+   - 文件名命中 `artifacts.scratchPatterns`；
+   - 不命中任务级 `keep_at_root` 豁免。
+
+   已跟踪文件、回合前就存在的文件、目录一律不碰。scratch 里重名不覆盖（自动加 `-N` 后缀）；跨盘移动退化为复制+删除，仍是移动。清扫失败（含 git 不可用——非 git 工作目录整体惰化）只记 journal（`artifact-sweep-failed` / `artifact-sweep-skipped`），不阻断任务。`artifacts.sweep: false` 整体关闭。
+
+   **注意**：`*.txt` 在缺省 patterns 里——如果任务的交付物本身就是根目录下的 `.txt`/`.log`，要么把文件名写进任务的 `keep_at_root`，要么收紧 `scratchPatterns`，否则交付物会被挪进 scratch（可从 journal 找到落点找回）。
 
 #### 验收的自生成产物：`artifactIgnore` 与 `TASKCTL_ACCEPTANCE_MODE`
 
