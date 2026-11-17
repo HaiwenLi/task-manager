@@ -50,6 +50,7 @@ export type ReviewEvidence = {
 export function buildReviewPrompt(evidence: ReviewEvidence): string {
   return [
     "你是独立复核者。你只能依据下面这些材料判断，不要猜测你没看到的东西。",
+    "你的默认立场是压力测试：先找做不到、说不通、缺证据的地方；不要因为是「完成了」就倾向通过。",
     "",
     "## 任务",
     `标题：${evidence.task.title}`,
@@ -86,9 +87,12 @@ export function buildReviewPrompt(evidence: ReviewEvidence): string {
     "6. 归因为外部变更的差异写进 externalChanges，每条以标准编号开头（如 `C1：表头多出备注列`），说明它影响了哪条；这类差异本身不构成 fail 的理由。",
     "7. 本任务自己该写的东西没写、写错、写少了，必须 fail——外部变更不能当挡箭牌。",
     "8. 时间上从严，但只针对本任务该产出的内容：涉及该写的行、该改对的单元格这类交付内容时，证据说明不了先后的按本任务的问题处理（判 fail 或 unclear），不要替它猜成外部变更；纯属别人追加的结构（多一列、多一个文件）按类别归因，不必证明先后。",
+    "9. 每条 evidence 必须写清楚「读了哪个产物/文件的哪一部分、实际看到了什么」，拿出处和观察说话。只在说不到具体产物、说不出观察时，才允许 evidence 为空——空 evidence 的那条标准判 unclear。",
+    "10. 每个 defects 条目用严重级前缀开头：🔴 是必须返工才能过、🟡 是明显缺陷、🟢 是无关痛痒的挑剔。只有 🔴 或 🟡 可以当作 fail 的理由；如果只有 🟢，不要 fail。",
+    "11. summary 先写你对本任务和验收标准的复述（我要求它做什么、做到什么算过），再写结论。如果你连任务和判据都复述不清楚，或者复述和上面给出的标准对不上，判 unclear——那不是产物的问题，是判据本身没写清楚。",
     "",
     "JSON 形状：",
-    `{"verdict":"pass|fail|unclear","criteria":[{"id":"C1","pass":true,"evidence":"依据"}],"externalChanges":["归因为外部变更的差异"],"defects":["必须修的点"],"summary":"一句话"}`,
+    `{"verdict":"pass|fail|unclear","criteria":[{"id":"C1","pass":true,"evidence":"读了 <文件>，看到 <事实>"}],"externalChanges":["归因为外部变更的差异"],"defects":["🔴 必须修的点 / 🟢 挑剔项"],"summary":"一句话复述你怎么理解本任务与判据，再给结论"}`,
   ].join("\n");
 }
 
