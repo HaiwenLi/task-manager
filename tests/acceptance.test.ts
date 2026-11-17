@@ -62,4 +62,21 @@ describe("runAcceptance", () => {
 
     expect(result).toMatchObject({ passed: false, exitCode: null, skipped: false });
   });
+
+  it("injects TASKCTL_ACCEPTANCE_MODE=generate by default", async () => {
+    // 命令把收到的模式写进文件，验证 env 注入（cmd 与 sh 都走 node，行为一致）
+    const command = `"${process.execPath}" -e "require('fs').writeFileSync('mode.txt', process.env.TASKCTL_ACCEPTANCE_MODE ?? '(unset)')"`;
+
+    await runAcceptance(command, cwd);
+
+    await expect(readFile(join(cwd, "mode.txt"), "utf8")).resolves.toBe("generate");
+  });
+
+  it("injects the explicitly requested mode", async () => {
+    const command = `"${process.execPath}" -e "require('fs').writeFileSync('mode.txt', process.env.TASKCTL_ACCEPTANCE_MODE ?? '(unset)')"`;
+
+    await runAcceptance(command, cwd, "check");
+
+    await expect(readFile(join(cwd, "mode.txt"), "utf8")).resolves.toBe("check");
+  });
 });

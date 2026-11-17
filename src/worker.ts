@@ -496,8 +496,12 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
   const startedAt = new Date().toISOString();
   let result: AcceptanceResult;
   try {
+    // The gate always runs the command in `check` mode: it must verify, not
+    // (re)generate, because the digest comparison below spans the run. The
+    // worker-side invocations default to `generate` and land inside the
+    // attempt window instead (see TASKCTL_ACCEPTANCE_MODE in the README).
     result = await controlled(r, "acceptance", r.cfg.acceptanceTimeoutMs ?? ACCEPTANCE_TIMEOUT_MS_DEFAULT,
-      () => r.deps.acceptance ? legacyExecution(() => r.deps.acceptance!(command, r.cfg.workdir)) : startAcceptance(command, r.cfg.workdir));
+      () => r.deps.acceptance ? legacyExecution(() => r.deps.acceptance!(command, r.cfg.workdir)) : startAcceptance(command, r.cfg.workdir, "check"));
   } catch (err) {
     if (!(err instanceof WorkerTimeoutError)) throw err;
     result = { passed: false, skipped: false, exitCode: null, output: err.message };
@@ -510,7 +514,7 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
     const current = (await r.deps.store.list()).find(t => t.id === r.task.id);
     const definitionMatches = !!current && current.status === "running" && definitionDigest(current) === r.definition;
     const evidence = { attemptId: r.owner, definitionDigest: r.definition, artifactBefore, artifactAfter, command,
-      startedAt, finishedAt: new Date().toISOString(), ...result, model, definitionMatches };
+      mode: "check" as const, startedAt, finishedAt: new Date().toISOString(), ...result, model, definitionMatches };
     await writeRuntime(r.cfg.tasksDir, r.task.id, "acceptance.json", evidence);
     if (!definitionMatches || artifactBefore !== artifactAfter || result.skipped) throw new ReviewRequiredError("acceptance evidence invalidated by definition/artifact drift or skipped check");
     emit(r, "acceptance", result.passed ? "passed" : `failed (exit ${result.exitCode ?? "null"})`);
@@ -832,6 +836,7 @@ function renderAcceptance(record: Record<string, unknown>): string {
     `command: ${value("command")}`,
     `result: ${outcome}`,
     `exitCode: ${value("exitCode")}`,
+    `mode: ${value("mode")}`,
     // The acceptance window is the narrowest slice the reviewer can trust: a
     // workspace that changed outside it changed while someone else had it open.
     `windows: startedAt ${value("startedAt")} finishedAt ${value("finishedAt")}`,
