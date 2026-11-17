@@ -1,7 +1,7 @@
 # 调研：EGM（Elephant-Goldfish Model）审查机制 — 可引入 task-manager 的部分
 
 Date: 2026-11-17
-Scope: 对 EGM 插件（`d:\agent\elephant-goldfish-model`，本机已装到 `C:\Users\GZ11\.agents\plugins\egm\`）做源码级机制分析，判断「它为什么能独立地挖出高质量审查结果」，以及哪些机制值得引入 task-manager 的复核管线（`src/review.ts` 及周边）。
+Scope: 对 EGM 插件（`google/elephant-goldfish-model`，安装根 `<plugin-root>/skills/*`）做源码级机制分析，判断「它为什么能独立地挖出高质量审查结果」，以及哪些机制值得引入 task-manager 的复核管线（`src/review.ts` 及周边）。
 
 性质：本文是本地源码阅读的结论，含作者判断与建议，**未运行任何测试、未做双盲对照**。EGM 官方也明确"review 不替代测试与人类判断"（`README.md:121`）。
 
@@ -199,7 +199,7 @@ EGM 的 `egm-resolve` 对每条 finding 四分类（`resolve/SKILL.md:56-82`）�
 
 ## 6. 关于"另一个 AI 的调研"的判断框架
 
-那份材料不在本机可检索的文件系统里（session 正文存储位置未定位到含 EGM 内容；可能属于另一个 agent 引擎或未落盘）。**建议用下面这个框架核查任何一份 EGM 调研，判断它对不对：**
+那份材料不在此仓库可检索的文件系统里（session 正文存储位置未定位到含 EGM 内容；可能属于另一个 agent 引擎或未落盘）。**建议用下面这个框架核查任何一份 EGM 调研，判断它对不对：**
 
 **对的说法，通常包含且自洽于以下事实**（这些是本源码阅读确认的）：
 1. 核心是「隔离上下文」而非「并行」；parallel 只出现在 review swarm 一处，且有 not-run 语义兜底。
