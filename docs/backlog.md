@@ -6,9 +6,17 @@
 
 更新方式：每跑完一批真实任务，把新发现的问题加进来、把已经不再需要的划掉。**不做**不等于**忘了**，也不需要为了列表变短而做。
 
-最后更新：2026-11-17（车道与验收方式见 [ADR-0009](adr/0009-lanes-and-verification.md)；本轮落地 `artifactIgnore` / `TASKCTL_ACCEPTANCE_MODE` / 复核改动证据，边界见第 4 节）
+最后更新：2026-11-17（`main@a8b74fe`；车道与验收方式见 [ADR-0009](adr/0009-lanes-and-verification.md)；本轮落地 `artifactIgnore` / `TASKCTL_ACCEPTANCE_MODE` / 复核改动证据，边界见第 4 节）
 
 ---
+
+## 方向（2026-11-17 定）
+
+判断标准只有一条：**能不能改变下一次真实任务的结果**。能，就做；不能，或者做起来复杂而收益小，进这张表等触发条件。
+
+所以本期不建新功能。已经加进来的机制——车道、`verify`、渲染检查、EGM 复核规则、返工空转判定——全部只有 fake adapter 下的证据。再加一层功能，只会让"未验证的面积"更大。下一步是拿真任务跑，看哪些机制真的触发、哪些是摆设，数据出来再决定后续。
+
+下面每一项都写了"什么时候值得做"。到那个时刻再做，不是现在。
 
 ## 0. 车道与验收（`feat/task-lanes` 之后）
 
@@ -28,9 +36,21 @@
 | --- | --- | --- |
 | `tsc --noEmit` 类型检查 | **从未执行过** | 本机源码被 TSD 按进程白名单透明加密，同一份文件不同进程看到的字节不同：`node`/`tsx`/`vitest` 在名单里，读到明文（所以测试跑的是真代码）；`tsc` 不在名单里，读到密文，报 `TS1490 File appears to be binary`。`git archive` 导出到 `%TEMP%` 也不管用（写入即加密，与目录无关）。所以"类型正确"目前只有**人工读代码**这一个证据。要验必须在一台不受 TSD 覆盖的机器上跑 |
 | 加密范围不止 `.ts` | 已确认（2026-11-16） | `tests/fixtures/process-tree.mjs`、`tests/adapters/fake-opencode.mjs` 同样是密文存放：本仓的 `read` 工具判定 `binary file`，`graphify update` 报 `not valid UTF-8; read it as latin-1`，而 vitest 照常执行。**看到这类警告不要"另存为 UTF-8"**——那一步会把明文写进磁盘，正好破坏当前的加密状态。代价只是这些文件在知识图谱里没有符号 |
-| 真实环境端到端 | **未跑过** | `modelFallbacks`（429 换模型）和 `tolerate`（运行期别人改表）这两条都是为真实场景写的，但证据全部来自 fake adapter |
+| 真实环境端到端 | **大部分未跑过** | `modelFallbacks`、`tolerate`，以及 2026-11-16/17 新增的车道、`verify`、渲染检查、EGM 复核规则、空转判定，证据全部来自 fake adapter。逐条见 §1.1 |
 
-这两条是"代码可信度"的天花板。在它们补上之前，`300 passed / 1 skipped` 只证明逻辑分支对，不证明类型对、也不证明在真后端下对。
+这两条是"代码可信度"的天花板。在它们补上之前，`307 passed / 1 skipped` 只证明逻辑分支对，不证明类型对、也不证明在真后端下对。
+
+## 1.1 新机制的真实反馈缺口（2026-11-17）
+
+每条都只有 fake adapter 或自制产物下的证据。真跑第一批任务时，就盯这张表：
+
+| 机制 | 不知道的事 | 去哪里看 |
+| --- | --- | --- |
+| `ESCALATE:` 升级 | 真实 worker 会不会写、会不会滥用（每次都说"比预想大"就等于没有信号） | journal 的 `escalated` 条数 / 任务总数 |
+| `verify: render` | 只在自制页面上验过；真实产物会不会误报（管理后台类页面的横向滚动容器）或漏报 | `render.json` 与人工看一眼的差异 |
+| EGM P1 提示词 | 真实 reviewer 是否真按"引具体产物""带严重级""先复述"执行 | `review.json` 的 `criteria[].evidence` 是否像引用，`defects` 有没有 🔴/🟡/🟢 |
+| 返工空转判定 | 真实 reviewer 两轮给同一批 fail 很常见，"worker 没动"与"判据本身写死"在信号上无法区分 | `blocked ... stalled` 出现在哪类任务上 |
+| 快速车道 | 没有 criteria 的快速任务会不会大量停在 `awaiting-human`（等于白跑） | `awaiting-human` 里快速任务的比例 |
 
 顺带一个容易误判的点：`tsc` 读不到源码 ≠ 源码有问题。同一棵树里 `node` 能读到明文、测试 300 条全绿，说明差别在"哪个进程被放行"，不在文件本身。任何工具报"文件损坏/非 UTF-8"时，先确认它是否在 TSD 白名单里，再决定要不要动文件。
 
@@ -55,6 +75,7 @@
 | `reviewerModel` 与 `model` 强制不同 provider | 0.2 天 | 只写进文档，没强制。同 provider 的"独立复核"独立性存疑，但强制会让人用 `--allow-same-provider` 绕过，不如讲清楚 |
 | 恢复面的 ADR | 0.3 天 | `reconcile` / `retry` 的语义（什么能自动恢复、什么必须人工）还没进 `docs/adr/`，目前只在 README 和代码注释里 |
 | `tolerate` 的 CLI 入口 | 0.2 天 | 现在只能改 frontmatter，和 worker 同一条通道——已被定义检查兜住（执行期改定义 → 验收作废），但人工操作也不方便 |
+| README 的复核章节与提示词同步 | 0.1 天 | README 的「复核流水线」还是旧的几条规则，没写 2026-11-17 加的压力测试立场、证据强制、严重级前缀、复述要求。不算错（没写≠写错），但读 README 的人会以为复核还是老样子 |
 
 ## 4. 已交付功能里的已知边界（别当成 bug 报）
 
@@ -92,3 +113,17 @@
 
 - 本地 `refs/private/taskctl-before-publication-20261102-f3bbec6`：发布前的原始备份点，**故意不推**。它保存的是脱敏前的历史，删了就没了追溯退路
 - 远程 tag `p1-review-loop`：上一轮的发布标记，指向 `04be731`，与当前 `main` 无关
+
+## 7. EGM 落地之后：明确不做与遗留（2026-11-17）
+
+调研与取舍的完整推理在 [review mechanisms 调研](research/2026-11-17-egm-review-mechanisms.md)。这里只留结论，避免两处口径不一致。
+
+| 项 | 结论 | 触发条件 |
+| --- | --- | --- |
+| 结构化 severity（枚举 + 迁移历史 `review.json`） | **不做**。提示词软约束够用，准入仍是 pass/fail/unclear 三元；nit 误判由下一轮或人工放行兜底 | 出现"只有挑剔项却 fail、白花一轮"的实际案例 |
+| 独立 `restated` 字段喂归因 | **不做**。判据是给定的（`acceptance` 命令 / `criteria`），不是让 reviewer 理解一份文档；`summary` 里先复述已拿到大部分收益 | `reject` 的 clarify 归因真正开始被使用时 |
+| EGM 的"连续两轮 clean 才收敛" | **不做**，语义错配：taskctl 每轮审的是不同的产物状态，不是同一文档多次抽样 | 永久不做 |
+| P3 透镜层（`verify:human` + `risk:high` 多 lens + 去重合成） | **暂不做**。要先有 disable-model-invocation 闸门，也要有真实返工数据支撑"何时值得多 lens" | 上面两个前提都成立 |
+| 更细的收敛判决（churn、逼近速度、新问题落在刚修好的 scope） | **等数据**。现在只有"空转/逼近"二元 | 攒到足够的真实返工记录（`review_rounds > 0` 的任务样本） |
+
+同一原则在 §0 的分类器上已经用过一次：先跑数据、再设计，不靠猜。
