@@ -153,6 +153,7 @@ function buildTask(overrides: Partial<Task> & { id: string }): Task {
     quick: false,
     verify: "human",
     renderTargets: [],
+    keepAtRoot: [],
     reviewRounds: 0,
     sessions: [],
     retries: 0,

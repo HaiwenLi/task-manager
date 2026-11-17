@@ -79,6 +79,13 @@ export type Task = {
   risk: TaskRisk;
   /** Workspace for this task, relative to the configured workdir. */
   workdir?: string;
+  /**
+   * Root-level filenames this task exempt from the post-turn sweep
+   * (globs in the same dialect as `artifacts.scratchPatterns`). Empty means
+   * nothing is exempt. Not part of the definition digest: it decides where
+   * litter is parked, not what "done" means.
+   */
+  keepAtRoot: string[];
   /** Tasks that must be `done` before this one may be claimed. */
   dependsOn: string[];
   /** Explicit human sign-off regardless of risk. */
@@ -159,6 +166,7 @@ export function parseTaskFile(raw: string, id: string): Task {
     complexity: parseEnum(data, "complexity", COMPLEXITIES, "complex", id),
     risk: parseEnum(data, "risk", RISKS, "normal", id),
     workdir: optionalString(data, "workdir", id),
+    keepAtRoot: parseStringList(data, "keep_at_root", id),
     dependsOn: parseDependsOn(data, id),
     humanCheck: parseHumanCheck(data, id),
     tolerate: parseTolerate(data, id),
@@ -188,6 +196,7 @@ export function serializeTaskFile(task: Task): string {
     complexity: task.complexity,
     ...(task.risk === "high" && { risk: task.risk }),
     ...(task.workdir !== undefined && { workdir: task.workdir }),
+    ...(task.keepAtRoot.length > 0 && { keep_at_root: task.keepAtRoot }),
     ...(task.dependsOn.length > 0 && { depends_on: task.dependsOn }),
     ...(task.humanCheck && { human_check: task.humanCheck }),
     ...(task.tolerate.length > 0 && { tolerate: task.tolerate }),

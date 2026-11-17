@@ -113,6 +113,7 @@ function task(overrides: Partial<Task> = {}): Task {
     quick: false,
     verify: "human",
     renderTargets: [],
+    keepAtRoot: [],
     reviewRounds: 0,
     sessions: [],
     retries: 0,
