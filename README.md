@@ -54,6 +54,8 @@ npx tsx src/main.ts <子命令> [参数]
 | `modelFallbacks` | string[] | `[]` | 模型被 provider 拒绝时依次换用的模型（`provider/model`）。排在任务 `model`（或配置 `model`）之后；没有主模型时整条链为空 |
 | `reviewerModelFallbacks` | string[] | `[]` | 复核会话的降级链，排在 `reviewerModel` 之后；没配 `reviewerModel` 时整条链为空 |
 | `opencodeBin` | string | `opencode` | opencode 可执行文件。**Windows 下 `.cmd` shim 无法被 `shell:false` 直接启动**，应在本地配置实际 `.exe`，不要提交机器专属路径 |
+| `chromeBin` | string | 自动探测 | 渲染验收用的浏览器可执行文件；也可用环境变量 `TASKCTL_CHROME`。找不到时渲染任务 `blocked`，不会当成通过 |
+| `renderViewports` | string[] | `["1440x900","390x844"]` | 渲染验收要过的视口列表 |
 
 ## 任务文件
 
@@ -87,11 +89,39 @@ retries: 0
 | `depends_on` | | 依赖的任务 id；全部 `done` 才会被领取，成环直接报错 |
 | `human_check` | | `true` 时无论风险都要人工放行 |
 | `tolerate` | | 声明**容忍的外部变更种类**：`external_cell_change`、`new_column`、`deleted_row`、`extra_file`。只写这几个值，写错直接报错（打错字不该变成"声明了但什么都没容忍"）。见下节 |
+| `quick` | | `true` 表示**没出 spec、没跑澄清会话**，意图原文就是定义。`taskctl add --quick` 写入；因为没写下任何可核对的判据，这种任务不会自己收尾（见「车道与验收方式」） |
+| `verify` | | 谁来判"做完了"：`human`（默认，独立复核判）、`mechanical`（验收命令退出码判）、`render`（无头浏览器判）。进 `definitionDigest`，中途改会作废本次尝试 |
+| `render_targets` | | `verify: render` 时要打开的页面，相对 `workdir`；`verify: render` 却没有这一项会直接报错 |
 | `review_rounds` | ✓ | 复核失败次数，由 worker 维护 |
 | `sessions` | ✓ | 会话 id 链（按时间顺序追加），由 worker 维护 |
 | `retries` | ✓ | 失败尝试计数，由 worker 维护 |
 
-辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`acceptance.json`（命令、时间、输出、身份摘要与实际使用的模型）、`review.json`（复核判决、模型与被容忍的外部变更）、`models.json`（模型降级链的当前位置）、`done.requested`（完成请求）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
+辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`acceptance.json`（命令、时间、输出、身份摘要与实际使用的模型）、`review.json`（复核判决、模型与被容忍的外部变更）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`done.requested`（完成请求）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
+
+## 车道与验收方式
+
+两个问题分开答：**进来的时候要不要澄清**（车道），和**出去的时候谁说了算**（`verify`）。
+
+| 车道 | 怎么进 | 起点 | 代价 |
+| --- | --- | --- | --- |
+| 标准 | `add "<意图>"` | `draft`，澄清会话出 spec + criteria，等人签字 | 一次模型调用 + 一次签字 |
+| 简单 | `add --simple` 或意图里说「简单任务」 | `open`，仍出 spec | 符号少一次签字 |
+| 快速 | `add --quick` | `open`，**不出 spec、不跑澄清**，意图原文就是定义 | 没有写下来的判据，所以它不会自己收尾 |
+
+三条道都必须能被人或机器判"做完了"，判据由 `verify` 指定：
+
+- `human`（默认）：独立复核会话逐条判 `criteria`。适合结论要读、要解释的工作。
+- `mechanical`：`acceptance` 命令的退出码就是判决，通过即 `done`，不再起复核会话。适合"测试全绿/构建通过"这类工作。
+- `render`：`taskctl verify`（worker 在收尾时也会自己跑）用无头浏览器打开 `render_targets` 里的每个页面，逐个视口要求：**能画出来、有可读内容、不横向溢出、没有未捕获异常**。截图留在 `tasks/<id>/evidence/`。适合"产物是给人看的"工作——复核读的是代码和 diff，看不见白屏和溢出。
+
+`verify: render` 找不到浏览器时任务 `blocked`，并写明原因：**没跑成的检查不算通过**。
+
+**升级只会往上走。** 一个快速/简单任务在执行中可能被证明"不是那么简单"，两条触发线都是运行期事实，不靠事前猜：
+
+- 执行者在自己回合里写下 `ESCALATE: <理由>`；
+- 会话回合用尽或上下文告满需要交接（说明这事一次没干完）。
+
+触发后本次尝试**照样可以继续**，但不再能用自己产出的证据收尾——一律进复核。任务文件里的 `verify` 不改，`definitionDigest` 不变，所以升级本身不会让正在跑的尝试作废；理由记进 journal（`event: escalated`），`board`/`report` 可查。这个方向是刻意的：执行者能要求"多看一道"，不能要求"少看一道"。
 
 ## 复核流水线
 
@@ -237,6 +267,6 @@ E2E 前置：本机 opencode 已安装并登录；Windows 下测试会自动解�
 
 ## 设计文档
 
-见 `docs/adr/`（任务存储与文件锁、独立编排器、会话链交接、TypeScript 薄编排器、验收门等决策记录）。
+见 `docs/adr/`（任务存储与文件锁、独立编排器、会话链交接、TypeScript 薄编排器、验收门、车道与验收方式等决策记录）。
 
 **有意没做的事、以及已交付功能的边界**单独记在 [docs/backlog.md](docs/backlog.md)：`tsc` 在本机为何跑不了、`tolerate` 词表缺哪些、降级链没有退避、`retry` 的会话死循环等。做新功能前先看那份——避免把"没做"当成"忘了"，也避免把当前实现信得比实际更足。
