@@ -129,10 +129,15 @@ async function readRegistry(registryDir: string): Promise<ReservationRecord[]> {
 
 async function gitCommonDir(canonical: string): Promise<string | null> {
   try {
-    const { stdout } = await exec("git", ["-C", canonical, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+    // `--path-format=absolute` needs Git 2.31+; a 2.28 install echoes the
+    // unknown flag back as a path (realpath then fails). Ask without it and
+    // resolve the possibly-relative answer against the -C directory.
+    const { stdout } = await exec("git", ["-C", canonical, "rev-parse", "--git-common-dir"], {
       env: { ...process.env, LC_ALL: "C" },
     });
-    return await realpath(stdout.replace(/\r?\n$/, ""));
+    const raw = stdout.replace(/\r?\n$/, "");
+    if (raw.length === 0) return null;
+    return await realpath(isAbsolute(raw) ? raw : resolve(canonical, raw));
   } catch (error) {
     // Other failures (unsafe repository, unreadable Git metadata, missing Git)
     // must fail closed rather than accidentally reserve only one worktree.
