@@ -15,6 +15,7 @@ import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
 import { chainPosition, modelAt, modelChain, readModelRotation, rotateModel, type Handover, type ModelRole } from "./models.js";
 import { startReview, type CriterionResult, type ReviewEvidence, type ReviewResult } from "./review.js";
+import { collectChangeEvidence } from "./changes.js";
 import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck } from "./render.js";
 
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
@@ -639,12 +640,18 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
     return "awaiting-human";
   }
   const acceptance = await readRuntime<Record<string, unknown>>(r.cfg.tasksDir, id, "acceptance.json");
+  // The reviewer judges text, so the workspace's own footprint — what the
+  // worker (and anyone else) changed — is collected as text too. Never throws:
+  // a non-Git workdir yields explicit unavailable notes instead of blocking
+  // the review.
+  const changes = await collectChangeEvidence(r.cfg.workdir);
   const evidence: ReviewEvidence = {
     task: r.task,
     spec: (await readSpec(r.cfg.tasksDir, id)) ?? "",
     acceptanceMarkdown: acceptance === null ? "" : renderAcceptance(acceptance),
     handoff: (await latestNote(r.cfg.tasksDir, id))?.markdown ?? null,
     journal: await journalTail(r.cfg.tasksDir, id, 30),
+    changes,
     window: { startedAt: r.record.startedAt, finishedAt: new Date().toISOString() },
   };
   emit(r, "reviewing");
@@ -693,6 +700,10 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
         model: reviewerModel,
         tolerate: r.task.tolerate,
         definitionDigest: r.definition,
+        // What the reviewer actually saw, for post-mortems: the exact
+        // (already-truncated) change list and diffstat injected into the
+        // prompt, not a re-collection that may since have changed.
+        evidence: { gitStatus: changes.status, gitDiffStat: changes.diffStat },
         at: new Date().toISOString(),
       });
       await appendJournal(r.cfg.tasksDir, id, {
