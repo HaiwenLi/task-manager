@@ -48,6 +48,28 @@ describe("resolveConfig", () => {
     expect(() => resolveConfig({ parallel: 0 }, "taskctl.json")).toThrow(/positive/);
   });
 
+  it("resolves the artifacts block with the confirmed defaults", () => {
+    expect(resolveConfig({}, "taskctl.json").artifacts).toEqual({
+      sweep: true,
+      scratchPatterns: ["*.log", "*.tmp", "_*", "*.sha", "*.txt"],
+    });
+    expect(resolveConfig({ artifacts: { sweep: false } }, "taskctl.json").artifacts).toEqual({
+      sweep: false,
+      scratchPatterns: ["*.log", "*.tmp", "_*", "*.sha", "*.txt"],
+    });
+    expect(resolveConfig({ artifacts: { scratchPatterns: ["*.csv"] } }, "taskctl.json").artifacts).toEqual({
+      sweep: true,
+      scratchPatterns: ["*.csv"],
+    });
+  });
+
+  it("rejects malformed artifacts blocks", () => {
+    expect(() => resolveConfig({ artifacts: "nope" }, "taskctl.json")).toThrow(/artifacts/);
+    expect(() => resolveConfig({ artifacts: { sweep: "false" } }, "taskctl.json")).toThrow(/sweep.*boolean/);
+    expect(() => resolveConfig({ artifacts: { scratchPatterns: "x" } }, "taskctl.json")).toThrow(/scratchPatterns/);
+    expect(() => resolveConfig({ artifacts: { unknown: true } }, "taskctl.json")).toThrow(/unknown artifacts field/);
+  });
+
   it("rejects unknown fields", () => {
     expect(() => resolveConfig({ nope: 1 }, "taskctl.json")).toThrow(/unknown field/);
   });

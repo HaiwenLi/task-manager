@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -303,6 +303,48 @@ describe("taskctl run", () => {
 
     expect(code).toBe(1);
     expect(cap.errors.join("\n")).toContain("invalid JSON");
+  });
+
+  it("缺省把逐任务输出写进 <taskDir>/logs/run-<ISO>.log（C2）", async () => {
+    await seedTask("t1");
+    const config = await writeConfig({ tasksDir, workdir: dir });
+    const adapter = new DoneMarkingAdapter(tasksDir);
+    const cap = capture();
+
+    const code = await runCli(["run", "--config", config], { adapter, ...cap.deps });
+
+    expect(code).toBe(0);
+    const logsDir = join(tasksDir, "t1", "logs");
+    const runs = (await readdir(logsDir)).filter((name) => /^run-.+\.log$/.test(name));
+    expect(runs).toHaveLength(1);
+    const raw = await readFile(join(logsDir, runs[0]!), "utf8");
+    expect(raw).toContain("[t1] running");
+    // tee 而不是重定向：stdout 照常输出
+    expect(cap.lines).toContain("[t1] running");
+  });
+
+  it("--log <file> 把全部任务行 tee 到指定文件（C2）", async () => {
+    await seedTask("t1");
+    const config = await writeConfig({ tasksDir, workdir: dir });
+    const adapter = new DoneMarkingAdapter(tasksDir);
+    const cap = capture();
+    const logFile = join(dir, "nested", "controller.log");
+
+    const code = await runCli(["run", "--log", logFile, "--config", config], { adapter, ...cap.deps });
+
+    expect(code).toBe(0);
+    const raw = await readFile(logFile, "utf8");
+    expect(raw).toContain("[t1] running");
+    expect(cap.lines).toContain("[t1] running");
+    // 指定了 --log 就不再写逐任务缺省日志（logs 目录仍由 LOG_DIR 约定创建）
+    const perTask = (await readdir(join(tasksDir, "t1", "logs")).catch(() => [] as string[]))
+      .filter((name) => name.startsWith("run-"));
+    expect(perTask).toHaveLength(0);
+  });
+
+  it("--log 缺值 → exit 2", async () => {
+    const cap = capture();
+    await expect(runCli(["run", "--log"], cap.deps)).resolves.toBe(2);
   });
 
   it("未知 agent → exit 1（v0.1 只有 opencode）", async () => {

@@ -1,5 +1,5 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { LOCK_TTL_MS_DEFAULT } from "./claim.js";
 import { latestNote, writeNote } from "./handoff.js";
 import { TaskStore } from "./task-store.js";
@@ -20,6 +20,7 @@ import { readRuntime } from "./runtime.js";
 import { reconcileTask, retryTask } from "./reconcile.js";
 import { checkRender, describeFailures, RenderUnavailableError, DEFAULT_VIEWPORTS } from "./render.js";
 import { taskWorkdir } from "./scheduler.js";
+import { resolveArtifacts } from "./artifacts.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
 export type CliDeps = {
@@ -41,7 +42,7 @@ const USAGE = [
   "  taskctl add \"<意图>\" [--type code|office|research|design] [--simple] [--quick] [--verify human|mechanical|render] [--target <a.html,b.html>] [--id <id>] [--config taskctl.json]",
   "  taskctl spec --task <id> [--tasks-dir <dir>]",
   "  taskctl approve --task <id> [--tasks-dir <dir>]",
-  "  taskctl run [--config taskctl.json]",
+  "  taskctl run [--log <file>] [--config taskctl.json]",
   "  taskctl verify --task <id> [--viewport 1440x900,390x844] [--config taskctl.json]",
   "  taskctl done --task <id> [--tasks-dir <dir>]",
   "  taskctl note --task <id> --status <s> --done <d> --found <f> --next <n> [--files <a,b>] [--tasks-dir <dir>]",
@@ -120,7 +121,7 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
       checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return approveCommand(flags, log);
     case "run":
-      checkFlags(command, flags, ["config"], []);
+      checkFlags(command, flags, ["config", "log"], []);
       return runCommand(flags, deps, log);
     case "verify":
       checkFlags(command, flags, ["task", "viewport", "tasks-dir", "config"], ["task"]);
@@ -181,6 +182,26 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   const cfg = resolveConfig(await readConfig(configPath), configPath);
   const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
   const store = new TaskStore(cfg.tasksDir);
+  // Controller log: with --log every event line is teed to one operator-chosen
+  // file; by default each task's lines land in its own task dir under logs/.
+  // This replaces the external `Tee-Object` into the workspace root that
+  // motivated task 006 — the controller now keeps its own hygiene.
+  const runStamp = new Date().toISOString().replaceAll(":", "-");
+  const teeTarget = flags.get("log") !== undefined ? resolve(flags.get("log")!) : undefined;
+  if (teeTarget !== undefined) {
+    await mkdir(dirname(teeTarget), { recursive: true });
+    await writeFile(teeTarget, "", { flag: "a" });
+  }
+  let logJob: Promise<unknown> = Promise.resolve();
+  const writeLogLine = (taskId: string, line: string): void => {
+    const target = teeTarget ?? join(cfg.tasksDir, taskId, "logs", `run-${runStamp}.log`);
+    logJob = logJob.then(async () => {
+      await mkdir(dirname(target), { recursive: true });
+      await appendFile(target, `${new Date().toISOString()}  ${line}\n`, "utf8");
+    }).catch(() => {
+      // A log write that cannot happen must not take the run down with it.
+    });
+  };
   // The board is rewritten on every event, so a browser watching board.md sees
   // tasks move while the run is still going. Writes are chained, never racing.
   let boardJob: Promise<unknown> = Promise.resolve();
@@ -195,12 +216,15 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
     adapter,
     ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
     onEvent: (evt) => {
-      log(`[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`);
+      const line = `[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`;
+      log(line);
+      writeLogLine(evt.taskId, line);
       refreshBoard();
     },
   });
   refreshBoard();
   await boardJob;
+  await logJob;
   return 0;
 }
 
@@ -311,6 +335,7 @@ async function addCommand(
     complexity,
     risk,
     ...(workdir !== undefined && { workdir }),
+    keepAtRoot: [],
     ...(acceptance !== undefined && { acceptance }),
     dependsOn: [],
     humanCheck: false,
@@ -793,6 +818,7 @@ const CONFIG_KEYS = new Set([
   "modelFallbacks",
   "reviewerModelFallbacks",
   "artifactIgnore",
+  "artifacts",
   "parallel",
   "opencodeBin",
   "chromeBin",
@@ -830,6 +856,7 @@ export function resolveConfig(raw: Record<string, unknown>, path: string): Resol
     modelFallbacks: stringArray(raw, "modelFallbacks", path),
     reviewerModelFallbacks: stringArray(raw, "reviewerModelFallbacks", path),
     artifactIgnore: stringArray(raw, "artifactIgnore", path),
+    artifacts: resolveArtifacts(raw.artifacts, path),
     parallel: integer(raw, "parallel", path),
     opencodeBin: string(raw, "opencodeBin", path),
     chromeBin: string(raw, "chromeBin", path),

@@ -10,6 +10,7 @@ export function buildTaskFile(overrides: Partial<Task> & { id: string; title?: s
     description: "",
     criteria: [],
     workdir: undefined,
+    keepAtRoot: [],
     dependsOn: [],
     humanCheck: false,
     tolerate: [],

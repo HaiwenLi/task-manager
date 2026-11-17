@@ -71,6 +71,7 @@ export class OpenCodeAdapter implements AgentAdapter {
     ];
     const child = spawn(this.bin, [...this.binArgsPrefix, ...argv], {
       cwd: args.cwd, shell: false, detached: process.platform !== "win32",
+      ...(args.env === undefined ? {} : { env: { ...process.env, ...args.env } }),
     });
 
     let sessionId = args.sessionId ?? "";
