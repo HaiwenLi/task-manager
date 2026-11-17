@@ -153,4 +153,78 @@ describe("worker review stage", () => {
     await runTask(config({ maxReviewRounds: 2 }), deps, await store.get("a"), "w1");
     expect((await store.get("a")).status).toBe("blocked");
   });
+
+  it("a stalled rework (same failing criterion, nothing moved) blocks early", async () => {
+    await seed({ criteria: ["C1 ok", "C2 ok"], reviewRounds: 1 });
+    // A worker that made no change: C1 still fails, C2 still passes, same as
+    // the previous round recorded in review.json below.
+    const unchanged: ReviewResult = {
+      verdict: "fail",
+      criteria: [
+        { id: "C1", pass: false, evidence: "exit 1" },
+        { id: "C2", pass: true, evidence: "ok" },
+      ],
+      externalChanges: [],
+      defects: ["C1 还是没修"],
+      summary: "未达 C1",
+    };
+    const deps = { store, adapter: adapter(), acceptance: pass, review: verdict(unchanged) };
+
+    // Seed the previous round's review.json so the stall check has something to
+    // compare against (the same failing set).
+    await mkdir(join(tasks, "a"), { recursive: true });
+    const { writeRuntime } = await import("../src/runtime.js");
+    await writeRuntime(tasks, "a", "review.json", {
+      ...unchanged,
+      model: "m",
+      tolerate: [],
+      definitionDigest: "d",
+      at: new Date().toISOString(),
+    });
+
+    await runTask(config({ maxReviewRounds: 5 }), deps, await store.get("a"), "w1");
+    const task = await store.get("a");
+    expect(task.status).toBe("blocked");
+    // Not incremented further: the stall is its own terminal, before another round.
+    expect(task.reviewRounds).toBe(1);
+  });
+
+  it("a progressing rework (a criterion flipped or a new one failed) keeps reworking", async () => {
+    await seed({ criteria: ["C1 ok", "C2 ok"], reviewRounds: 1 });
+    // The worker fixed C1 but broke C2: criterion set changed, so it's progress
+    // (touching new ground), not a stall.
+    const flipped: ReviewResult = {
+      verdict: "fail",
+      criteria: [
+        { id: "C1", pass: true, evidence: "ok" },
+        { id: "C2", pass: false, evidence: "regression" },
+      ],
+      externalChanges: [],
+      defects: ["C2 新问题"],
+      summary: "C2 回升错误",
+    };
+    const deps = { store, adapter: adapter(), acceptance: pass, review: verdict(flipped) };
+
+    await mkdir(join(tasks, "a"), { recursive: true });
+    const { writeRuntime } = await import("../src/runtime.js");
+    await writeRuntime(tasks, "a", "review.json", {
+      verdict: "fail",
+      criteria: [
+        { id: "C1", pass: false, evidence: "exit 1" },
+        { id: "C2", pass: true, evidence: "ok" },
+      ],
+      externalChanges: [],
+      defects: ["C1 没修"],
+      summary: "未达 C1",
+      model: "m",
+      tolerate: [],
+      definitionDigest: "d",
+      at: new Date().toISOString(),
+    });
+
+    await runTask(config({ maxReviewRounds: 5 }), deps, await store.get("a"), "w1");
+    const task = await store.get("a");
+    expect(task.status).toBe("open");
+    expect(task.reviewRounds).toBe(2);
+  });
 });

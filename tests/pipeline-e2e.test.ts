@@ -32,18 +32,36 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
-function scriptedAgent(verdict: "pass" | "fail"): AgentAdapter {
+function scriptedAgent(verdict: "pass" | "fail" | "alternating-fail"): AgentAdapter {
+  let reviewCount = 0;
   return {
     prompt: async (args) => {
       if (args.text.includes("任务澄清助手")) {
         calls.push("clarify");
-        return { sessionId: "s-clarify", exitCode: 0, text: "## 目标\n完成改版\n## 验收标准\n- C1 artifact.txt 存在\n## 边界\n无" };
+        return { sessionId: "s-clarify", exitCode: 0, text: "## 目标\n完成改版\n## 验收标准\n- C1 artifact.txt 存在\n- C2 无残留文件\n## 边界\n无" };
       }
       if (args.text.includes("独立复核者")) {
         calls.push("review");
-        const result = verdict === "pass"
-          ? { verdict: "pass", criteria: [{ id: "C1", pass: true, evidence: "artifact.txt 存在" }], defects: [], summary: "通过" }
-          : { verdict: "fail", criteria: [{ id: "C1", pass: false, evidence: "artifact.txt 缺失" }], defects: ["没有产物"], summary: "未达标" };
+        reviewCount += 1;
+        let result: unknown;
+        if (verdict === "pass") {
+          result = { verdict: "pass", criteria: [{ id: "C1", pass: true, evidence: "artifact.txt 存在" }, { id: "C2", pass: true, evidence: "干净" }], defects: [], summary: "通过" };
+        } else if (verdict === "fail") {
+          result = { verdict: "fail", criteria: [{ id: "C1", pass: false, evidence: "artifact.txt 缺失" }, { id: "C2", pass: true, evidence: "干净" }], defects: ["没有产物"], summary: "未达标" };
+        } else {
+          // alternating-fail: flip which criterion fails each round, so the
+          // failing set always differs from the previous round (no stall).
+          const c1fail = reviewCount % 2 === 1;
+          result = {
+            verdict: "fail",
+            criteria: [
+              { id: "C1", pass: !c1fail, evidence: c1fail ? "artifact.txt 缺失" : "存在" },
+              { id: "C2", pass: c1fail, evidence: c1fail ? "干净" : "有残留" },
+            ],
+            defects: [c1fail ? "C1 缺失" : "C2 有残留"],
+            summary: "未达标",
+          };
+        }
         return { sessionId: "s-review", exitCode: 0, text: JSON.stringify(result) };
       }
       calls.push("worker");
@@ -102,7 +120,10 @@ describe("pipeline end to end through the CLI", () => {
 
   it("a failing review spends a round and ends blocked at the limit", async () => {
     const cfgPath = await writeConfig();
-    const agent = scriptedAgent("fail");
+    // A worker that keeps changing the failing criterion (C1 <-> C2) is not
+    // stalled — it is touching new ground each round — so the rework loop runs
+    // until maxReviewRounds, then blocks. The stall check must not fire here.
+    const agent = scriptedAgent("alternating-fail");
     await runCli(
       ["add", "复杂任务：改登录页", "--acceptance", "check", "--config", cfgPath, "--id", "001-login"],
       { ...silent, adapter: agent },
