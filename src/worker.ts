@@ -10,6 +10,10 @@ import type { Task } from "./task-file.js";
 import type { AgentAdapter, PromptResult } from "./adapters/types.js";
 import type { Execution } from "./execution.js";
 import { reserveWorkspace, artifactDigest, type WorkspaceReservation } from "./workspace.js";
+import {
+  artifactsOrDefault, logDirOf, scratchDirOf, snapshotRoot, sweepRoot, taskDirOf,
+  LOG_DIR_ENV, TASK_DIR_ENV, type ArtifactsConfig, type SweepOutcome,
+} from "./artifacts.js";
 import { definitionDigest, readAttempt, readRuntime, writeRuntime, type AttemptRecord } from "./runtime.js";
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
@@ -55,6 +59,12 @@ export type WorkerConfig = {
   renderViewports?: string[];
   /** Browser binary for render checks; auto-detected when absent. */
   chromeBin?: string;
+  /**
+   * Artifact hygiene: post-turn sweep of the workspace root. Absent means the
+   * defaults (sweep on, `DEFAULT_SCRATCH_PATTERNS`); resolved from the
+   * `artifacts` block of `taskctl.json`.
+   */
+  artifacts?: ArtifactsConfig;
 };
 export type WorkerStore = Pick<TaskStore, "list" | "setStatus" | "appendSession" | "incRetries" | "readDoneMarker" | "clearDoneMarker" | "incReviewRounds">;
 export type WorkerDeps = {
@@ -80,6 +90,11 @@ type Run = {
    * off for this attempt: an escalated run may not finish on its own evidence.
    */
   escalated: boolean;
+  /**
+   * The inert-sweep reason (e.g. non-Git workdir) is journaled once per
+   * attempt, not once per turn — every turn would only repeat the same line.
+   */
+  sweepSkipNoted: boolean;
 };
 const emit = (r: Run, type: WorkerEventType, detail?: string) => r.deps.onEvent?.({ type, taskId: r.task.id, detail });
 const owned = <T>(r: Run, fn: () => Promise<T>) => withOwnership(r.cfg.tasksDir, r.task.id, r.owner, fn);
@@ -103,7 +118,7 @@ export async function runTask(cfg: WorkerConfig, deps: WorkerDeps, task: Task, w
   let notifyLost!: () => void;
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
   const now = new Date().toISOString();
-  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false,
+  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, sweepSkipNoted: false,
     record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing" } };
   let reservation: WorkspaceReservation | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -337,7 +352,15 @@ async function fallBack(r: Run, role: ModelRole, reason: string): Promise<boolea
  * both branches reach the caller's provider check.
  */
 async function turn(r: Run, text: string, model: string | undefined, sessionId?: string): Promise<PromptResult & { timedOut: boolean }> {
-  const args = { sessionId, text, model, effort: r.task.effort ?? r.cfg.effort, title: r.task.title, cwd: r.cfg.workdir };
+  const taskDir = taskDirOf(r.cfg.tasksDir, r.task.id);
+  const logDir = logDirOf(r.cfg.tasksDir, r.task.id);
+  // The convention the protocol copy promises: $TASKCTL_LOG_DIR exists before
+  // the worker is asked to write into it, every turn (also after handoffs).
+  await mkdir(logDir, { recursive: true });
+  const args = {
+    sessionId, text, model, effort: r.task.effort ?? r.cfg.effort, title: r.task.title, cwd: r.cfg.workdir,
+    env: { [TASK_DIR_ENV]: taskDir, [LOG_DIR_ENV]: logDir },
+  };
   try {
     return { ...await controlled(r, "agent turn", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT,
       () => r.deps.adapter.start ? r.deps.adapter.start(args) : legacyExecution(() => r.deps.adapter.prompt(args)),
@@ -348,6 +371,64 @@ async function turn(r: Run, text: string, model: string | undefined, sessionId?:
     await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
     return { sessionId: "", text: "", exitCode: -1, timedOut: true };
   }
+}
+
+/**
+ * One worker turn bracketed by the artifact sweep: snapshot the workspace root
+ * before dispatch, move this turn's new litter into `<taskDir>/scratch/`
+ * after. The snapshot/sweep pair is what "本轮新增" means — pre-existing and
+ * tracked files can never qualify, whatever they match.
+ */
+async function workedTurn(r: Run, text: string, model: string | undefined, sessionId?: string): Promise<PromptResult & { timedOut: boolean }> {
+  const sweepOn = artifactsOrDefault(r.cfg.artifacts).sweep;
+  const before = sweepOn ? await snapshotRoot(r.cfg.workdir) : null;
+  const result = await turn(r, text, model, sessionId);
+  if (before !== null) await sweepAfterTurn(r, before);
+  return result;
+}
+
+/**
+ * Park this turn's litter and journal what happened. Sweep problems are facts
+ * about hygiene, not about the task: every failure is journaled and the run
+ * continues (the files simply stay where they are — nothing is ever deleted).
+ */
+async function sweepAfterTurn(r: Run, before: ReadonlySet<string>): Promise<void> {
+  let outcome: SweepOutcome;
+  try {
+    const cfg = artifactsOrDefault(r.cfg.artifacts);
+    outcome = await sweepRoot({
+      workdir: r.cfg.workdir,
+      scratchDir: scratchDirOf(r.cfg.tasksDir, r.task.id),
+      before,
+      patterns: cfg.scratchPatterns,
+      keepAtRoot: r.task.keepAtRoot,
+    });
+  } catch (error) {
+    await journalSweep(r, "artifact-sweep-failed", error instanceof Error ? error.message : String(error));
+    return;
+  }
+  if (outcome.skipped !== undefined) {
+    // The inert reason (e.g. a non-Git workdir) is the same every turn:
+    // journal it once per attempt, then stay quiet.
+    if (!r.sweepSkipNoted) {
+      r.sweepSkipNoted = true;
+      await journalSweep(r, "artifact-sweep-skipped", outcome.skipped);
+    }
+    return;
+  }
+  for (const move of outcome.moved) {
+    await journalSweep(r, "artifact-swept", `${move.from} -> ${move.to}`);
+  }
+  for (const failure of outcome.failures) {
+    await journalSweep(r, "artifact-sweep-failed", `${failure.file}: ${failure.error}`);
+  }
+}
+
+/** Journal one sweep fact; a journaling failure must not fail the task. */
+async function journalSweep(r: Run, event: string, detail: string): Promise<void> {
+  try {
+    await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, { stage: "worker", event, detail }));
+  } catch { /* journal unavailable; the sweep itself already happened */ }
 }
 
 async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
@@ -361,9 +442,12 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
   let handovers = 0;
   for (;;) {
     const note = await latestNote(r.cfg.tasksDir, r.task.id);
-    const prompt = buildWorkerPrompt(r.task, { handoff: note?.markdown, workdir: r.cfg.workdir, tasksDir: r.cfg.tasksDir });
+    const prompt = buildWorkerPrompt(r.task, {
+      handoff: note?.markdown, workdir: r.cfg.workdir, tasksDir: r.cfg.tasksDir,
+      taskDir: taskDirOf(r.cfg.tasksDir, r.task.id), logDir: logDirOf(r.cfg.tasksDir, r.task.id),
+    });
     const model = await modelFor(r, "worker");
-    const result = await turn(r, prompt, model, sessionId);
+    const result = await workedTurn(r, prompt, model, sessionId);
     await owned(r, async () => {
       // A rejected turn did no work, and its session belongs to the backend that
       // refused it: recording it would both spend a session and hand the next
@@ -403,7 +487,7 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       fresh = true;
     } else if (await overBudget(r, sessionId, model)) {
       await escalate(r, "context budget exhausted; a session handoff was needed");
-      const wrap = await turn(r, WRAP_UP_INSTRUCTION, model, sessionId);
+      const wrap = await workedTurn(r, WRAP_UP_INSTRUCTION, model, sessionId);
       const after = await latestNote(r.cfg.tasksDir, r.task.id);
       if (!after || after.seq <= (note?.seq ?? 0)) {
         if (wrap.failure === "provider") {
