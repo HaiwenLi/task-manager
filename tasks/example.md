@@ -1,4 +1,5 @@
 ---
+schema: taskctl/v1
 id: example
 title: 创建 hello.txt
 status: open
