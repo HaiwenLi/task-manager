@@ -11,6 +11,22 @@ export type AcceptanceResult =
   | { passed: false; skipped: true };
 
 /**
+ * How the acceptance gate tells the command *why* it is being run.
+ *
+ * `generate` is the default whenever the variable is absent: the command may
+ * write or refresh its artifacts (the worker self-checking mid-attempt runs
+ * this way, and so does any plain manual invocation). `check` is what the
+ * orchestrator's gate injects: the command must only read and verify, because
+ * the gate compares the workspace digest across the run and a write would read
+ * as drift. Splitting the two is what lets a task whose acceptance command
+ * produces `report.json`-style artifacts survive its own gate.
+ */
+export type AcceptanceMode = "generate" | "check";
+
+/** Environment variable carrying {@link AcceptanceMode} to the command. */
+export const ACCEPTANCE_MODE_ENV = "TASKCTL_ACCEPTANCE_MODE";
+
+/**
  * Run a task's `acceptance:` shell command in `cwd`: exit 0 passes, anything
  * else fails. This is the trust boundary of ADR-0006 — an agent's self-report
  * only triggers this check; it never flips status by itself. Deciding what a
@@ -21,12 +37,12 @@ export type AcceptanceResult =
  * command (task has no `acceptance` field) skips the gate with
  * `{passed: false, skipped: true}`; logging the warning is the caller's job.
  */
-export async function runAcceptance(command: string, cwd: string): Promise<AcceptanceResult> {
-  return startAcceptance(command, cwd).result;
+export async function runAcceptance(command: string, cwd: string, mode: AcceptanceMode = "generate"): Promise<AcceptanceResult> {
+  return startAcceptance(command, cwd, mode).result;
 }
 
 /** Start the gate immediately and expose its process lifecycle to the worker. */
-export function startAcceptance(command: string, cwd: string): Execution<AcceptanceResult> {
+export function startAcceptance(command: string, cwd: string, mode: AcceptanceMode = "generate"): Execution<AcceptanceResult> {
   if (command.trim().length === 0) {
     return {
       result: Promise.resolve({ passed: false, skipped: true }),
@@ -39,6 +55,7 @@ export function startAcceptance(command: string, cwd: string): Execution<Accepta
     cwd,
     shell: false,
     detached: !isWindows,
+    env: { ...process.env, [ACCEPTANCE_MODE_ENV]: mode },
     windowsVerbatimArguments: isWindows,
   });
 

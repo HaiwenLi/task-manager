@@ -15,6 +15,7 @@ import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
 import { chainPosition, modelAt, modelChain, readModelRotation, rotateModel, type Handover, type ModelRole } from "./models.js";
 import { startReview, type CriterionResult, type ReviewEvidence, type ReviewResult } from "./review.js";
+import { collectChangeEvidence } from "./changes.js";
 import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck } from "./render.js";
 
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
@@ -43,6 +44,11 @@ export type WorkerConfig = {
   modelFallbacks?: string[];
   /** Models to try, in order, when a provider rejects the reviewer's model. */
   reviewerModelFallbacks?: string[];
+  /**
+   * Workspace-relative paths or globs excluded from the acceptance drift
+   * digest — the paths a task's own acceptance command is expected to write.
+   */
+  artifactIgnore?: string[];
   /** How many tasks the scheduler may run at once (default 2). */
   parallel?: number;
   /** Viewports a `verify: render` task must pass (default 1440x900 and 390x844). */
@@ -487,17 +493,21 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
     }));
     return await reviewStage(r);
   }
-  const artifactBefore = await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir]);
+  const artifactBefore = await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir], r.cfg.artifactIgnore ?? []);
   const startedAt = new Date().toISOString();
   let result: AcceptanceResult;
   try {
+    // The gate always runs the command in `check` mode: it must verify, not
+    // (re)generate, because the digest comparison below spans the run. The
+    // worker-side invocations default to `generate` and land inside the
+    // attempt window instead (see TASKCTL_ACCEPTANCE_MODE in the README).
     result = await controlled(r, "acceptance", r.cfg.acceptanceTimeoutMs ?? ACCEPTANCE_TIMEOUT_MS_DEFAULT,
-      () => r.deps.acceptance ? legacyExecution(() => r.deps.acceptance!(command, r.cfg.workdir)) : startAcceptance(command, r.cfg.workdir));
+      () => r.deps.acceptance ? legacyExecution(() => r.deps.acceptance!(command, r.cfg.workdir)) : startAcceptance(command, r.cfg.workdir, "check"));
   } catch (err) {
     if (!(err instanceof WorkerTimeoutError)) throw err;
     result = { passed: false, skipped: false, exitCode: null, output: err.message };
   }
-  const artifactAfter = await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir]);
+  const artifactAfter = await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir], r.cfg.artifactIgnore ?? []);
   // All controller writers use the same mutex as takeover for final validation/write.
   // The review runs outside this guard: it takes the same mutex for its own
   // writes, and nesting would deadlock the task against itself.
@@ -505,7 +515,7 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
     const current = (await r.deps.store.list()).find(t => t.id === r.task.id);
     const definitionMatches = !!current && current.status === "running" && definitionDigest(current) === r.definition;
     const evidence = { attemptId: r.owner, definitionDigest: r.definition, artifactBefore, artifactAfter, command,
-      startedAt, finishedAt: new Date().toISOString(), ...result, model, definitionMatches };
+      mode: "check" as const, startedAt, finishedAt: new Date().toISOString(), ...result, model, definitionMatches };
     await writeRuntime(r.cfg.tasksDir, r.task.id, "acceptance.json", evidence);
     if (!definitionMatches || artifactBefore !== artifactAfter || result.skipped) throw new ReviewRequiredError("acceptance evidence invalidated by definition/artifact drift or skipped check");
     emit(r, "acceptance", result.passed ? "passed" : `failed (exit ${result.exitCode ?? "null"})`);
@@ -630,12 +640,18 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
     return "awaiting-human";
   }
   const acceptance = await readRuntime<Record<string, unknown>>(r.cfg.tasksDir, id, "acceptance.json");
+  // The reviewer judges text, so the workspace's own footprint — what the
+  // worker (and anyone else) changed — is collected as text too. Never throws:
+  // a non-Git workdir yields explicit unavailable notes instead of blocking
+  // the review.
+  const changes = await collectChangeEvidence(r.cfg.workdir);
   const evidence: ReviewEvidence = {
     task: r.task,
     spec: (await readSpec(r.cfg.tasksDir, id)) ?? "",
     acceptanceMarkdown: acceptance === null ? "" : renderAcceptance(acceptance),
     handoff: (await latestNote(r.cfg.tasksDir, id))?.markdown ?? null,
     journal: await journalTail(r.cfg.tasksDir, id, 30),
+    changes,
     window: { startedAt: r.record.startedAt, finishedAt: new Date().toISOString() },
   };
   emit(r, "reviewing");
@@ -684,6 +700,10 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
         model: reviewerModel,
         tolerate: r.task.tolerate,
         definitionDigest: r.definition,
+        // What the reviewer actually saw, for post-mortems: the exact
+        // (already-truncated) change list and diffstat injected into the
+        // prompt, not a re-collection that may since have changed.
+        evidence: { gitStatus: changes.status, gitDiffStat: changes.diffStat },
         at: new Date().toISOString(),
       });
       await appendJournal(r.cfg.tasksDir, id, {
@@ -827,6 +847,7 @@ function renderAcceptance(record: Record<string, unknown>): string {
     `command: ${value("command")}`,
     `result: ${outcome}`,
     `exitCode: ${value("exitCode")}`,
+    `mode: ${value("mode")}`,
     // The acceptance window is the narrowest slice the reviewer can trust: a
     // workspace that changed outside it changed while someone else had it open.
     `windows: startedAt ${value("startedAt")} finishedAt ${value("finishedAt")}`,
