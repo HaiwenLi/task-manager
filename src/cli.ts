@@ -8,6 +8,7 @@ import { runScheduler } from "./scheduler.js";
 import { OpenCodeAdapter } from "./adapters/opencode.js";
 import type { AgentAdapter } from "./adapters/types.js";
 import { serializeTaskFile, type Task, type TaskVerify } from "./task-file.js";
+import { buildFinding } from "./findings.js";
 import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, TEMPLATES, type TaskType } from "./intake.js";
 import { appendObservation, readProfile } from "./profile.js";
 import { extractCriteria, readSpec, writeSpec } from "./spec.js";
@@ -55,6 +56,7 @@ const USAGE = [
   "  taskctl metrics [--tasks-dir <dir>]",
   "  taskctl reconcile --task <id> [--tasks-dir <dir>]",
   "  taskctl retry --task <id> [--tasks-dir <dir>]",
+  "  taskctl findings --task <id> [--out <file>] [--tasks-dir <dir>]",
   "  taskctl learn --note \"<原话 → 改法>\" [--tasks-dir <dir>]",
   "  taskctl template [--type code|office|research|design]",
 ].join("\n");
@@ -168,6 +170,9 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "retry":
       checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return retryCommand(flags, log);
+    case "findings":
+      checkFlags(command, flags, ["task", "out", "tasks-dir", "config"], ["task"]);
+      return findingsCommand(flags, log);
     case "template":
       checkFlags(command, flags, ["type", "tasks-dir", "config"], []);
       return templateCommand(flags, log);
@@ -653,6 +658,38 @@ async function learnCommand(flags: Map<string, string>, log: (line: string) => v
   const tasksDir = await tasksDirFor(flags);
   const path = await appendObservation(tasksDir, flags.get("note")!);
   log(path);
+  return 0;
+}
+
+/**
+ * `taskctl findings --task <id>` — draft a finding from what the task left behind.
+ *
+ * Prints by default and writes only when asked: a command that silently creates
+ * files in the repo is a command people run by accident.
+ */
+async function findingsCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const id = flags.get("task")!;
+  let task;
+  try {
+    task = await new TaskStore(tasksDir).get(id);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      log(`task ${id} not found in ${tasksDir}`);
+      return 1;
+    }
+    throw err;
+  }
+  const draft = await buildFinding(tasksDir, task);
+  const out = flags.get("out");
+  if (out === undefined) {
+    for (const line of draft.markdown.split("\n")) log(line);
+    return 0;
+  }
+  const target = resolve(out);
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, draft.markdown, "utf8");
+  log(`${target}  signals=${draft.signals}`);
   return 0;
 }
 

@@ -226,6 +226,16 @@ npx tsx src/main.ts run [--log <file>] [--config taskctl.json]
 
 工作目录预留同时保存在 `<workdir>/.taskctl-workspace.lock/` 和用户临时目录 `opencode/taskctl-workspaces/reservations.json`。注册表检查父子目录及 Git 元数据路径的重叠，即使运行期间执行 `git init` / 新建 linked worktree 也不能绕过既有预留。只删本地锁不会清除不确定执行的预留。
 
+### taskctl findings — 把一次真实任务的摩擦抽成草稿
+
+```bash
+taskctl findings --task <id> [--out docs/findings/2026-11-17-<slug>.md] [--tasks-dir <dir>]
+```
+
+从 `journal.md`、`review.json`、`render.json`、`acceptance.json`、`attempt.json` 里抽机器可查的事实（升级、阻塞、返工、交接、降级、验收失败、复核未过的标准、渲染失败……），拼成一条按模板排好的草稿；**只抽事实，不写结论**，`复现条件` 和`猜测的成因` 留空给人填。
+
+默认打印，`--out` 才落盘。用途是多机之间传递真实摩擦：`tasks/` 不在 git 里，换台机器这些证据就没了。约定、命名、以及"从 finding 到改进任务"的两条硬规则见 [docs/findings/README.md](docs/findings/README.md)。
+
 ### taskctl done — 请求完成（agent 侧）
 
 ```bash
