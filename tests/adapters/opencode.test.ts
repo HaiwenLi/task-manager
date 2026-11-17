@@ -115,6 +115,25 @@ describe("OpenCodeAdapter.prompt", () => {
     await expect(readFile(join(cwd, "fake-cwd-marker.txt"), "utf8")).resolves.toBe("x");
   });
 
+  it("merges args.env over the inherited environment of the worker process", async () => {
+    // C1：worker 进程里要能看到 TASKCTL_TASK_DIR / TASKCTL_LOG_DIR。
+    // 用 node -e 当假后端：把收到的环境变量落盘，证明 env 真的进了子进程。
+    const dump = join(cwd, "env-dump.json");
+    const script = `require('fs').writeFileSync(${JSON.stringify(dump)}, JSON.stringify({ taskDir: process.env.TASKCTL_TASK_DIR ?? '(unset)', logDir: process.env.TASKCTL_LOG_DIR ?? '(unset)' }))`;
+    const adapter = new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: ["-e", script] });
+
+    const result = await adapter.prompt({
+      text: "hi",
+      cwd,
+      env: { TASKCTL_TASK_DIR: join(cwd, "task-a"), TASKCTL_LOG_DIR: join(cwd, "task-a", "logs") },
+    });
+
+    expect(result.exitCode).toBe(0);
+    await expect(readFile(dump, "utf8")).resolves.toEqual(
+      JSON.stringify({ taskDir: join(cwd, "task-a"), logDir: join(cwd, "task-a", "logs") }),
+    );
+  });
+
   it("rejects when the binary cannot be spawned at all", async () => {
     // spawn error（如 bin 不存在）是环境故障，不是回合结果
     const broken = new OpenCodeAdapter({ bin: "taskctl-no-such-binary" });

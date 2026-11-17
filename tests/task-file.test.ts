@@ -112,4 +112,16 @@ review_rounds: 2
     const review = raw.replace("status: open", "status: awaiting-human");
     expect(parseTaskFile(review, "fix-login").status).toBe("awaiting-human");
   });
+
+  it("parses keep_at_root, defaults to empty, and round-trips only when set", () => {
+    const withKeep = "---\ntitle: x\nstatus: open\nkeep_at_root:\n  - run.log\n  - '*.tmp'\nsessions: []\nretries: 0\n---\n正文";
+    const kept = parseTaskFile(withKeep, "001-x");
+    expect(kept.keepAtRoot).toEqual(["run.log", "*.tmp"]);
+    expect(serializeTaskFile(kept)).toContain("keep_at_root");
+    expect(parseTaskFile(serializeTaskFile(kept), "001-x")).toEqual(kept);
+
+    const bare = parseTaskFile("---\ntitle: x\nstatus: open\nsessions: []\nretries: 0\n---\n正文", "001-x");
+    expect(bare.keepAtRoot).toEqual([]);
+    expect(serializeTaskFile(bare)).not.toContain("keep_at_root");
+  });
 });

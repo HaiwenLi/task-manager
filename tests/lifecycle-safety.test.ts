@@ -170,7 +170,26 @@ describe("review lifecycle safety regressions", () => {
         let finish!: (value: { sessionId: string; exitCode: number; text: string }) => void;
         const result = new Promise<{ sessionId: string; exitCode: number; text: string }>(resolve => { finish = resolve; });
         // Simulate takeover while execution is still pending, not just after a result.
-        void writeFile(join(tasks, "a", "lock.json"), JSON.stringify({ worker: "successor", heartbeat: Date.now() }));
+        // The successor write is deliberately outside the protocol mutex — but
+        // the worker's heartbeat renews lock.json via rename every 10ms and can
+        // clobber a plain write that lands between its read and its rename,
+        // silently "un-taking-over". Reinstall until one heartbeat cycle has
+        // passed with the successor still on disk; only then is the takeover
+        // guaranteed observable and the loss that cancels the turn can fire.
+        const lockPath = join(tasks, "a", "lock.json");
+        const successor = JSON.stringify({ worker: "successor", heartbeat: Date.now() });
+        void (async () => {
+          for (let guard = 0; ; guard++) {
+            await writeFile(lockPath, successor);
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            try {
+              if (await readFile(lockPath, "utf8") === successor) return;
+            } catch {
+              return; // the attempt already released; nothing left to trigger
+            }
+            if (guard > 200) return; // bounded: never wedge the test process
+          }
+        })();
         return { result, inspect: () => ({ state }), cancel: async () => {
           cancelled = true; state = "exited"; finish({ sessionId: "stale", exitCode: -1, text: "stopped" }); return true;
         } };

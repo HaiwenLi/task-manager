@@ -6,7 +6,7 @@
 
 更新方式：每跑完一批真实任务，把新发现的问题加进来、把已经不再需要的划掉。**不做**不等于**忘了**，也不需要为了列表变短而做。
 
-最后更新：2026-11-17（`main@a8b74fe`；车道与验收方式见 [ADR-0009](adr/0009-lanes-and-verification.md)；本轮落地 `artifactIgnore` / `TASKCTL_ACCEPTANCE_MODE` / 复核改动证据，边界见第 4 节）
+最后更新：2026-11-17（`main@a8b74fe`；车道与验收方式见 [ADR-0009](adr/0009-lanes-and-verification.md)；本轮落地 `artifactIgnore` / `TASKCTL_ACCEPTANCE_MODE` / 复核改动证据，边界见第 4 节；同日第二轮落地产物卫生——`TASKCTL_LOG_DIR` 约定 / `run --log` / 回合后清扫，边界见第 4 节）
 
 ---
 
@@ -97,6 +97,14 @@
 - digest 格式从 v1 升到 v2：目录行移到子项之后、纯忽略目录整体不注册（连带**空目录**也不再注册——建空目录不再算 drift；与 git 一样看不见空目录）。v1/v2 摘要不可比，但摘要只在单次验收内前后比，无存量影响
 - taskctl 不验证命令在 check 模式下真的没写文件：写了又不在 `artifactIgnore` 里，按 drift 拦下（fail closed）。check 合规是命令作者的责任，文档只给了推荐写法
 - 复核的改动清单只有 `git status --porcelain` + `git diff --stat`，各截断至 200 行；非 git 工作目录显式「不可用」。二进制产物的变更只有状态行没有内容视图；review.json 的 `evidence` 记的是注入原文（复盘用），不是全集
+
+**产物卫生（`TASKCTL_LOG_DIR` / `--log` / 回合后清扫，2026-11-17）**
+- 清扫只看**根目录、非递归、常规文件**：子目录里的杂物（哪怕同名命中 patterns）不扫；目录本身永不移动。要深扫先攒真实痛点再扩
+- 未跟踪判定靠 `git status --porcelain -z --ignored=traditional`（`??`/`!!` 都算）。**非 git 工作目录整体惰化**（journal 记一次 `artifact-sweep-skipped`，之后静默）——宁可不清也不猜
+- 缺省 patterns 含 `*.txt`：交付物本身就是根目录 `.txt`/`.log` 的任务必须写 `keep_at_root` 或收紧 patterns，否则交付物会被挪进 scratch（journal 有落点，可找回，但验收会先失败一轮）
+- `keepAtRoot` **不进 `definitionDigest`**：worker 理论上可以改自己的豁免列表来保住杂物——被挪走的只是杂物本身（scratch 可找回），不改变"做完"的判据，所以没按定义漂移处理
+- 清扫在 worker 回合后、验收前发生；落点 `tasks/<id>/scratch/` 在 digest 的排除路径内，不影响 drift 判定。复核的 `git status` 里 scratch 路径若未被仓库忽略会显示为新增未跟踪文件（本仓 `/tasks/*` 已忽略，无此问题）
+- `taskctl gc`（清旧 run 日志、scratch、过期 reservation/lock）**有意未做**，另立任务
 
 **blocked 与恢复**
 - 不按记录的 PID 杀进程（PID 复用无法证明归属，ADR-0007）

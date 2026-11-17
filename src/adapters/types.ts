@@ -25,6 +25,12 @@ export interface AgentAdapter {
     effort?: string;
     title?: string;
     cwd: string;
+    /**
+     * Extra environment for the spawned worker process (e.g. TASKCTL_TASK_DIR /
+     * TASKCTL_LOG_DIR). Merged over the orchestrator's own environment; absent
+     * means inherit unchanged.
+     */
+    env?: Record<string, string>;
   }): Promise<PromptResult>;
   /** Preferred lifecycle boundary. Legacy prompt-only backends cannot prove
    * cancellation and are blocked, not retried, after an interrupted turn. */
