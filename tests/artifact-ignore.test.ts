@@ -6,6 +6,7 @@ import { artifactDigest } from "../src/workspace.js";
 import { TaskStore } from "../src/task-store.js";
 import { runTask, type WorkerConfig } from "../src/worker.js";
 import type { AgentAdapter } from "../src/adapters/types.js";
+import type { ReviewEvidence, ReviewResult } from "../src/review.js";
 
 let root: string;
 let cwd: string;
@@ -160,4 +161,83 @@ const okReview = async () => ({
   externalChanges: [],
   defects: [],
   summary: "ok",
+});
+
+describe("acceptance gate × artifactIgnore (C1, worker level)", () => {
+  it("a gate writing only ignored paths passes without drift", async () => {
+    const tasksDir = join(root, "tasks");
+    await seedTask(tasksDir, "check");
+    const store = new TaskStore(tasksDir);
+    const acceptance = async () => {
+      await mkdir(join(cwd, "out"), { recursive: true });
+      await writeFile(join(cwd, "out", "gen.json"), "generated");
+      return passGate();
+    };
+    await runTask(config(tasksDir, { artifactIgnore: ["out", "*.json"] }), { store, adapter: adapter(), acceptance, review: okReview }, await store.get("a"), "w1");
+    expect((await store.get("a")).status).toBe("done");
+    const evidence = JSON.parse(await readFile(join(tasksDir, "a", "acceptance.json"), "utf8"));
+    expect(evidence.passed).toBe(true);
+    expect(evidence.artifactBefore).toBe(evidence.artifactAfter);
+  });
+
+  it("a gate writing a non-ignored path still invalidates the evidence", async () => {
+    const tasksDir = join(root, "tasks");
+    await seedTask(tasksDir, "check");
+    const store = new TaskStore(tasksDir);
+    const acceptance = async () => {
+      await writeFile(join(cwd, "source_gen.ts"), "generated");
+      return passGate();
+    };
+    await runTask(config(tasksDir, { artifactIgnore: ["out"] }), { store, adapter: adapter(), acceptance, review: okReview }, await store.get("a"), "w1");
+    const task = await store.get("a");
+    expect(task.status).toBe("blocked");
+    expect(task.retries).toBe(0); // invalidation blocks directly, not through retries
+    const evidence = JSON.parse(await readFile(join(tasksDir, "a", "acceptance.json"), "utf8"));
+    expect(evidence.artifactBefore).not.toBe(evidence.artifactAfter);
+  });
+});
+
+describe("acceptance gate × TASKCTL_ACCEPTANCE_MODE (C2, worker level)", () => {
+  // A command that only generates its artifact outside check mode: exactly the
+  // shape 001/002's spec-driven acceptance commands had.
+  const generator = `"${process.execPath}" -e "if(process.env.TASKCTL_ACCEPTANCE_MODE!=='check')require('fs').writeFileSync('report.json','generated')"`;
+
+  it("the gate runs check mode: no file written, digests equal, mode recorded", async () => {
+    const tasksDir = join(root, "tasks");
+    await seedTask(tasksDir, generator);
+    const store = new TaskStore(tasksDir);
+    // 不注入 acceptance seam：走真实 startAcceptance，验证 env 注入。
+    await runTask(config(tasksDir), { store, adapter: adapter(), review: okReview }, await store.get("a"), "w1");
+    expect((await store.get("a")).status).toBe("done");
+    const evidence = JSON.parse(await readFile(join(tasksDir, "a", "acceptance.json"), "utf8"));
+    expect(evidence.mode).toBe("check");
+    expect(evidence.passed).toBe(true);
+    expect(evidence.artifactBefore).toBe(evidence.artifactAfter);
+    await expect(readFile(join(cwd, "report.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("the same command run by hand (generate default) does write its artifact", async () => {
+    await writeFile(join(cwd, "seed.txt"), "workspace baseline");
+    const before = await artifactDigest(cwd);
+    const { runAcceptance } = await import("../src/acceptance.js");
+    const result = await runAcceptance(generator, cwd);
+    expect(result.passed).toBe(true);
+    await expect(readFile(join(cwd, "report.json"), "utf8")).resolves.toBe("generated");
+    expect(await artifactDigest(cwd)).not.toBe(before);
+  });
+
+  it("hands the collected evidence to the reviewer", async () => {
+    const tasksDir = join(root, "tasks");
+    await seedTask(tasksDir, generator);
+    const store = new TaskStore(tasksDir);
+    const seen: ReviewEvidence[] = [];
+    const review = async (evidence: ReviewEvidence): Promise<ReviewResult> => {
+      seen.push(evidence);
+      return okReview();
+    };
+    await runTask(config(tasksDir), { store, adapter: adapter(), review }, await store.get("a"), "w1");
+    expect((await store.get("a")).status).toBe("done");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.acceptanceMarkdown).toContain("mode: check");
+  });
 });
