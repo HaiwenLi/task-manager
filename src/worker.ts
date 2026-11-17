@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { claim, heartbeat, lockLive, release, withOwnership, OwnershipLostError } from "./claim.js";
 import { latestNote, writeNote, type HandoffNote } from "./handoff.js";
@@ -10,10 +10,12 @@ import type { Task } from "./task-file.js";
 import type { AgentAdapter, PromptResult } from "./adapters/types.js";
 import type { Execution } from "./execution.js";
 import { reserveWorkspace, artifactDigest, type WorkspaceReservation } from "./workspace.js";
-import { definitionDigest, readAttempt, readRuntime, writeRuntime, type AttemptRecord } from "./runtime.js";
+import { definitionDigest, readAttempt, readDefinitionSnapshot, readRuntime, writeDefinitionSnapshot, writeRuntime, type AttemptRecord } from "./runtime.js";
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
-import { chainPosition, modelAt, modelChain, readModelRotation, rotateModel, type Handover, type ModelRole } from "./models.js";
+import { chainPosition, configChain, modelAt, modelChain, readModelRotation, rotateModel, type Handover, type ModelRole } from "./models.js";
+import { classifyDispatchFailure, quotaBackoffMs } from "./dispatch.js";
+import { failureFingerprint } from "./fingerprint.js";
 import { startReview, type CriterionResult, type ReviewEvidence, type ReviewResult } from "./review.js";
 import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck } from "./render.js";
 
@@ -22,6 +24,8 @@ export const ACCEPTANCE_TIMEOUT_MS_DEFAULT = 10 * 60_000;
 export const MAX_SESSIONS_PER_TASK_DEFAULT = 20;
 export const MAX_TURNS_PER_SESSION_DEFAULT = 40;
 export const MAX_REVIEW_ROUNDS_DEFAULT = 2;
+/** Consecutive identical acceptance failures before the task waits for a human. */
+export const FAILURE_FINGERPRINT_LIMIT_DEFAULT = 3;
 export const WRAP_UP_INSTRUCTION = "上下文预算告急。请立即运行一次 taskctl note（详尽记录进展），然后只回复 HANDOFF_READY";
 
 /**
@@ -43,6 +47,18 @@ export type WorkerConfig = {
   modelFallbacks?: string[];
   /** Models to try, in order, when a provider rejects the reviewer's model. */
   reviewerModelFallbacks?: string[];
+  /**
+   * The whole dispatch chain when set: head first, alternatives after. Defaults
+   * to `[model]`, so a config without it keeps meaning what it always did.
+   */
+  modelChain?: string[];
+  /**
+   * Identical acceptance failures tolerated in a row before the task stops for a
+   * human (default 3). See {@link recordAcceptanceFailure}.
+   */
+  failureFingerprintLimit?: number;
+  /** Backoff schedule after a quota refusal, by step; the last entry repeats. */
+  quotaBackoffMs?: number[];
   /** How many tasks the scheduler may run at once (default 2). */
   parallel?: number;
   /** Viewports a `verify: render` task must pass (default 1440x900 and 390x844). */
@@ -66,7 +82,9 @@ class UncertainExecutionError extends Error {}
 class ReviewRequiredError extends Error {}
 
 type Run = {
-  cfg: WorkerConfig; deps: WorkerDeps; task: Task; owner: string; definition: string;
+  cfg: WorkerConfig; deps: WorkerDeps; task: Task; owner: string;
+  /** Digest of the definition snapshot persisted at claim; the attempt's bar. */
+  definition: string;
   record: AttemptRecord; lost: boolean; notifyLost: () => void; loss: Promise<void>;
   execution?: Execution<unknown>;
   /**
@@ -74,6 +92,8 @@ type Run = {
    * off for this attempt: an escalated run may not finish on its own evidence.
    */
   escalated: boolean;
+  /** Why each model on the dispatch chain refused this attempt, in order. */
+  dispatchFailures: Map<string, string>;
 };
 const emit = (r: Run, type: WorkerEventType, detail?: string) => r.deps.onEvent?.({ type, taskId: r.task.id, detail });
 const owned = <T>(r: Run, fn: () => Promise<T>) => withOwnership(r.cfg.tasksDir, r.task.id, r.owner, fn);
@@ -98,6 +118,7 @@ export async function runTask(cfg: WorkerConfig, deps: WorkerDeps, task: Task, w
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
   const now = new Date().toISOString();
   const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false,
+    dispatchFailures: new Map(),
     record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing" } };
   let reservation: WorkspaceReservation | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -137,6 +158,11 @@ export async function runTask(cfg: WorkerConfig, deps: WorkerDeps, task: Task, w
     emit(r, task.status === "running" ? "takeover" : "claimed");
     await owned(r, async () => {
       await writeRuntime(cfg.tasksDir, task.id, "attempt.json", r.record);
+      // The definition this attempt is judged by is written down here, beside the
+      // attempt record: a later check — acceptance, review, or a takeover after a
+      // crash — compares against what the work actually ran by, not against
+      // whatever the file says when the evidence is looked at.
+      r.definition = (await writeDefinitionSnapshot(cfg.tasksDir, r.task)).digest;
       await deps.store.clearDoneMarker(task.id); // do not consume a predecessor's completion request
       await deps.store.setStatus(task.id, "running");
       await appendJournal(cfg.tasksDir, task.id, { stage: "worker", event: "claimed", detail: reservation?.cwd ?? cfg.workdir });
@@ -270,8 +296,10 @@ async function controlled<T>(
   } finally { r.execution = undefined; if (timer) clearTimeout(timer); }
 }
 
-/** The worker's chain: the task's own model (else the config default), then fallbacks. */
-const workerChain = (r: Run): string[] => modelChain(r.task.model ?? r.cfg.model, r.cfg.modelFallbacks);
+/** The worker's chain: the task's own model (else the configured chain), then fallbacks. */
+const workerChain = (r: Run): string[] => r.task.model === undefined
+  ? configChain(r.cfg.model, r.cfg.modelChain, r.cfg.modelFallbacks)
+  : modelChain(r.task.model, [...(r.cfg.modelChain ?? []), ...(r.cfg.modelFallbacks ?? [])]);
 /** The reviewer's chain: its own model, then its fallbacks — never the task's silently. */
 const reviewerChain = (r: Run): string[] => modelChain(r.cfg.reviewerModel, r.cfg.reviewerModelFallbacks);
 
@@ -328,20 +356,69 @@ async function fallBack(r: Run, role: ModelRole, reason: string): Promise<boolea
 /**
  * One agent turn. The declared return type is the union of "the backend
  * answered" and "we timed out", which is why `failure` has to be part of it:
- * both branches reach the caller's provider check.
+ * both branches reach the caller's provider check. `durationMs` and `tokens` are
+ * what the quota classifier reads: a refusal that returned in a second having
+ * spent nothing is an allowance problem, not a task problem.
  */
-async function turn(r: Run, text: string, model: string | undefined, sessionId?: string): Promise<PromptResult & { timedOut: boolean }> {
+async function turn(r: Run, text: string, model: string | undefined, sessionId?: string): Promise<PromptResult & { timedOut: boolean; durationMs: number }> {
   const args = { sessionId, text, model, effort: r.task.effort ?? r.cfg.effort, title: r.task.title, cwd: r.cfg.workdir };
+  const startedAt = Date.now();
   try {
     return { ...await controlled(r, "agent turn", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT,
       () => r.deps.adapter.start ? r.deps.adapter.start(args) : legacyExecution(() => r.deps.adapter.prompt(args)),
-      (result) => result.failure === "provider"), timedOut: false };
+      (result) => result.failure === "provider"), timedOut: false, durationMs: Date.now() - startedAt };
   } catch (err) {
     if (!(err instanceof WorkerTimeoutError)) throw err;
     // Only reached if cancellation was positively confirmed.
     await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
-    return { sessionId: "", text: "", exitCode: -1, timedOut: true };
+    return { sessionId: "", text: "", exitCode: -1, timedOut: true, durationMs: Date.now() - startedAt };
   }
+}
+
+/** Wait out a quota backoff step; a configured empty schedule waits not at all. */
+async function quotaPause(r: Run, step: number): Promise<void> {
+  const schedule = r.cfg.quotaBackoffMs;
+  const ms = schedule === undefined
+    ? quotaBackoffMs(step)
+    : (schedule[Math.min(step, Math.max(0, schedule.length - 1))] ?? 0);
+  if (ms > 0) await new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+/** One line saying why a model refused the turn, for the blocked note. */
+function refusalLine(model: string, result: PromptResult & { durationMs: number }): string {
+  const first = (result.text ?? "").split(/\r?\n/).map((line) => line.trim()).find((line) => line.length > 0) ?? "no output";
+  return `${model}: exit ${result.exitCode} in ${result.durationMs}ms, ${first.slice(0, 240)}`;
+}
+
+/**
+ * Stop for a human when the whole chain is out of allowance.
+ *
+ * `blocked` rather than a retry: the task never ran, nothing about it failed, and
+ * spending its retry budget would only convert a provider's billing window into
+ * a task verdict. The note names every model that refused, because the operator's
+ * next move (add a funded model, or wait for the window) depends on which.
+ */
+async function blockForQuota(r: Run, current: string, result: PromptResult & { durationMs: number }): Promise<"blocked"> {
+  r.dispatchFailures.set(current, refusalLine(current, result));
+  const tried = [...r.dispatchFailures.entries()];
+  await owned(r, async () => {
+    const seq = ((await latestNote(r.cfg.tasksDir, r.task.id))?.seq ?? 0) + 1;
+    await writeNote(r.cfg.tasksDir, {
+      task: r.task.id, seq, status: "blocked:needs-owner",
+      done: `派发失败：配额耗尽，链上 ${tried.length} 个模型都拒绝执行本任务；未消耗 retries（任务本身没跑过）。`,
+      found: tried.map(([model, reason]) => `- ${reason}`).join("\n"),
+      next: "换一个有额度的模型（配置 modelChain）或等窗口重置后 taskctl retry；不要把它当作任务失败去改判据。",
+      files: [],
+    });
+    await r.deps.store.setStatus(r.task.id, "blocked");
+    await appendJournal(r.cfg.tasksDir, r.task.id, {
+      stage: "worker",
+      event: "blocked",
+      detail: `quota exhausted on every model: ${tried.map(([model]) => model).join(" -> ")}`,
+    });
+  });
+  emit(r, "blocked", `quota exhausted on every model in the chain (${tried.map(([model]) => model).join(" -> ")}); retries untouched`);
+  return "blocked";
 }
 
 async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
@@ -378,12 +455,32 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
     if (result.exitCode !== 0) {
       await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
       emit(r, "turn-failed", result.timedOut ? "turn timed out; shutdown confirmed" : `exit ${result.exitCode}`);
-      const handedOver = handovers < maxHandovers && result.failure === "provider"
-        && await fallBack(r, "worker", `turn rejected by ${model ?? "(default)"}`);
-      // The next model must not be asked to continue a session created by
-      // another backend. A handover is a session boundary.
-      if (handedOver) { handovers++; fresh = true; }
-      if (!handedOver && await fail(r)) return "blocked";
+      // Allowance refusals are classified before the retry accounting: the task
+      // never ran, so this must not cost it a retry (see blockForQuota).
+      const kind = classifyDispatchFailure({ failure: result.failure, exitCode: result.exitCode,
+        durationMs: result.durationMs, tokens: result.tokens, output: result.text ?? "" });
+      const modelName = model ?? "(default)";
+      if (kind === "quota") {
+        r.dispatchFailures.set(modelName, refusalLine(modelName, result));
+        emit(r, "model-fallback", `quota on ${modelName}; not spending a retry`);
+        const advanced = handovers < maxHandovers
+          && await fallBack(r, "worker", `quota exhausted on ${modelName}`);
+        if (advanced) {
+          handovers++;
+          await quotaPause(r, handovers - 1);
+          // The next model must not continue a session the refusing backend owns.
+          fresh = true;
+        } else {
+          return await blockForQuota(r, modelName, result);
+        }
+      } else {
+        const handedOver = handovers < maxHandovers && result.failure === "provider"
+          && await fallBack(r, "worker", `turn rejected by ${model ?? "(default)"}`);
+        // The next model must not be asked to continue a session created by
+        // another backend. A handover is a session boundary.
+        if (handedOver) { handovers++; fresh = true; }
+        if (!handedOver && await fail(r)) return "blocked";
+      }
     } else if (await owned(r, () => r.deps.store.readDoneMarker(r.task.id))) {
       await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
       const verdict = await accept(r);
@@ -422,15 +519,28 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
 }
 
 /**
+ * The digest the attempt is judged against: the claim-time snapshot, which is
+ * the authority, falling back to this process's copy only when no snapshot was
+ * ever written (a run that died before the claim block finished).
+ */
+async function attemptDefinition(r: Run): Promise<string> {
+  const snapshot = await readDefinitionSnapshot(r.cfg.tasksDir, r.task.id);
+  return snapshot?.digest ?? r.definition;
+}
+
+/**
  * True while the task still carries the definition this attempt started under.
  *
  * The status is part of the question: a human moving the task out from under a
  * running attempt is the same kind of change as an edit to its criteria, and it
- * must not be judged under rules the attempt never ran by.
+ * must not be judged under rules the attempt never ran by. Lifecycle fields
+ * (retries, sessions) are not part of the definition at all — see
+ * {@link definitionFields} — so lowering a retry count mid-run is not drift.
  */
 async function definitionIntact(r: Run, statuses: readonly Task["status"][]): Promise<boolean> {
+  const definition = await attemptDefinition(r);
   const current = await owned(r, async () => (await r.deps.store.list()).find((task) => task.id === r.task.id));
-  return !!current && statuses.includes(current.status) && definitionDigest(current) === r.definition;
+  return !!current && statuses.includes(current.status) && definitionDigest(current) === definition;
 }
 
 /** Refuse to act on work whose task definition moved under it. */
@@ -444,6 +554,41 @@ async function requireUnchangedDefinition(r: Run, statuses: readonly Task["statu
   throw new ReviewRequiredError(
     "task definition changed during the attempt (criteria/tolerate/risk); re-approve before reviewing",
   );
+}
+
+/**
+ * The consecutive-identical-acceptance-failure counter, beside `attempt.json`.
+ *
+ * It survives the attempt on purpose: the loop that burns a gate five times is
+ * usually a *new* attempt per round, so an in-memory counter would restart at 1
+ * every time and never trip. A pass deletes it — the failure it counted is gone.
+ */
+const ACCEPTANCE_FAILURES_FILE = "acceptance-failures.json";
+
+type AcceptanceFailureRecord = { fingerprint: string; count: number; updatedAt: string };
+
+/**
+ * Count this failure against the streak of identical ones and return the streak.
+ *
+ * Identity is the *normalized* output (see {@link failureFingerprint}): the same
+ * failure printed at a different clock time, from a different absolute path, or
+ * after a different elapsed time is the same failure. A different fingerprint
+ * starts the streak over at 1, because a gate that fails differently each round
+ * is making progress somewhere, even if not enough.
+ */
+async function recordAcceptanceFailure(r: Run, output: string): Promise<{ fingerprint: string; count: number }> {
+  const fingerprint = failureFingerprint(output, { roots: [r.cfg.workdir, r.cfg.tasksDir] });
+  const previous = await readRuntime<AcceptanceFailureRecord>(r.cfg.tasksDir, r.task.id, ACCEPTANCE_FAILURES_FILE);
+  const count = previous?.fingerprint === fingerprint ? (Number(previous.count) || 0) + 1 : 1;
+  await writeRuntime(r.cfg.tasksDir, r.task.id, ACCEPTANCE_FAILURES_FILE, {
+    fingerprint, count, updatedAt: new Date().toISOString(),
+  } satisfies AcceptanceFailureRecord);
+  return { fingerprint, count };
+}
+
+/** A passing acceptance clears the streak: whatever repeated, no longer is. */
+async function clearAcceptanceFailures(r: Run): Promise<void> {
+  await rm(join(r.cfg.tasksDir, r.task.id, ACCEPTANCE_FAILURES_FILE), { force: true });
 }
 
 async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "awaiting-human"> {
@@ -503,8 +648,9 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
   // writes, and nesting would deadlock the task against itself.
   const outcome = await owned(r, async (): Promise<"review" | "blocked" | "retry" | "done" | "awaiting-human"> => {
     const current = (await r.deps.store.list()).find(t => t.id === r.task.id);
-    const definitionMatches = !!current && current.status === "running" && definitionDigest(current) === r.definition;
-    const evidence = { attemptId: r.owner, definitionDigest: r.definition, artifactBefore, artifactAfter, command,
+    const definition = await attemptDefinition(r);
+    const definitionMatches = !!current && current.status === "running" && definitionDigest(current) === definition;
+    const evidence = { attemptId: r.owner, definitionDigest: definition, artifactBefore, artifactAfter, command,
       startedAt, finishedAt: new Date().toISOString(), ...result, model, definitionMatches };
     await writeRuntime(r.cfg.tasksDir, r.task.id, "acceptance.json", evidence);
     if (!definitionMatches || artifactBefore !== artifactAfter || result.skipped) throw new ReviewRequiredError("acceptance evidence invalidated by definition/artifact drift or skipped check");
@@ -515,6 +661,7 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
       detail: `${result.passed ? "passed" : "failed"} exit=${result.exitCode ?? "null"}`,
     });
     if (result.passed) {
+      await clearAcceptanceFailures(r);
       // The operator asked for the exit code to be the verdict, and it is: there is
       // nothing left for a reviewer to add. An escalated run loses this shortcut,
       // because escalation means the evidence stopped describing the work.
@@ -524,6 +671,29 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
       return "review";
     }
     const retries = await r.deps.store.incRetries(r.task.id);
+    // The same failure, over and over, is not a retry problem: re-running it
+    // rebuilds the same evidence for minutes and learns nothing. (A bio
+    // similarity gate that had been deliberately superseded burned five
+    // acceptance runs before a human noticed.) Stop while a person can still act.
+    const streak = await recordAcceptanceFailure(r, result.output ?? "");
+    const limit = r.cfg.failureFingerprintLimit ?? FAILURE_FINGERPRINT_LIMIT_DEFAULT;
+    if (streak.count >= limit) {
+      const seq = ((await latestNote(r.cfg.tasksDir, r.task.id))?.seq ?? 0) + 1;
+      await writeNote(r.cfg.tasksDir, {
+        task: r.task.id, seq, status: "blocked:needs-owner",
+        done: `验收连续 ${streak.count} 次给出同一失败（指纹 ${streak.fingerprint}）；已停止自动重试，等人工判断。`,
+        found: `acceptance: ${command}\nstreak: ${streak.count}/${limit}\noutput: ${(result.output ?? "").slice(0, 800)}`,
+        next: "同一条失败重跑不会再给新信息：先决定是改判据/修门，还是承认证据不足；改完再 taskctl retry。",
+        files: [],
+      });
+      await appendJournal(r.cfg.tasksDir, r.task.id, {
+        stage: "worker", event: "blocked",
+        detail: `same acceptance failure ${streak.count}x (fingerprint ${streak.fingerprint}); needs owner`,
+      });
+      await r.deps.store.setStatus(r.task.id, "blocked");
+      emit(r, "blocked", `the same acceptance failure repeated ${streak.count} time(s); needs owner`);
+      return "blocked";
+    }
     if (retries >= r.cfg.retryLimit) {
       await r.deps.store.setStatus(r.task.id, "blocked"); emit(r, "blocked", "retry limit reached"); return "blocked";
     }
@@ -592,8 +762,9 @@ async function acceptRender(
     }
     throw err;
   }
+  const evidenceDigest = await attemptDefinition(r);
   await owned(r, () => writeRuntime(r.cfg.tasksDir, id, "render.json", {
-    ...check, model, definitionDigest: r.definition, escalated: r.escalated,
+    ...check, model, definitionDigest: evidenceDigest, escalated: r.escalated,
   }));
   if (check.ok) {
     emit(r, "acceptance", `render ok (${check.views.length} view(s))`);
@@ -679,11 +850,12 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
       // not the same claim as work passed by the model the operator chose. So is
       // the declaration that authorised any excused drift — a narrowed field
       // must not read as if the reviewer had been allowed what it now says.
+      const definition = await attemptDefinition(r);
       await writeRuntime(r.cfg.tasksDir, id, "review.json", {
         ...result,
         model: reviewerModel,
         tolerate: r.task.tolerate,
-        definitionDigest: r.definition,
+        definitionDigest: definition,
         at: new Date().toISOString(),
       });
       await appendJournal(r.cfg.tasksDir, id, {

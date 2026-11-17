@@ -87,6 +87,11 @@ export class OpenCodeAdapter implements AgentAdapter {
       const decoder = new StringDecoder("utf8");
       let buffered = "";
       let providerFailure = false;
+      // Token counts reported by step_finish events, summed. Kept separate from
+      // "0": a refusal that reports nothing must not look like a turn that ran
+      // and spent nothing.
+      let tokens = 0;
+      let tokensReported = false;
 
       // stderr MUST be drained: a verbose child (auth warnings, LSP logs)
       // fills the pipe buffer and blocks forever otherwise. Captured so a
@@ -124,6 +129,18 @@ export class OpenCodeAdapter implements AgentAdapter {
           if (typeof piece === "string") {
             text += piece;
           }
+          return;
+        }
+        if (event.type === "step_finish") {
+          // The step's usage is what tells an exhausted allowance apart from work
+          // that failed: a rejected turn ends with a step that spent nothing.
+          const part = asObject(event.part);
+          const usage = asObject(part?.tokens) ?? asObject((event as RunEvent & { tokens?: unknown }).tokens);
+          if (usage !== undefined) {
+            const cache = asObject(usage.cache);
+            tokens += count(usage.input) + count(usage.output) + count(usage.reasoning) + count(cache?.read) + count(cache?.write);
+            tokensReported = true;
+          }
         }
       };
 
@@ -148,6 +165,7 @@ export class OpenCodeAdapter implements AgentAdapter {
           sessionId,
           exitCode: code ?? -1,
           text: code === 0 ? text : withStderr(text, stderr),
+          ...(tokensReported ? { tokens } : {}),
           ...(rejected ? { failure: "provider" as const } : {}),
         });
       });

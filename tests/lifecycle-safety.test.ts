@@ -27,7 +27,7 @@ afterEach(async () => {
 });
 
 async function seed(acceptance?: string) {
-  await writeFile(join(tasks, "a.md"), `---\ntitle: Safe task\nstatus: open\ncriteria:\n  - C1 ok\nsessions: []\nretries: 0\n${acceptance === undefined ? "" : `acceptance: ${JSON.stringify(acceptance)}\n`}---\nDo work\n`);
+  await writeFile(join(tasks, "a.md"), `---\nschema: taskctl/v1\ntitle: Safe task\nstatus: open\ncriteria:\n  - C1 ok\nsessions: []\nretries: 0\n${acceptance === undefined ? "" : `acceptance: ${JSON.stringify(acceptance)}\n`}---\nDo work\n`);
 }
 function config(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
   return { tasksDir: tasks, workdir: cwd, agent: "fixture", contextThreshold: .8,

@@ -37,6 +37,7 @@ async function seed(options: SeedOptions = {}): Promise<void> {
   const criteria = options.criteria ?? ["C1 ok"];
   const lines = [
     "---",
+    "schema: taskctl/v1",
     "title: Review task",
     "status: open",
     'acceptance: "check"',
