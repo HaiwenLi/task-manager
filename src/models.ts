@@ -60,6 +60,26 @@ export function modelAt(chain: readonly string[], index: number | undefined): st
   return Number.isInteger(at) && at >= 0 && at < chain.length ? chain[at] : chain[0];
 }
 
+/**
+ * The chain a configuration describes.
+ *
+ * `modelChain` is the whole ordered chain when it is set — its head is the
+ * primary, the rest are the alternatives — and its absence is equivalent to a
+ * one-element chain `[model]`, which is what every config written before the key
+ * existed means. `modelFallbacks` still appends after either form, so the two
+ * ways of declaring alternatives compose instead of competing.
+ */
+export function configChain(
+  primary: string | undefined,
+  chain: readonly string[] | undefined,
+  fallbacks: readonly string[] | undefined,
+): string[] {
+  if (chain !== undefined && chain.length > 0) {
+    return modelChain(chain[0], [...chain.slice(1), ...(fallbacks ?? [])]);
+  }
+  return modelChain(primary, fallbacks);
+}
+
 /** Where the chain actually stands: a position recorded for a different model is stale. */
 export function chainPosition(chain: readonly string[], entry: RotationEntry | undefined): number {
   if (entry === undefined) return 0;

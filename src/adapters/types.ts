@@ -10,6 +10,12 @@ export type PromptResult = {
   exitCode: number;
   text: string;
   failure?: "provider";
+  /**
+   * Tokens the backend reported for this turn, when it reports any. Absent means
+   * "not measured", not "zero" — a refusal that burned no tokens is exactly the
+   * signal the quota classifier reads, so the two must not be conflated.
+   */
+  tokens?: number;
 };
 
 /**

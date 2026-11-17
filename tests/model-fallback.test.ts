@@ -30,6 +30,7 @@ afterEach(async () => {
 async function seed(model: string | null = "w/one"): Promise<void> {
   await writeFile(join(tasks, "a.md"), [
     "---",
+    "schema: taskctl/v1",
     "title: Fallback task",
     "status: open",
     'acceptance: "check"',
