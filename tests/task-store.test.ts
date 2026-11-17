@@ -1,10 +1,11 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskStore } from "../src/task-store.js";
 
 const aMd = `---
+schema: taskctl/v1
 id: a
 title: 任务A
 status: open
@@ -14,6 +15,7 @@ retries: 0
 A 的正文`;
 
 const bMd = `---
+schema: taskctl/v1
 id: b
 title: 任务B
 status: done
@@ -50,6 +52,42 @@ describe("TaskStore.list", () => {
     await writeFile(join(tasksDir, "notes.txt"), "not a task", "utf8");
     const store = new TaskStore(tasksDir);
     expect((await store.list()).map((t) => t.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("TaskStore registration gate", () => {
+  it("registers only files that declare schema: taskctl/v1, and reports the rest", async () => {
+    // A legal task file that never declared the schema: it is a document, not a
+    // task. The directory listing used to be the whole admission policy.
+    const legacy = "---\nid: snapshot\ntitle: 013 snapshot at relaunch\nstatus: open\nsessions: []\nretries: 0\n---\n正文";
+    await writeFile(join(tasksDir, "013-snapshot-at-relaunch.md"), legacy, "utf8");
+    const store = new TaskStore(tasksDir);
+
+    const scan = await store.scan();
+    expect(scan.tasks.map((t) => t.id)).toEqual(["a", "b"]);
+    expect(scan.ignored).toEqual(["013-snapshot-at-relaunch.md"]);
+    // Ignored is not deleted: an explicit read still parses it.
+    expect((await store.get("013-snapshot-at-relaunch")).title).toContain("snapshot");
+    // And nothing rewrote it in passing.
+    expect(await readFile(join(tasksDir, "013-snapshot-at-relaunch.md"), "utf8")).toBe(legacy);
+  });
+
+  it("refuses a file that declares a different schema", async () => {
+    await writeFile(
+      join(tasksDir, "future.md"),
+      "---\nschema: taskctl/v2\nid: future\ntitle: 未来格式\nstatus: open\nsessions: []\nretries: 0\n---\n",
+      "utf8",
+    );
+    const scan = await new TaskStore(tasksDir).scan();
+    expect(scan.tasks.map((t) => t.id)).toEqual(["a", "b"]);
+    expect(scan.ignored).toEqual(["future.md"]);
+  });
+
+  it("writes the schema on every rewrite, so a registered file stays registered", async () => {
+    await new TaskStore(tasksDir).setStatus("a", "running");
+    const raw = await readFile(join(tasksDir, "a.md"), "utf8");
+    expect(raw).toContain("schema: taskctl/v1");
+    expect((await new TaskStore(tasksDir).scan()).tasks.map((t) => t.id)).toEqual(["a", "b"]);
   });
 });
 
@@ -127,7 +165,7 @@ describe("pipeline mutations", () => {
   it("incReviewRounds increments and persists", async () => {
     await writeFile(
       join(tasksDir, "c.md"),
-      "---\ntitle: C\nstatus: review\nreview_rounds: 1\nsessions: []\nretries: 0\n---\n",
+      "---\nschema: taskctl/v1\ntitle: C\nstatus: review\nreview_rounds: 1\nsessions: []\nretries: 0\n---\n",
       "utf8",
     );
     const store = new TaskStore(tasksDir);

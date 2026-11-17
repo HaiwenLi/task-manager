@@ -112,6 +112,33 @@ export class TaskFileError extends Error {
   }
 }
 
+/**
+ * The one frontmatter value that turns a Markdown file in `tasks/` into a task.
+ *
+ * "Markdown is the source of truth" (ADR-0001) never said *every* Markdown file
+ * is a task: a hand-taken snapshot dropped into the directory was picked up and
+ * scheduled six times before anyone noticed. Registration is therefore explicit
+ * — the file declares the schema it was written for, and everything else in the
+ * directory is inert. Adding a field to the vocabulary later becomes a migration
+ * with a name, not a silent reinterpretation of existing files.
+ */
+export const TASK_SCHEMA = "taskctl/v1";
+
+/**
+ * The `schema` a file's frontmatter declares, or `undefined` when it declares
+ * none (or cannot be read at all).
+ *
+ * Only the frontmatter is looked at: the body of a non-task Markdown file is
+ * arbitrary text and must never be parsed as one.
+ */
+export function declaredTaskSchema(raw: string): unknown {
+  try {
+    return (matter(raw).data ?? {})["schema"];
+  } catch {
+    return undefined;
+  }
+}
+
 const STATUSES: readonly TaskStatus[] = ["draft", "open", "running", "review", "awaiting-human", "done", "blocked"];
 const COMPLEXITIES: readonly TaskComplexity[] = ["simple", "complex"];
 const RISKS: readonly TaskRisk[] = ["normal", "high"];
@@ -178,6 +205,9 @@ export function parseTaskFile(raw: string, id: string): Task {
  */
 export function serializeTaskFile(task: Task): string {
   const frontmatter: Record<string, unknown> = {
+    // Registration marker first: `tasks/` holds other Markdown too, and only a
+    // file that declares the schema is scheduled (see {@link TASK_SCHEMA}).
+    schema: TASK_SCHEMA,
     id: task.id,
     title: task.title,
     status: task.status,
