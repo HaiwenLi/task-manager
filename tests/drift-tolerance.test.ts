@@ -33,6 +33,7 @@ afterEach(async () => {
 async function seed(extra: string[] = []): Promise<void> {
   await writeFile(join(tasks, "a.md"), [
     "---",
+    "schema: taskctl/v1",
     "title: 填表",
     "status: open",
     'acceptance: "check"',
@@ -78,7 +79,7 @@ function adapterThatRewrites(edit: (markdown: string) => string): AgentAdapter {
 /** A task with criteria and no acceptance command: the review-only path. */
 async function seedReviewOnly(): Promise<void> {
   await writeFile(join(tasks, "a.md"), [
-    "---", "title: 填表", "status: open", "criteria:", "  - C1 32 行全部填好",
+    "---", "schema: taskctl/v1", "title: 填表", "status: open", "criteria:", "  - C1 32 行全部填好",
     "review_rounds: 0", "sessions: []", "retries: 0", "---", "把 32 行填进共享表", "",
   ].join("\n"), "utf8");
 }

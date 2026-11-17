@@ -74,7 +74,50 @@ export function boardPath(tasksDir: string): string {
   return join(tasksDir, "..", ".taskctl", "board.md");
 }
 
-/** Rewrite the board atomically so a watching browser never sees half a file. */
+/**
+ * Backoff for a rename that Windows refused.
+ *
+ * `rename` onto an existing file is not atomic-with-wait on Windows: while
+ * another process holds a handle on the destination (an editor, a watcher, or
+ * the second of two `taskctl board` runs) it fails with `EPERM` instead of
+ * waiting. The failure is transient by nature — the handle goes away — so the
+ * replacement is retried a bounded number of times rather than turned into an
+ * error on the first collision. The total ceiling is ~3.9s, well under the
+ * interval at which a person retries a command by hand.
+ */
+const RENAME_RETRY_DELAYS_MS: readonly number[] = [5, 25, 125, 625, 3125];
+
+/**
+ * Errors that mean "the destination was busy", not "the write is wrong".
+ * `ENOENT` (the temp file vanished), `EACCES` on an immutable target, a full
+ * disk and everything else propagate on the first attempt: retrying them only
+ * delays the same error.
+ */
+const TRANSIENT_RENAME_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+
+/** Rename, retrying only a destination held by a concurrent handle. */
+export async function renameWithRetry(from: string, to: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      const delay = RENAME_RETRY_DELAYS_MS[attempt];
+      if (code === undefined || !TRANSIENT_RENAME_CODES.has(code) || delay === undefined) throw err;
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
+/**
+ * Rewrite the board atomically so a watching browser never sees half a file.
+ *
+ * The replace stays "write a unique temp file, then rename it over the target":
+ * a delete-then-write would open exactly the window the atomic rename exists to
+ * close, and an append would corrupt the generated file. Only the rename's
+ * transient refusal is retried (see {@link renameWithRetry}).
+ */
 export async function writeBoard(tasksDir: string, markdown: string): Promise<string> {
   const path = boardPath(tasksDir);
   await mkdir(join(path, ".."), { recursive: true });
@@ -82,7 +125,7 @@ export async function writeBoard(tasksDir: string, markdown: string): Promise<st
   // not rename each other's half-written file.
   const tmp = `${path}.${randomUUID()}.tmp`;
   await writeFile(tmp, markdown, "utf8");
-  await rename(tmp, path);
+  await renameWithRetry(tmp, path);
   return path;
 }
 
