@@ -273,11 +273,67 @@ export async function reservationsFor(
 }
 
 /**
+ * Translate one ignore pattern into an anchored RegExp over workspace-relative
+ * posix paths. A `*` stays inside one segment, `?` matches one non-separator
+ * character, and a `**` segment crosses segments (a leading or trailing
+ * double-star segment also matches zero segments). Everything else is literal
+ * — there are no character classes and no negation, and matching is
+ * case-sensitive everywhere. Separators may be spelled with a backslash
+ * (they are normalised); patterns are relative to the workspace.
+ */
+export function ignorePatternRegExp(pattern: string): RegExp {
+  const normalized = pattern.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+  let source = "^";
+  let i = 0;
+  while (i < normalized.length) {
+    const char = normalized[i]!;
+    if (char === "*") {
+      if (normalized[i + 1] === "*") {
+        while (normalized[i + 1] === "*") i++;
+        if (normalized[i + 1] === "/") { source += "(?:.*/)?"; i += 2; }
+        else source += ".*";
+        continue;
+      }
+      source += "[^/]*";
+      i++;
+      continue;
+    }
+    if (char === "?") {
+      source += "[^/]";
+      i++;
+      continue;
+    }
+    source += char.replace(/[\\^$.|+(){}\[\]]/g, "\\$&");
+    i++;
+  }
+  return new RegExp(source + "$");
+}
+
+/**
+ * Compile `artifactIgnore` patterns into one predicate over relative posix
+ * paths. A pattern that can match the empty string covers the workspace root
+ * itself: gutting the drift check that way must be a loud error, not a silent
+ * pass-everything configuration.
+ */
+export function compileIgnorePatterns(patterns: string[]): (rel: string) => boolean {
+  const regexps = patterns.map((pattern) => {
+    const regexp = ignorePatternRegExp(pattern);
+    if (regexp.test("")) throw new Error(`artifactIgnore pattern matches the whole workspace: ${pattern}`);
+    return regexp;
+  });
+  return (rel: string) => regexps.some((regexp) => regexp.test(rel));
+}
+
+/**
  * SHA256 of a sorted, framed manifest and streamed file contents. Includes all
  * tracked, untracked and ignored files except .git, node_modules, .taskctl and
  * .taskctl-* metadata. Explicit exclusions may be absolute or cwd-relative and
  * exclude entire subtrees strictly inside cwd (e.g. an auxiliary tasksDir).
  * Outside paths, cwd itself, and ancestors of cwd cannot exclude source files.
+ * `ignorePatterns` are workspace-relative paths or globs (see
+ * {@link ignorePatternRegExp}); a matched file — or a directory whose every
+ * descendant is matched — leaves the manifest entirely, so an acceptance
+ * command writing only ignored paths is not drift.
  *
  * Links are entries containing their target text, never traversal edges; resolved
  * targets outside the root are rejected, while internal cycles are permitted. This
@@ -285,9 +341,14 @@ export async function reservationsFor(
  * compare before/after execution. Unsupported special files fail closed. Build
  * outputs are included; Git ignore rules are deliberately not consulted.
  */
-export async function artifactDigest(cwd: string, excludePaths: string[] = []): Promise<string> {
+export async function artifactDigest(
+  cwd: string,
+  excludePaths: string[] = [],
+  ignorePatterns: string[] = [],
+): Promise<string> {
   const root = await realpath(cwd);
   const logicalRoot = resolve(cwd);
+  const ignored = compileIgnorePatterns(ignorePatterns);
   const exclusions = (await Promise.all(excludePaths.map(async (path) => {
     const absolute = resolve(logicalRoot, path);
     // Rebase exclusions spelled through the same alias, including a tasksDir
@@ -301,23 +362,33 @@ export async function artifactDigest(cwd: string, excludePaths: string[] = []): 
     }
   }))).filter((path) => within(root, path) && pathKey(path) !== pathKey(root));
   const manifest = createHash("sha256");
-  manifest.update("taskctl-artifact-v1\n");
+  // v2: directory lines moved after their children and disappear together with
+  // every child, so a directory that only holds ignored (or no) entries cannot
+  // register as drift just by existing.
+  manifest.update("taskctl-artifact-v2\n");
 
-  async function visit(directory: string): Promise<void> {
+  /** Visit one directory; the count is how many entries it contributed. */
+  async function visit(directory: string): Promise<number> {
     if (!within(root, await realpath(directory))) throw new Error(`Workspace directory escaped root: ${directory}`);
     const names = (await readdir(directory)).sort();
+    let recorded = 0;
     for (const name of names) {
       if (name === ".git" || name === "node_modules" || name === ".taskctl" || name.startsWith(".taskctl-")) continue;
       const path = join(directory, name);
       if (exclusions.some((excluded) => within(excluded, path))) continue;
       const entry = await lstat(path);
       const rel = relative(root, path).split(sep).join("/");
+      if (ignored(rel)) continue;
       if (entry.isSymbolicLink()) {
         if (!within(root, await realpath(path))) throw new Error(`Workspace link escaped root: ${path}`);
         manifest.update(JSON.stringify(["link", rel, await readlink(path)]) + "\n");
+        recorded++;
       } else if (entry.isDirectory()) {
-        manifest.update(JSON.stringify(["directory", rel]) + "\n");
-        await visit(path);
+        const contributed = await visit(path);
+        if (contributed > 0) {
+          manifest.update(JSON.stringify(["directory", rel]) + "\n");
+          recorded += contributed;
+        }
       } else if (entry.isFile()) {
         if (!within(root, await realpath(path))) throw new Error(`Workspace file escaped root: ${path}`);
         const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -332,10 +403,12 @@ export async function artifactDigest(cwd: string, excludePaths: string[] = []): 
         } finally {
           await handle.close();
         }
+        recorded++;
       } else {
         throw new Error(`Unsupported workspace entry: ${path}`);
       }
     }
+    return recorded;
   }
 
   await visit(root);
