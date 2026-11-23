@@ -41,6 +41,15 @@ export interface AgentAdapter {
   /** Preferred lifecycle boundary. Legacy prompt-only backends cannot prove
    * cancellation and are blocked, not retried, after an interrupted turn. */
   start?(args: Parameters<AgentAdapter["prompt"]>[0]): Execution<Awaited<ReturnType<AgentAdapter["prompt"]>>>;
+  /**
+   * The exact model string to dispatch. An effort is a *variant* of a model
+   * (`provider/model#high`), and a provider only publishes the variants it
+   * lists: appending one to a model without it is rejected by the provider
+   * (`provider.no-route: Variant unavailable for …`), which cost a whole
+   * worker turn on 2026-11-23 (minimax coding plan publishes no variants at
+   * all). Optional: a backend that cannot tell keeps the plain model.
+   */
+  resolveModel?(model: string | undefined, effort: string | undefined): Promise<string | undefined>;
   /** tokens 总量 */
   contextUsage(sessionId: string): Promise<number>;
   /** limit.context */

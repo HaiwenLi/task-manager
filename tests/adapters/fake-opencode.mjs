@@ -20,6 +20,12 @@
 //                      with FAKE_STDERR_REPEAT it can exceed any pipe buffer,
 //                      proving the adapter drains stderr (a full pipe would
 //                      otherwise block the child forever)
+//   FAKE_PROVIDER_NOROUTE — emit a `provider.no-route` error event (the
+//                      provider refusing a variant it does not publish) and
+//                      exit non-zero: the adapter must classify this as a
+//                      retryable provider failure, not an uncertain turn
+//   FAKE_PROVIDER_RETRY   — emit a `retry` event carrying a rate-limit error
+//                      and exit non-zero: opencode's own retry loop gave up
 import { writeFileSync } from "node:fs";
 
 const argv = process.argv.slice(2);
@@ -35,6 +41,28 @@ if (process.env.FAKE_STDERR_TEXT) {
 const [subcommand, operation] = argv;
 
 if (subcommand === "run") {
+  // Provider refusals: the CLI exits non-zero after the backend refused the
+  // turn. Both shapes must be recognised as retryable provider failures.
+  if (process.env.FAKE_PROVIDER_NOROUTE) {
+    process.stdout.write(
+      `${JSON.stringify({
+        sessionID: "ses_fake123",
+        type: "error",
+        error: { type: "provider.no-route", message: "Variant unavailable for anthropic/sonnet: high" },
+      })}\n`,
+    );
+    process.exitCode = Number(process.env.FAKE_EXIT_CODE ?? 1);
+  } else if (process.env.FAKE_PROVIDER_RETRY) {
+    process.stdout.write(
+      `${JSON.stringify({
+        sessionID: "ses_fake123",
+        type: "retry",
+        attempt: 4,
+        error: { type: "provider.rate-limit", message: "该模型当前访问量过大", status: 429 },
+      })}\n`,
+    );
+    process.exitCode = Number(process.env.FAKE_EXIT_CODE ?? 1);
+  } else {
   // Preset turn transcript: a text line carrying sessionID first (as in the
   // real CLI), then other event types, one deliberately unparseable line the
   // adapter must skip, then a second text event whose text is appended.
@@ -53,6 +81,7 @@ if (subcommand === "run") {
   }
   process.stdout.write(`${lines.join("\n")}\n`);
   process.exitCode = Number(process.env.FAKE_EXIT_CODE ?? 0);
+  }
 } else if (subcommand === "api" && operation === "session.get") {
   // --param sessionID=<id> → tokens telemetry; the sum input+output+
   // reasoning+cache.read+cache.write = 1375 is what the adapter must report.
@@ -71,7 +100,8 @@ if (subcommand === "run") {
     `${JSON.stringify({
       data: [
         { id: "sonnet", providerID: "anthropic", limit: { context: 200000, output: 16000 } },
-        { id: "gpt", providerID: "openai", limit: { context: 128000, output: 8000 } },
+        // A model that publishes effort variants (like the coding plans do).
+        { id: "gpt", providerID: "openai", variants: [{ id: "low" }, { id: "high" }], limit: { context: 128000, output: 8000 } },
         { id: "local-model", providerID: "ollama", limit: { context: 8192, output: 4096 } },
       ],
     })}\n`,

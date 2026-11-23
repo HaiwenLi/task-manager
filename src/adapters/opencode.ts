@@ -14,8 +14,14 @@ type RunEvent = { sessionID?: unknown; type?: unknown; text?: unknown; part?: un
  * Backend rejections that mean "this turn never got to do work": quotas, rate
  * limits, auth and 5xx. They are retryable external failures, not evidence that
  * a session is still running.
+ *
+ * The list is deliberately wide. A refusal that is NOT recognised here does
+ * not fail the turn — it makes the execution look uncertain, and an uncertain
+ * execution blocks the task instead of rotating to the next model in the
+ * chain. That is how one provider hiccup could wedge a whole board
+ * (2026-11-23: `provider.no-route`, `provider.rate-limit`).
  */
-const PROVIDER_REJECTION = /rate.?limit|quota|usage limit|用量上限|insufficient|unauthorized|\b401\b|\b429\b|\b5\d\d\b/i;
+const PROVIDER_REJECTION = /rate.?limit|quota|usage limit|用量上限|insufficient|unauthorized|\b401\b|\b403\b|\b429\b|\b5\d\d\b|no-route|variant unavailable|model not found|no such model|not_found|forbidden|overloaded|bad gateway|service unavailable|model_not_found/i;
 
 /** A parsed `{"location":…,"data":…}` envelope from `opencode api`. */
 type ApiEnvelope = { data?: unknown };
@@ -46,10 +52,76 @@ type JsonObject = Record<string, unknown>;
 export class OpenCodeAdapter implements AgentAdapter {
   private readonly bin: string;
   private readonly binArgsPrefix: string[];
+  /** Model metadata for the variant lookup; fetched once per adapter. */
+  private modelList?: Promise<Map<string, Set<string>>>;
 
   constructor(opts: { bin?: string; binArgsPrefix?: string[] } = {}) {
     this.bin = opts.bin ?? "opencode";
     this.binArgsPrefix = opts.binArgsPrefix ?? [];
+  }
+
+  /**
+   * The model string to dispatch: an effort is a *variant* the provider must
+   * publish. `opencode api model.list` lists the variants per model, so the
+   * suffix is added only when it exists — otherwise the provider refuses the
+   * turn with `provider.no-route` (2026-11-23: minimax coding plan publishes
+   * no variants at all, and `#high` killed the turn in half a second).
+   *
+   * An unknown model keeps the old behaviour (suffix appended): the provider,
+   * not this lookup, is the authority on what it accepts.
+   */
+  async resolveModel(model: string | undefined, effort: string | undefined): Promise<string | undefined> {
+    if (!model) return undefined;
+    if (!effort) return model;
+    const variants = await this.variantsOf(model);
+    if (!variants) return `${model}#${effort}`;
+    return variants.has(effort) ? `${model}#${effort}` : model;
+  }
+
+  /**
+   * The variant ids a model publishes, keyed by `provider/id`. Absent entry
+   * means "this model is not in the list" — the caller then keeps its old
+   * behaviour instead of guessing.
+   */
+  private async variantsOf(model: string): Promise<Set<string> | undefined> {
+    const catalogue = await this.modelCatalogue();
+    const bare = model.includes("/") ? model.slice(model.indexOf("/") + 1) : model;
+    for (const [key, variants] of catalogue) {
+      const provider = key.includes("/") ? key.slice(0, key.indexOf("/")) : "";
+      const id = key.includes("/") ? key.slice(key.indexOf("/") + 1) : key;
+      if (`${provider}/${id}`.toLowerCase() === model.toLowerCase() || id.toLowerCase() === bare.toLowerCase()) {
+        return variants;
+      }
+    }
+    return undefined;
+  }
+
+  /** `opencode api model.list`, fetched once and kept for the process life. */
+  private modelCatalogue(): Promise<Map<string, Set<string>>> {
+    this.modelList ??= this.api("model.list").then((envelope) => {
+      const catalogue = new Map<string, Set<string>>();
+      if (Array.isArray(envelope.data)) {
+        for (const entry of envelope.data) {
+          const object = asObject(entry);
+          const providerID = object?.providerID;
+          const id = object?.id;
+          const modelID = object?.modelID;
+          const variants = Array.isArray(object?.variants)
+            ? object.variants.flatMap((variant) => {
+                const name = asObject(variant)?.id;
+                return typeof name === "string" ? [name] : [];
+              })
+            : [];
+          const names = [id, modelID].filter((name): name is string => typeof name === "string");
+          for (const name of names) {
+            const key = typeof providerID === "string" ? `${providerID}/${name}` : name;
+            if (!catalogue.has(key)) catalogue.set(key, new Set(variants));
+          }
+        }
+      }
+      return catalogue;
+    }).catch(() => new Map<string, Set<string>>());
+    return this.modelList;
   }
 
   /** Run one agent turn and collect the session id, final text and exit code. */
@@ -133,6 +205,14 @@ export class OpenCodeAdapter implements AgentAdapter {
           // opencode reports a rejected turn as an error event (provider quota,
           // auth, 5xx). Remember it so the caller can retry instead of treating
           // the turn as an unverifiable interruption.
+          if (PROVIDER_REJECTION.test(JSON.stringify(event))) providerFailure = true;
+          return;
+        }
+        if (event.type === "retry") {
+          // opencode's own retry loop: the provider refused this attempt
+          // (`provider.rate-limit` on the zhipuai coding plan, 2026-11-23).
+          // The turn may still succeed after a retry, so this only matters when
+          // the CLI gives up and exits non-zero.
           if (PROVIDER_REJECTION.test(JSON.stringify(event))) providerFailure = true;
           return;
         }

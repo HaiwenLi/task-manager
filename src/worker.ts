@@ -276,6 +276,9 @@ async function controlled<T>(
   await checkpoint(r, "active", label);
   let execution: Execution<T> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  // Declared out here: the catch block reads it, and a `let` inside `try` is
+  // not visible there.
+  let settledOutput: string | undefined;
   try {
     // Generation cannot be taken over between the ownership check and dispatch.
     await owned(r, async () => {
@@ -292,7 +295,14 @@ async function controlled<T>(
     const lost = r.loss.then(() => { throw new OwnershipLostError(); });
     let settled = false;
     const tracked = execution!.result.then(
-      (value) => { settled = true; return value; },
+      (value) => {
+        settled = true;
+        // Keep the turn's last output: a turn that dies without a classifiable
+        // error must still leave a trace, or the next incident is guesswork.
+        const text = (value as { text?: unknown }).text;
+        settledOutput = typeof text === "string" ? text : undefined;
+        return value;
+      },
       (error) => { throw error; },
     );
     const value = await Promise.race([tracked, timeout, lost]);
@@ -312,7 +322,14 @@ async function controlled<T>(
     } catch { /* failed cancellation is uncertain */ }
     finally { if (stopTimer) clearTimeout(stopTimer); }
     if (err instanceof OwnershipLostError || r.lost) throw new OwnershipLostError();
-    if (!stopped) throw new UncertainExecutionError(`${label}: shutdown unconfirmed; automatic retry prohibited`);
+    if (!stopped) {
+      // The turn's own last words (stderr included) are the only evidence of
+      // why the CLI went away — carry them, or the incident is unreadable.
+      const tail = settledOutput
+        ? ` — last output: ${settledOutput.replace(/\s+/g, " ").trim().slice(-400)}`
+        : "";
+      throw new UncertainExecutionError(`${label}: shutdown unconfirmed; automatic retry prohibited${tail}`);
+    }
     throw err;
   } finally { r.execution = undefined; if (timer) clearTimeout(timer); }
 }
@@ -387,11 +404,19 @@ async function turn(r: Run, text: string, model: string | undefined, sessionId?:
   // The convention the protocol copy promises: $TASKCTL_LOG_DIR exists before
   // the worker is asked to write into it, every turn (also after handoffs).
   await mkdir(logDir, { recursive: true });
+  const startedAt = Date.now();
+  // An effort is a provider variant (`model#high`); only ask for one the
+  // model actually publishes — a model without that variant refuses the turn
+  // (`provider.no-route`) before any work happens.
+  const effort = r.task.effort ?? r.cfg.effort;
+  const resolved = await r.deps.adapter.resolveModel?.(model, effort);
   const args = {
-    sessionId, text, model, effort: r.task.effort ?? r.cfg.effort, title: r.task.title, cwd: r.cfg.workdir,
+    sessionId, text,
+    model: resolved ?? model,
+    effort: resolved === undefined ? effort : undefined,
+    title: r.task.title, cwd: r.cfg.workdir,
     env: { [TASK_DIR_ENV]: taskDir, [LOG_DIR_ENV]: logDir },
   };
-  const startedAt = Date.now();
   try {
     return { ...await controlled(r, "agent turn", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT,
       () => r.deps.adapter.start ? r.deps.adapter.start(args) : legacyExecution(() => r.deps.adapter.prompt(args)),
