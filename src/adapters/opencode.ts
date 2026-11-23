@@ -265,8 +265,34 @@ export class OpenCodeAdapter implements AgentAdapter {
         });
       });
     });
-    const execution = processExecution(child, result, true);
+    const execution = processExecution(child, result, true, () => this.interruptSession(sessionId));
     return { ...execution, inspect: () => ({ ...execution.inspect(), ...(sessionId ? { sessionId } : {}) }) };
+  }
+
+  /**
+   * Stop the session on the opencode service. `opencode run` is a client of a
+   * background service and the agent loop lives on that service: killing the
+   * client leaves the loop running - still calling the model, still running
+   * tools in the work tree (2026-11-23: three sessions outlived their clients,
+   * one for five hours, two of them editing a tree another session was also
+   * editing). `session.interrupt` is the service's stop operation; its reply
+   * says whether anything was running, and either way the session is not
+   * executing once it has arrived.
+   */
+  private async interruptSession(sessionId: string): Promise<boolean> {
+    if (!sessionId) return false;
+    try {
+      const envelope = await within(this.api("session.interrupt", [`sessionID=${sessionId}`]), 4000);
+      // This operation answers bare - `{"interrupted":true|false}` - unlike
+      // the enveloped telemetry calls (verified against the real service,
+      // 2026-11-23). Accept either shape; only a boolean counts as an answer.
+      const reply = asObject(envelope.data) ?? asObject(envelope);
+      return typeof reply?.interrupted === "boolean";
+    } catch {
+      // No service reachable, or an older service without the operation:
+      // unconfirmed, which is what the caller already assumes.
+      return false;
+    }
   }
 
   /**
@@ -383,4 +409,15 @@ function count(value: unknown): number {
 /** Narrow `unknown` to a plain object, else undefined. */
 function asObject(value: unknown): JsonObject | undefined {
   return typeof value === "object" && value !== null ? (value as JsonObject) : undefined;
+}
+
+/** A control-plane call that must not hang the cancellation path. */
+function within<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`no reply within ${ms}ms`)), ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
 }

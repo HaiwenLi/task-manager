@@ -28,6 +28,13 @@ export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
 export const ACCEPTANCE_TIMEOUT_MS_DEFAULT = 10 * 60_000;
 export const MAX_SESSIONS_PER_TASK_DEFAULT = 20;
 export const MAX_TURNS_PER_SESSION_DEFAULT = 40;
+/**
+ * How long a cancellation may take before the turn counts as "shutdown
+ * unconfirmed". A real cancellation is bounded well inside it: the stop of
+ * the backend session (4s cap) runs beside the process-tree kill (1.5s cap),
+ * then the exit confirmation (0.5s cap).
+ */
+export const CANCEL_DEADLINE_MS = 8_000;
 export const MAX_REVIEW_ROUNDS_DEFAULT = 2;
 /** Consecutive identical acceptance failures before the task waits for a human. */
 export const FAILURE_FINGERPRINT_LIMIT_DEFAULT = 3;
@@ -320,11 +327,15 @@ async function controlled<T>(
     if (!execution) throw err;
     r.record.sessionId = execution.inspect().sessionId;
     if (!(err instanceof WorkerTimeoutError) && !(err instanceof OwnershipLostError) && !r.lost && execution.inspect().state === "exited") throw err;
-    // Never wait indefinitely for a broken cancellation implementation.
+    // Never wait indefinitely for a broken cancellation implementation. The
+    // bound fits a real one: the backend stop (4s cap) runs beside the tree
+    // kill (1.5s cap) and the exit confirmation (0.5s cap). It was 2s until
+    // 2026-11-23, which left no room for asking the service to stop its
+    // session - so every timed-out turn was "unconfirmed" and parked the task.
     let stopTimer: ReturnType<typeof setTimeout> | undefined;
     let stopped = false;
     try {
-      stopped = await Promise.race([execution.cancel(), new Promise<false>(resolve => { stopTimer = setTimeout(() => resolve(false), 2_000); })]);
+      stopped = await Promise.race([execution.cancel(), new Promise<false>(resolve => { stopTimer = setTimeout(() => resolve(false), CANCEL_DEADLINE_MS); })]);
       stopped = stopped && execution.inspect().state === "exited";
     } catch { /* failed cancellation is uncertain */ }
     finally { if (stopTimer) clearTimeout(stopTimer); }

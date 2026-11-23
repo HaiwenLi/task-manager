@@ -26,7 +26,13 @@
 //                      retryable provider failure, not an uncertain turn
 //   FAKE_PROVIDER_RETRY   — emit a `retry` event carrying a rate-limit error
 //                      and exit non-zero: opencode's own retry loop gave up
-import { writeFileSync } from "node:fs";
+//   FAKE_RUN_HANG         — after the transcript, never exit: the stand-in for
+//                      an agent turn still running when the controller cancels it
+//   FAKE_INTERRUPT_FILE   — `api session.interrupt` appends the sessionID it
+//                      was asked to stop to this file
+//   FAKE_INTERRUPT_UNAVAILABLE — `api session.interrupt` fails: an older or
+//                      unreachable service
+import { appendFileSync, writeFileSync } from "node:fs";
 
 const argv = process.argv.slice(2);
 
@@ -81,6 +87,11 @@ if (subcommand === "run") {
   }
   process.stdout.write(`${lines.join("\n")}\n`);
   process.exitCode = Number(process.env.FAKE_EXIT_CODE ?? 0);
+  if (process.env.FAKE_RUN_HANG) {
+    // A turn still in flight: keep the client alive until it is cancelled.
+    process.stdout.write('{"sessionID":"ses_fake123","type":"text","part":{"type":"text","text":"still working"}}\n');
+    setInterval(() => {}, 60_000);
+  }
   }
 } else if (subcommand === "api" && operation === "session.get") {
   // --param sessionID=<id> → tokens telemetry; the sum input+output+
@@ -95,6 +106,27 @@ if (subcommand === "run") {
     })}\n`,
   );
   process.exitCode = 0;
+} else if (subcommand === "api" && operation === "session.interrupt") {
+  // The service's stop operation. FAKE_INTERRUPT_FILE records which session
+  // was asked to stop, so a test can prove the adapter interrupts the session
+  // it observed in the stream; FAKE_INTERRUPT_UNAVAILABLE models an older or
+  // unreachable service, which must leave the cancellation unconfirmed.
+  const paramIndex = argv.indexOf("--param");
+  const param = paramIndex >= 0 ? argv[paramIndex + 1] : "";
+  const sessionID = param.startsWith("sessionID=") ? param.slice("sessionID=".length) : "";
+  if (process.env.FAKE_INTERRUPT_UNAVAILABLE) {
+    process.stderr.write(`UnknownError: Operation not found: session.abort\n`);
+    process.exitCode = 1;
+  } else {
+    if (process.env.FAKE_INTERRUPT_FILE) {
+      appendFileSync(process.env.FAKE_INTERRUPT_FILE, `${sessionID}\n`);
+    }
+    // Bare reply, exactly as the real service answers this operation (no
+    // envelope): a double that invents a wrapper here passes the unit tests
+    // and fails against the real CLI.
+    process.stdout.write(`${JSON.stringify({ interrupted: true })}\n`);
+    process.exitCode = 0;
+  }
 } else if (subcommand === "api" && operation === "model.list") {
   process.stdout.write(
     `${JSON.stringify({

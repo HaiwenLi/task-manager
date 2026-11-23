@@ -50,7 +50,10 @@ it("missing acceptance has no PID and never passes", async () => {
   await expect(execution.result).resolves.toEqual({ passed: false, skipped: true });
 });
 
-it("OpenCode cancellation kills the local tree but cannot confirm backend termination", async () => {
+it("OpenCode cancellation kills the local tree; an unacknowledged backend leaves it uncertain", async () => {
+  // The process-tree fixture is not a service: it does not answer the stop
+  // request, so nothing proves the backend session ended. The kill still
+  // happens and is still not confirmation.
   const adapter = new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: [fixture] });
   const execution = adapter.start({ text: "offline fixture", cwd });
   try {
@@ -63,6 +66,73 @@ it("OpenCode cancellation kills the local tree but cannot confirm backend termin
     await expect(execution.cancel()).resolves.toBe(false);
   } finally { await execution.cancel(); }
 }, 10000);
+
+it("OpenCode cancellation stops the service-side session before confirming", async () => {
+  // opencode run is a client of a background service: the agent loop lives
+  // there and outlives a killed client (2026-11-23). The stop request goes to
+  // the session observed in the stream, and its acknowledgement is what turns
+  // the cancellation from "unconfirmed" into a confirmed shutdown.
+  const fake = fileURLToPath(new URL("./adapters/fake-opencode.mjs", import.meta.url));
+  const interrupted = join(cwd, "interrupted.txt");
+  process.env.FAKE_RUN_HANG = "1";
+  process.env.FAKE_INTERRUPT_FILE = interrupted;
+  try {
+    const execution = new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: [fake] }).start({ text: "hi", cwd });
+    for (let i = 0; i < 200 && execution.inspect().sessionId === undefined; i++) await delay(25);
+    expect(execution.inspect()).toMatchObject({ state: "running", sessionId: "ses_fake123" });
+    const started = Date.now();
+    await expect(execution.cancel()).resolves.toBe(true);
+    expect(Date.now() - started).toBeLessThan(6000);
+    expect(await readFile(interrupted, "utf8")).toBe("ses_fake123\n");
+    expect(execution.inspect().state).toBe("exited");
+  } finally {
+    delete process.env.FAKE_RUN_HANG;
+    delete process.env.FAKE_INTERRUPT_FILE;
+  }
+}, 15000);
+
+it("an older service without the stop operation leaves OpenCode cancellation uncertain", async () => {
+  const fake = fileURLToPath(new URL("./adapters/fake-opencode.mjs", import.meta.url));
+  process.env.FAKE_RUN_HANG = "1";
+  process.env.FAKE_INTERRUPT_UNAVAILABLE = "1";
+  try {
+    const execution = new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: [fake] }).start({ text: "hi", cwd });
+    for (let i = 0; i < 200 && execution.inspect().sessionId === undefined; i++) await delay(25);
+    await expect(execution.cancel()).resolves.toBe(false);
+    expect(execution.inspect().state).toBe("uncertain");
+  } finally {
+    delete process.env.FAKE_RUN_HANG;
+    delete process.env.FAKE_INTERRUPT_UNAVAILABLE;
+  }
+}, 15000);
+
+it("a backend stop that confirms keeps a cancel out of uncertain; one that fails does not", async () => {
+  const hang = (): Promise<boolean> => Promise.resolve(false);
+  const live = (stop?: () => Promise<boolean>) => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd, stdio: "ignore" });
+    const result = new Promise<number | null>((resolve) => child.once("close", resolve));
+    return processExecution(child, result, true, stop);
+  };
+  const confirmed = live(async () => true);
+  await expect(confirmed.cancel()).resolves.toBe(true);
+  expect(confirmed.inspect().state).toBe("exited");
+  for (const stop of [undefined, hang, async () => { throw new Error("service down"); }]) {
+    const execution = live(stop);
+    await expect(execution.cancel()).resolves.toBe(false);
+    expect(execution.inspect().state).toBe("uncertain");
+  }
+}, 15000);
+
+it("a client that exits by itself once the service stops the session counts as stopped", async () => {
+  // The real shape of a cancelled turn: the service's interrupt ends the run,
+  // the client leaves, and taskkill then reports nothing to kill. Verified
+  // against the real CLI on 2026-11-23; the unit double had hidden it.
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd, stdio: "ignore" });
+  const result = new Promise<number | null>((resolve) => child.once("close", resolve));
+  const execution = processExecution(child, result, true, async () => { child.kill(); return true; });
+  await expect(execution.cancel()).resolves.toBe(true);
+  expect(execution.inspect().state).toBe("exited");
+}, 15000);
 
 it("OpenCode start preserves successful prompt results", async () => {
   const fixture = fileURLToPath(new URL("./adapters/fake-opencode.mjs", import.meta.url));
