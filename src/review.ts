@@ -50,6 +50,21 @@ export type ReviewEvidence = {
 };
 
 /**
+ * Long evidence must not ride the agent argv unbounded: Windows caps a spawn
+ * command line near 32k characters, and 2026-11-23 saw a 45k-character
+ * acceptance log kill the review spawn with ENAMETOOLONG after the work had
+ * already succeeded. Keep the head and the tail — per-checkpoint PASS spam
+ * lives in the middle, failures and the summary live at the end — and mark
+ * the cut so the reviewer knows it saw a clip, never a silent hole.
+ */
+function clip(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const head = Math.floor(maxChars * 0.7);
+  const tail = maxChars - head;
+  return `${text.slice(0, head)}\n\n[…taskctl 截断：原文 ${text.length} 字符，此处省略 ${text.length - maxChars} 字符（保留开头与结尾）…]\n\n${text.slice(text.length - tail)}`;
+}
+
+/**
  * The reviewer sees evidence, never the worker's conversation: spec, the
  * acceptance command and its result, the handoff note, the journal tail. It is
  * asked for one JSON object so a stray sentence cannot silently become a verdict.
@@ -68,7 +83,7 @@ export function buildReviewPrompt(evidence: ReviewEvidence): string {
     evidence.spec.trim(),
     "",
     "## 验收命令与结果",
-    evidence.acceptanceMarkdown.trim() || "(没有验收记录)",
+    clip(evidence.acceptanceMarkdown.trim(), 18_000) || "(没有验收记录)",
     "",
     "## 工作区改动清单（git status --porcelain）",
     evidence.changes?.status.trim() || "(未收集)",
@@ -77,7 +92,7 @@ export function buildReviewPrompt(evidence: ReviewEvidence): string {
     evidence.changes?.diffStat.trim() || "(未收集)",
     "",
     "## 执行者的交接笔记",
-    evidence.handoff?.trim() || "(没有交接笔记)",
+    clip(evidence.handoff?.trim() ?? "", 8_000) || "(没有交接笔记)",
     "",
     "## 容忍的外部变更",
     ...(evidence.task.tolerate.length > 0
@@ -89,7 +104,7 @@ export function buildReviewPrompt(evidence: ReviewEvidence): string {
     `交给复核：${evidence.window.finishedAt}`,
     "",
     "## 运行日志尾部",
-    ...(evidence.journal.length > 0 ? evidence.journal : ["(空)"]),
+    ...(evidence.journal.length > 0 ? clip(evidence.journal.join("\n"), 4_000).split("\n") : ["(空)"]),
     "",
     "## 规则",
     "1. 逐条判定上面的验收标准，id 用 C1、C2 原样。",

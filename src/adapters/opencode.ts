@@ -59,6 +59,20 @@ export class OpenCodeAdapter implements AgentAdapter {
 
   start(args: PromptArgs): Execution<PromptResult> {
     const model = args.model ? `${args.model}${args.effort ? `#${args.effort}` : ""}` : undefined;
+    // Windows caps the spawn command line near 32k characters; a prompt that
+    // size must be clipped here with a visible marker instead of dying as
+    // spawn ENAMETOOLONG after the work already happened (2026-11-23: a
+    // review turn carrying a 45k acceptance log). Keep in sync with the
+    // clip() in src/review.ts — duplicated locally to keep the adapter
+    // layer free of review-layer imports.
+    const MAX_ARGV_TEXT = 28_000;
+    const clipArgvText = (text: string): string => {
+      if (text.length <= MAX_ARGV_TEXT) return text;
+      const head = Math.floor(MAX_ARGV_TEXT * 0.7);
+      const tail = MAX_ARGV_TEXT - head;
+      return `${text.slice(0, head)}\n\n[…taskctl 截断：prompt 原文 ${text.length} 字符超出命令行上限，此处省略 ${text.length - MAX_ARGV_TEXT} 字符（保留开头与结尾）…]\n\n${text.slice(text.length - tail)}`;
+    };
+    const text = clipArgvText(args.text);
     const argv = [
       "run",
       "--format",
@@ -67,7 +81,7 @@ export class OpenCodeAdapter implements AgentAdapter {
       ...(model ? ["--model", model] : []),
       ...(args.title ? ["--title", args.title] : []),
       "--auto",
-      args.text,
+      text,
     ];
     const child = spawn(this.bin, [...this.binArgsPrefix, ...argv], {
       cwd: args.cwd, shell: false, detached: process.platform !== "win32",
