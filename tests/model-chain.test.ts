@@ -194,3 +194,110 @@ describe("dispatch on a quota refusal", () => {
     expect(await latestNote(tasks, "a")).toBeNull();
   });
 });
+
+/**
+ * A backend whose answer depends on how many times it has been asked, so a
+ * model can refuse once (its quota window is closed) and answer on the next
+ * visit (the window reset while the chain walked).
+ */
+function scripted(script: Record<string, Array<PromptResult | "done">>): { adapter: AgentAdapter; seen: string[] } {
+  const seen: string[] = [];
+  const step = new Map<string, number>();
+  const answer = async (args: { model?: string }): Promise<PromptResult> => {
+    const model = args.model ?? "(default)";
+    seen.push(model);
+    const at = step.get(model) ?? 0;
+    step.set(model, at + 1);
+    const behaviour = script[model]?.[at];
+    if (behaviour === undefined) throw new Error(`unexpected dispatch: ${model} step ${at}`);
+    if (behaviour !== "done") return behaviour;
+    await mkdir(join(tasks, "a"), { recursive: true });
+    await writeFile(join(tasks, "a", "done.requested"), "done");
+    return { sessionId: `ses-${model}-${at}`, text: "done", exitCode: 0 };
+  };
+  return {
+    seen,
+    adapter: {
+      prompt: (args) => answer(args),
+      start: (args) => ({
+        result: answer(args),
+        inspect: () => ({ state: "exited" as const }),
+        cancel: async () => true,
+      }),
+      contextUsage: async () => 0,
+      contextLimit: async () => 100,
+    },
+  };
+}
+
+describe("cyclic chain (chainCycles)", () => {
+  it("wraps to the head when the tail refuses, and finishes on a recovered model", async () => {
+    const first = scripted({
+      "q/one": [quotaRefusal(), "done"],
+      "q/two": [quotaRefusal()],
+      "q/three": [quotaRefusal()],
+    });
+
+    const outcome = await run(first.adapter, [], { model: "q/one", modelChain: chain, chainCycles: 1 });
+
+    // The whole chain refused once; the wrap gave the head a second chance and
+    // its window had reset — exactly the cyclic behaviour an operator asked
+    // for: park only when the whole cycle is out of allowance.
+    expect(outcome).toBe("done");
+    expect(first.seen).toEqual(["q/one", "q/two", "q/three", "q/one"]);
+    expect((await store.get("a")).retries).toBe(0);
+    expect(await readModelRotation(tasks, "a")).toMatchObject({
+      worker: { index: 0, model: "q/one" },
+      cycles: { worker: 1 },
+    });
+  });
+
+  it("parks for the owner only after the whole cycle refused, retries untouched", async () => {
+    const events: WorkerEvent[] = [];
+    const allDown = scripted({
+      "q/one": [quotaRefusal(), quotaRefusal()],
+      "q/two": [quotaRefusal(), quotaRefusal()],
+      "q/three": [quotaRefusal(), quotaRefusal()],
+    });
+
+    const outcome = await run(allDown.adapter, events, { model: "q/one", modelChain: chain, chainCycles: 1 });
+
+    expect(outcome).toBe("blocked");
+    expect(allDown.seen).toEqual([...chain, ...chain]);
+    const task = await store.get("a");
+    expect(task.status).toBe("blocked");
+    expect(task.retries).toBe(0);
+    const blocked = events.find((event) => event.type === "blocked")?.detail ?? "";
+    expect(blocked).toContain("1 wrap(s)");
+    expect(blocked).toContain("owner decision required");
+    const note = await latestNote(tasks, "a");
+    expect(note?.markdown).toContain("blocked:needs-owner");
+    expect(note?.markdown).toContain("付费档");
+    expect((await journalTail(tasks, "a", 20)).join("\n")).toContain("chainCycles=1 wrap(s) included");
+  });
+
+  it("gives a new attempt a fresh wrap budget while keeping the position", async () => {
+    const allDown = scripted({
+      "q/one": [quotaRefusal(), quotaRefusal()],
+      "q/two": [quotaRefusal(), quotaRefusal()],
+      "q/three": [quotaRefusal(), quotaRefusal()],
+    });
+    await run(allDown.adapter, [], { model: "q/one", modelChain: chain, chainCycles: 1 });
+    await store.updateFields("a", { retries: 0 });
+    await store.setStatus("a", "open");
+
+    // The rerun starts at the tail (the rotation survived, so the dead head is
+    // not retried first) and may wrap again (the budget reset with the attempt)
+    // — here the tail is still down and the head has recovered.
+    const recovered = scripted({
+      "q/three": [quotaRefusal()],
+      "q/one": ["done"],
+      "q/two": [quotaRefusal()],
+    });
+    const outcome = await run(recovered.adapter, [], { model: "q/one", modelChain: chain, chainCycles: 1 });
+
+    expect(outcome).toBe("done");
+    expect(recovered.seen).toEqual(["q/three", "q/one"]);
+    expect((await store.get("a")).retries).toBe(0);
+  });
+});

@@ -17,7 +17,7 @@ import {
 import { definitionDigest, readAttempt, readDefinitionSnapshot, readRuntime, writeDefinitionSnapshot, writeRuntime, type AttemptRecord } from "./runtime.js";
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
-import { chainPosition, configChain, modelAt, modelChain, readModelRotation, rotateModel, type Handover, type ModelRole } from "./models.js";
+import { chainPosition, configChain, modelAt, modelChain, readModelRotation, resetChainCycles, rotateModel, type Handover, type ModelRole } from "./models.js";
 import { classifyDispatchFailure, quotaBackoffMs } from "./dispatch.js";
 import { failureFingerprint } from "./fingerprint.js";
 import { startReview, type CriterionResult, type ReviewEvidence, type ReviewResult } from "./review.js";
@@ -69,6 +69,13 @@ export type WorkerConfig = {
   failureFingerprintLimit?: number;
   /** Backoff schedule after a quota refusal, by step; the last entry repeats. */
   quotaBackoffMs?: number[];
+  /**
+   * How many times the model chain may wrap back to its head once the tail is
+   * reached (default 0 = a linear chain, spent at the tail). A wrap re-probes
+   * models that refused earlier — quota windows reset while the chain walks —
+   * so a task parks for a human only when the whole cycle is out of allowance.
+   */
+  chainCycles?: number;
   /** How many tasks the scheduler may run at once (default 2). */
   parallel?: number;
   /** Viewports a `verify: render` task must pass (default 1440x900 and 390x844). */
@@ -366,7 +373,7 @@ async function fallBack(r: Run, role: ModelRole, reason: string): Promise<boolea
   const chain = role === "worker" ? workerChain(r) : reviewerChain(r);
   let handover: Handover | null;
   try {
-    handover = await owned(r, () => rotateModel(r.cfg.tasksDir, r.task.id, role, chain, reason));
+    handover = await owned(r, () => rotateModel(r.cfg.tasksDir, r.task.id, role, chain, reason, r.cfg.chainCycles ?? 0));
   } catch (error) {
     // A lost lease is not a rotation problem: let the run skip, and do not
     // report a write failure for a task this controller no longer owns.
@@ -519,17 +526,17 @@ async function blockForQuota(r: Run, current: string, result: PromptResult & { d
       task: r.task.id, seq, status: "blocked:needs-owner",
       done: `派发失败：配额耗尽，链上 ${tried.length} 个模型都拒绝执行本任务；未消耗 retries（任务本身没跑过）。`,
       found: tried.map(([model, reason]) => `- ${reason}`).join("\n"),
-      next: "换一个有额度的模型（配置 modelChain）或等窗口重置后 taskctl retry；不要把它当作任务失败去改判据。",
+      next: "换一个有额度的模型（配置 modelChain）、等窗口重置后 taskctl retry，或由所有者决策升级到付费档/其他供应商（不要把它当作任务失败去改判据）。",
       files: [],
     });
     await r.deps.store.setStatus(r.task.id, "blocked");
     await appendJournal(r.cfg.tasksDir, r.task.id, {
       stage: "worker",
       event: "blocked",
-      detail: `quota exhausted on every model: ${tried.map(([model]) => model).join(" -> ")}`,
+      detail: `quota exhausted on every model: ${tried.map(([model]) => model).join(" -> ")}${r.cfg.chainCycles ? ` (chainCycles=${r.cfg.chainCycles} wrap(s) included)` : ""}`,
     });
   });
-  emit(r, "blocked", `quota exhausted on every model in the chain (${tried.map(([model]) => model).join(" -> ")}); retries untouched`);
+  emit(r, "blocked", `quota exhausted on every model in the chain (${tried.map(([model]) => model).join(" -> ")}${r.cfg.chainCycles ? `, ${r.cfg.chainCycles} wrap(s)` : ""}); retries untouched — owner decision required (fund a model / wait for the window / escalate tiers by hand)`);
   return "blocked";
 }
 
@@ -539,9 +546,14 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
   // A handover is progress only if the recording sticks. On a cached or syncing
   // filesystem the position can read back stale, and then every turn looks like
   // a successful handover with no retry ever spent. The chain bounds how many
-  // legitimate handovers exist, so the loop is bounded by it too.
-  const maxHandovers = workerChain(r).length;
+  // legitimate handovers exist — one traversal plus every wrap the cycle budget
+  // allows — so the loop is bounded by it too.
+  const chainCycles = r.cfg.chainCycles ?? 0;
+  const maxHandovers = workerChain(r).length * (1 + chainCycles);
   let handovers = 0;
+  // A new attempt gets a fresh wrap budget: the position still points past the
+  // models that refused, but the chain may wrap around to them again.
+  await resetChainCycles(r.cfg.tasksDir, r.task.id, "worker");
   for (;;) {
     const note = await latestNote(r.cfg.tasksDir, r.task.id);
     const prompt = buildWorkerPrompt(r.task, {
@@ -950,12 +962,15 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
   // review is retried in place — with the next model when the chain has one —
   // and the task does not go back through the worker, because re-executing the
   // work to retry a review duplicates every side effect of a task that is not
-  // idempotent (a spreadsheet write, a file move). The chain is finite, and the
-  // loop is bounded by it explicitly rather than by trusting the read-back: a
-  // position that keeps coming back stale would otherwise spin forever with no
-  // retry spent.
-  const maxHandovers = reviewerChain(r).length;
+  // idempotent (a spreadsheet write, a file move). The chain is a cycle under
+  // the same wrap budget as the worker's, and the loop is bounded by it
+  // explicitly rather than by trusting the read-back: a position that keeps
+  // coming back stale would otherwise spin forever with no retry spent.
+  const chainCycles = r.cfg.chainCycles ?? 0;
+  const maxHandovers = reviewerChain(r).length * (1 + chainCycles);
   let handovers = 0;
+  // A fresh review round gets a fresh wrap budget, like a fresh attempt.
+  await resetChainCycles(r.cfg.tasksDir, id, "reviewer");
   for (;;) {
     const reviewerModel = await modelFor(r, "reviewer");
     const result = await controlled(r, "review", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT, () =>

@@ -30,7 +30,18 @@ export type ModelRole = "worker" | "reviewer";
 
 /** How far down the chain a role has moved, and the model that position was chosen for. */
 export type RotationEntry = { index: number; model: string };
-export type ModelRotation = { worker?: RotationEntry; reviewer?: RotationEntry; reason?: string; updatedAt?: string };
+/**
+ * How many times each role has wrapped around to the head of the chain. A wrap
+ * is a re-probe of models that refused earlier — their quota window may have
+ * reset while the chain was walking — so the budget is per attempt, not forever.
+ */
+export type ModelRotation = {
+  worker?: RotationEntry;
+  reviewer?: RotationEntry;
+  cycles?: Partial<Record<ModelRole, number>>;
+  reason?: string;
+  updatedAt?: string;
+};
 export type Handover = { role: ModelRole; from: string; to: string };
 
 const FILE = "models.json";
@@ -108,6 +119,14 @@ export async function readModelRotation(tasksDir: string, id: string): Promise<M
     return {
       worker: entry(parsed.worker),
       reviewer: entry(parsed.reviewer),
+      ...(typeof parsed.cycles === "object" && parsed.cycles !== null
+        ? {
+            cycles: {
+              ...(typeof (parsed.cycles as Record<string, unknown>).worker === "number" ? { worker: (parsed.cycles as Record<string, number>).worker } : {}),
+              ...(typeof (parsed.cycles as Record<string, unknown>).reviewer === "number" ? { reviewer: (parsed.cycles as Record<string, number>).reviewer } : {}),
+            },
+          }
+        : {}),
       ...(typeof parsed.reason === "string" ? { reason: parsed.reason } : {}),
       ...(typeof parsed.updatedAt === "string" ? { updatedAt: parsed.updatedAt } : {}),
     };
@@ -129,6 +148,12 @@ export async function writeModelRotation(tasksDir: string, id: string, rotation:
  * Advance one role to the next model in its chain, or report that the chain is
  * spent.
  *
+ * With `maxCycles > 0` the chain is a cycle, not a queue: reaching the tail
+ * wraps back to the head (a model that refused earlier may have recovered —
+ * quota windows reset while the chain walks) until the wrap budget is spent.
+ * Only then is the chain truly "spent" and the caller parks the task for a
+ * human instead of retrying.
+ *
  * A failed write throws: the caller contains it (see `fallBack` in the worker),
  * because a rotation that cannot be recorded must not be reported as progress.
  * Writing is how the position survives the retry, so an unrecorded handover
@@ -140,13 +165,50 @@ export async function rotateModel(
   role: ModelRole,
   chain: readonly string[],
   reason: string,
+  maxCycles = 0,
   now: Date = new Date(),
 ): Promise<Handover | null> {
   const current = await readModelRotation(tasksDir, id);
   const index = chainPosition(chain, current[role]);
   const next = index + 1;
-  if (next >= chain.length) return null;
+  const cycles = current.cycles?.[role] ?? 0;
+  if (next >= chain.length) {
+    if (chain.length === 0 || cycles >= maxCycles) return null;
+    const to = chain[0]!;
+    await writeModelRotation(tasksDir, id, {
+      ...current,
+      [role]: { index: 0, model: to },
+      cycles: { ...current.cycles, [role]: cycles + 1 },
+      reason,
+      updatedAt: now.toISOString(),
+    });
+    return { role, from: chain[index]!, to };
+  }
   const to = chain[next]!;
-  await writeModelRotation(tasksDir, id, { ...current, [role]: { index: next, model: to }, reason, updatedAt: now.toISOString() });
+  await writeModelRotation(tasksDir, id, {
+    ...current,
+    [role]: { index: next, model: to },
+    cycles: current.cycles,
+    reason,
+    updatedAt: now.toISOString(),
+  });
   return { role, from: chain[index]!, to };
+}
+
+/**
+ * Give a role a fresh wrap budget for a new attempt. The position stays where
+ * it is — a rerun still does not retry the dead head first — but the chain may
+ * wrap around to it again, so a recovered model re-enters the rotation instead
+ * of the task parking forever on a tail that never comes back. Advisory, like
+ * the rotation itself: a lost or unreadable file is a no-op, never an error.
+ */
+export async function resetChainCycles(tasksDir: string, id: string, role: ModelRole): Promise<void> {
+  try {
+    const current = await readModelRotation(tasksDir, id);
+    if ((current.cycles?.[role] ?? 0) === 0) return;
+    await writeModelRotation(tasksDir, id, { ...current, cycles: { ...current.cycles, [role]: 0 } });
+  } catch {
+    // Advisory state only: a reset that cannot be read or written costs at
+    // most one rejected dispatch, never a task.
+  }
 }

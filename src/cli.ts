@@ -896,6 +896,7 @@ export function resolveConfig(raw: Record<string, unknown>, path: string): Resol
     acceptanceTimeoutMs: number(raw, "acceptanceTimeoutMs", path),
     maxSessionsPerTask: integer(raw, "maxSessionsPerTask", path),
     maxTurnsPerSession: integer(raw, "maxTurnsPerSession", path),
+    chainCycles: integer(raw, "chainCycles", path),
     maxReviewRounds: integer(raw, "maxReviewRounds", path),
     reviewerModel: string(raw, "reviewerModel", path),
     reviewerEffort: string(raw, "reviewerEffort", path),
