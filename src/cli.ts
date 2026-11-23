@@ -842,7 +842,7 @@ async function readConfig(path: string): Promise<Record<string, unknown>> {
 }
 
 /** Fields a `taskctl.json` may carry (v0.1). */
-const CONFIG_KEYS = new Set([
+export const CONFIG_KEYS = new Set([
   "tasksDir",
   "workdir",
   "agent",
@@ -856,6 +856,7 @@ const CONFIG_KEYS = new Set([
   "acceptanceTimeoutMs",
   "maxSessionsPerTask",
   "maxTurnsPerSession",
+  "chainCycles",
   "maxReviewRounds",
   "reviewerModel",
   "reviewerEffort",
@@ -896,7 +897,7 @@ export function resolveConfig(raw: Record<string, unknown>, path: string): Resol
     acceptanceTimeoutMs: number(raw, "acceptanceTimeoutMs", path),
     maxSessionsPerTask: integer(raw, "maxSessionsPerTask", path),
     maxTurnsPerSession: integer(raw, "maxTurnsPerSession", path),
-    chainCycles: integer(raw, "chainCycles", path),
+    chainCycles: nonNegativeInteger(raw, "chainCycles", path),
     maxReviewRounds: integer(raw, "maxReviewRounds", path),
     reviewerModel: string(raw, "reviewerModel", path),
     reviewerEffort: string(raw, "reviewerEffort", path),
@@ -951,6 +952,20 @@ function integer(raw: Record<string, unknown>, key: string, path: string): numbe
   const value = number(raw, key, path);
   if (value !== undefined && !Number.isInteger(value)) {
     throw new Error(`config ${path}: field "${key}" must be an integer`);
+  }
+  return value;
+}
+
+/**
+ * A count whose zero is a meaningful setting rather than an omission, such as
+ * `chainCycles` (0 = a linear chain). `number` insists on a positive value, so
+ * zero is read here before that rule applies.
+ */
+function nonNegativeInteger(raw: Record<string, unknown>, key: string, path: string): number | undefined {
+  const value = raw[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new Error(`config ${path}: field "${key}" must be a non-negative integer`);
   }
   return value;
 }

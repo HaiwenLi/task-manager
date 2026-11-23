@@ -1,7 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { resolveConfig } from "../src/cli.js";
+import { CONFIG_KEYS, resolveConfig } from "../src/cli.js";
 
 describe("resolveConfig", () => {
+  it("resolves only fields it also accepts (the allowlist and the parser never drift apart)", () => {
+    // A key that is parsed but missing from the allowlist makes every command
+    // refuse the config that carries it, which is how `chainCycles` first
+    // shipped: 406 tests green, and `taskctl retry --config` dead on arrival.
+    const resolved = Object.keys(resolveConfig({}, "taskctl.json"));
+    expect(resolved.filter((key) => !CONFIG_KEYS.has(key))).toEqual([]);
+  });
+
+  it("accepts a wrap budget for the model chain, zero included", () => {
+    expect(resolveConfig({ chainCycles: 2 }, "taskctl.json").chainCycles).toBe(2);
+    // 0 is the documented "linear chain" setting, not a missing value.
+    expect(resolveConfig({ chainCycles: 0 }, "taskctl.json").chainCycles).toBe(0);
+    expect(resolveConfig({}, "taskctl.json").chainCycles).toBeUndefined();
+  });
+
+  it("rejects a wrap budget that is negative or not an integer", () => {
+    expect(() => resolveConfig({ chainCycles: -1 }, "taskctl.json")).toThrow(/non-negative integer/);
+    expect(() => resolveConfig({ chainCycles: 1.5 }, "taskctl.json")).toThrow(/non-negative integer/);
+    expect(() => resolveConfig({ chainCycles: "2" }, "taskctl.json")).toThrow(/non-negative integer/);
+  });
   it("accepts the pipeline keys", () => {
     const cfg = resolveConfig({ parallel: 3, maxReviewRounds: 1, reviewerModel: "x/y", reviewerEffort: "high" }, "taskctl.json");
     expect(cfg.parallel).toBe(3);
