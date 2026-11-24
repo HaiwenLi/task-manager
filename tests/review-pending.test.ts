@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../src/cli.js";
 import { latestNote } from "../src/handoff.js";
+import { noteModelRefusal } from "../src/model-cooldown.js";
 import { readRuntime } from "../src/runtime.js";
 import { runTask, type WorkerConfig, type WorkerDeps } from "../src/worker.js";
 import type { AgentAdapter } from "../src/adapters/types.js";
@@ -106,6 +107,51 @@ describe("review-pending recovery", () => {
     expect(metrics).toMatch(/只复核恢复\s+1/);
     expect(metrics).toMatch(/自动返工\s+0 个任务/);
     expect(metrics).toMatch(/首轮通过率\s+100%\s+\(1\/1\)/);
+  });
+
+  it("recovers a task that declares its own workdir without refusing it as changed", async () => {
+    // 调度器、watch、批次都先把任务的 workdir 解析成实际目录；只复核的恢复也必须这样做，
+    // 否则针对另一个目录重算摘要，恢复永远被拒，而 reconcile 还在推荐它。
+    const calls: string[] = [];
+    const sub = join(work, "sub");
+    await mkdir(sub, { recursive: true });
+    await writeFile(join(sub, "out.txt"), "the work product", "utf8");
+    const file = join(tasks, "a.md");
+    await writeFile(file, (await readFile(file, "utf8")).replace('acceptance: "check"', 'acceptance: "check"\nworkdir: sub'), "utf8");
+    const parked = await runTask({ ...config(), workdir: sub }, {
+      store, adapter: workerAdapter(calls), acceptance: pass, review: async () => providerRefusal,
+    }, await store.get("a"), "w1");
+    expect(parked).toBe("blocked");
+
+    const configPath = join(root, "taskctl.json");
+    await writeFile(configPath, JSON.stringify({ tasksDir: tasks, workdir: work, reviewerModel: "r/two" }), "utf8");
+    const review = vi.fn(async () => passVerdict);
+    const errors: string[] = [];
+    const code = await runCli(["retry", "--task", "a", "--review-only", "--config", configPath], {
+      adapter: workerAdapter(calls), acceptance: pass, review, log: () => {}, err: (line) => { errors.push(line); },
+    });
+
+    expect(code, errors.join("\n")).toBe(0);
+    expect(review).toHaveBeenCalledTimes(1);
+    expect(calls).toEqual(["worker"]);
+    expect((await store.get("a")).status).toBe("done");
+    // Recovery is an entry point like run and watch: it leaves the same per-task event log.
+    const logs = (await readdir(join(tasks, "a", "logs"))).filter((name) => /^run-.+\.log$/.test(name));
+    expect(logs).toHaveLength(1);
+    expect(await readFile(join(tasks, "a", "logs", logs[0]!), "utf8")).toContain("[a] done");
+  });
+
+  it("names the cooling reviewer model in the parked record", async () => {
+    await noteModelRefusal(tasks, "r/one", { reason: "another task saw a 429", cooldownMs: 600_000 });
+    const calls: string[] = [];
+    const review = vi.fn(async () => passVerdict);
+
+    const outcome = await runTask(config(), { store, adapter: workerAdapter(calls), acceptance: pass, review }, await store.get("a"), "w1");
+
+    expect(outcome).toBe("blocked");
+    expect(review).not.toHaveBeenCalled();
+    expect(await readRuntime<{ refusals: Array<{ model: string }> }>(tasks, "a", "review-pending.json"))
+      .toMatchObject({ refusals: [{ model: "r/one" }] });
   });
 
   it("rejects review-only recovery when the artifact changed", async () => {

@@ -842,13 +842,19 @@ async function checkCommand(flags: Map<string, string>, log: (line: string) => v
   }
   const command = task.workerSelfCheck?.trim();
   if (!command) throw new Error(`task ${id} has no worker_self_check declaration`);
-  const timeoutMs = task.workerSelfCheckTimeoutMs ?? 20 * 60_000;
-  const turnBound = cfg.turnTimeoutMs ?? 30 * 60_000;
+  // The worker runs this command inside the task's workspace and cannot see
+  // the controller's --config. The attempt record, written by the controller
+  // at claim, is the authority for both the workspace and the turn bound; the
+  // config beside the caller is only a fallback for records that predate it.
+  const turnBound = attempt.turnTimeoutMs ?? cfg.turnTimeoutMs ?? 30 * 60_000;
+  // An undeclared timeout is capped by the turn bound: a default longer than
+  // the turn would refuse every self-check on a short-turn board.
+  const timeoutMs = task.workerSelfCheckTimeoutMs ?? Math.min(20 * 60_000, turnBound);
   if (timeoutMs > turnBound) {
     throw new Error(`task ${id}: worker_self_check_timeout_ms ${timeoutMs} exceeds turnTimeoutMs ${turnBound}`);
   }
   const startedAt = new Date().toISOString();
-  const result = await runSelfCheck({ command, cwd: taskWorkdir(cfg.workdir, task), timeoutMs });
+  const result = await runSelfCheck({ command, cwd: attempt.workspace || taskWorkdir(cfg.workdir, task), timeoutMs });
   await writeRuntime(tasksDir, id, "self-check.json", {
     command, mode: "generate", startedAt, finishedAt: new Date().toISOString(), result,
   });
@@ -1208,16 +1214,23 @@ async function retryCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
   const cfg = await configFor(flags);
   const id = flags.get("task")!;
   if (flags.has("review-only")) {
-    const store = new TaskStore(tasksDir);
+    const store = deps.store ?? new TaskStore(tasksDir);
     const task = await store.get(id);
     const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
-    const outcome = await runTask({ ...cfg, tasksDir }, {
-      store, adapter,
-      ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
-      ...(deps.review === undefined ? {} : { review: deps.review }),
-      onEvent: (evt) => log(`[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`),
-    }, task, `review-only-${process.pid}-${id}`, { reviewOnly: true });
-    await refreshBoardFile(tasksDir).catch(() => {});
+    // Every other entry point resolves the task's own workdir before reserving
+    // and hashing it. Recovery must too, or a task that declares a workdir is
+    // re-digested against another tree and refused as changed for good.
+    const resolved = { ...cfg, tasksDir, workdir: taskWorkdir(cfg.workdir, task) };
+    // Recovery is an entry point like run and watch: it leaves the same
+    // per-task event log and the same trailing board refresh.
+    const telemetry = await createControllerTelemetry(resolved);
+    let outcome: Awaited<ReturnType<typeof runTask>>;
+    try {
+      outcome = await runTask(resolved, createWorkerDeps({ deps, adapter, store, telemetry, log }),
+        task, `review-only-${process.pid}-${id}`, { reviewOnly: true });
+    } finally {
+      await telemetry.flush();
+    }
     log(outcome === "done" || outcome === "awaiting-human" || outcome === "open"
       ? `review-only recovery finished: ${outcome}`
       : `review-only recovery refused or still unavailable: ${outcome}`);

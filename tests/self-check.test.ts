@@ -67,6 +67,71 @@ describe("worker self-check", () => {
     expect((await new TaskStore(tasks).get("a")).status).toBe("running");
   });
 
+  it("runs in the attempt's workspace under the attempt's turn bound, whatever the caller's cwd", async () => {
+    // worker 在任务自己的 workdir 里执行 taskctl check：它看不到控制器的 --config，
+    // 也不负责解析任务的子路径。这两样都是控制器在领取时写进 attempt.json 的事实。
+    const sub = join(work, "sub");
+    await mkdir(sub, { recursive: true });
+    const task = buildTaskFile({
+      id: "a", status: "running", workdir: "sub",
+      workerSelfCheck: `"${process.execPath}" -e "process.stdout.write(process.cwd())"`,
+    });
+    await writeFile(join(tasks, "a.md"), serializeTaskFile(task), "utf8");
+    await mkdir(join(tasks, "a"), { recursive: true });
+    await writeRuntime(tasks, "a", "attempt.json", {
+      attemptId: "active-a", backend: "fixture", workspace: sub, turnTimeoutMs: 60_000,
+      startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      phase: "active", operation: "agent turn",
+    });
+
+    const code = await runCli(["check", "--task", "a", "--tasks-dir", tasks], { log: () => {} });
+
+    expect(code).toBe(0);
+    const record = await readRuntime<{ result: { output?: string } }>(tasks, "a", "self-check.json");
+    expect(record?.result.output).toBe(sub);
+  });
+
+  it("judges a declared self-check timeout against the attempt's turn bound, not a default", async () => {
+    // 控制器以 45 分钟的回合上限启动、未在 worker 的 cwd 下留 taskctl.json：
+    // 一次 40 分钟的自检是合法的，不能被 30 分钟的缺省上界拒掉。
+    const task = buildTaskFile({
+      id: "a", status: "running", workerSelfCheck: nodePrint("within-the-turn-bound"),
+      workerSelfCheckTimeoutMs: 2_400_000,
+    });
+    await writeFile(join(tasks, "a.md"), serializeTaskFile(task), "utf8");
+    await mkdir(join(tasks, "a"), { recursive: true });
+    await writeRuntime(tasks, "a", "attempt.json", {
+      attemptId: "active-a", backend: "fixture", workspace: work, turnTimeoutMs: 2_700_000,
+      startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      phase: "active", operation: "agent turn",
+    });
+
+    const code = await runCli(["check", "--task", "a", "--tasks-dir", tasks], { log: () => {} });
+
+    expect(code).toBe(0);
+    expect(await readRuntime(tasks, "a", "self-check.json")).toMatchObject({ result: { passed: true } });
+  });
+
+  it("refuses a declared self-check timeout above the attempt's turn bound", async () => {
+    const task = buildTaskFile({
+      id: "a", status: "running", workerSelfCheck: nodePrint("too-long"),
+      workerSelfCheckTimeoutMs: 20_000,
+    });
+    await writeFile(join(tasks, "a.md"), serializeTaskFile(task), "utf8");
+    await mkdir(join(tasks, "a"), { recursive: true });
+    await writeRuntime(tasks, "a", "attempt.json", {
+      attemptId: "active-a", backend: "fixture", workspace: work, turnTimeoutMs: 10_000,
+      startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      phase: "active", operation: "agent turn",
+    });
+    const errors: string[] = [];
+
+    const code = await runCli(["check", "--task", "a", "--tasks-dir", tasks], { log: () => {}, err: (line) => { errors.push(line); } });
+
+    expect(code).toBe(1);
+    expect(errors.join("\n")).toContain("exceeds turnTimeoutMs 10000");
+  });
+
   it("refuses a task that is not running or has no declared self-check", async () => {
     const task = buildTaskFile({ id: "a", status: "open" });
     await writeFile(join(tasks, "a.md"), serializeTaskFile(task), "utf8");

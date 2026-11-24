@@ -14,6 +14,8 @@ export type AttemptRecord = {
   pid?: number;
   sessionId?: string;
   reason?: string;
+  /** The worker turn bound this attempt runs under; the worker-side self-check is judged against it. */
+  turnTimeoutMs?: number;
 };
 
 /** Where the claim-time definition snapshot lives, beside `attempt.json`. */
