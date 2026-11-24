@@ -385,11 +385,14 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
       + `${result.pending.join(", ")}. Run taskctl run again to continue.`,
     );
   }
+  // Each is said when its own count is above zero, the controller errors
+  // first: a run with both must not let the earlier return hide the later line.
+  let failed = false;
   if (controllerErrors > 0) {
     // A task blocked by a controller bug is not an ordinary outcome. The board
     // was still drained, but the run must not read as clean to a script.
     log(`[scheduler] ${controllerErrors} task(s) blocked by a controller error; see the controller-error line(s) above`);
-    return 1;
+    failed = true;
   }
   // What was refused is read off the result, never off the events: those are
   // reported once per process per task, and an exit code must not depend on
@@ -405,9 +408,9 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
     // The guard's verdicts are in the `refused` line(s) above. The board was
     // still drained, but a task that did not run must not read as clean to a script.
     log(`[scheduler] ${refused.length} task(s) refused by the budget guard; nothing was claimed for them`);
-    return 1;
+    failed = true;
   }
-  return 0;
+  return failed ? 1 : 0;
 }
 
 /** `taskctl watch` — own and drain one board until its stop request appears. */

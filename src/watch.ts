@@ -227,11 +227,15 @@ async function scheduleOnce(
       // The selection is fixed at this boundary. Arrivals during it are picked
       // up by a later board scan, never appended to the active batch.
       const result = await runSelected(cfg, deps, selected, { shouldStop });
-      // A refusal ran nothing, so it is no reason for an immediate fresh
-      // snapshot: the queue waits, and the next pass leaves the task out.
       if (result.stoppedAt !== undefined && result.outcome === "refused") {
         refusedAt.set(result.stoppedAt, Date.now());
-        return "wait";
+        // The refusal itself ran nothing, so when nothing else in the batch
+        // did either it is no reason for an immediate fresh snapshot: the
+        // queue waits, and the next pass leaves the task out. What the batch
+        // finished before the refusal may have made other tasks eligible,
+        // and those are not worth waiting for: the next pass leaves the
+        // refused task out just the same, so nothing can spin.
+        return result.done.length > 0 ? "worked" : "wait";
       }
       // A batch that exhausted its open budget did no terminal work: wait for
       // the next event/fallback exactly like the ordinary open outcome.

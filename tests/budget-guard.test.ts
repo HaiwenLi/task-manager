@@ -527,6 +527,33 @@ describe("a batch and the watch queue", () => {
     expect(gaps[0]).toBeGreaterThanOrEqual(100);
   });
 
+  it("a refused batch that got work done makes the queue rescan at once, and the next pass still leaves that task out", async () => {
+    // a, b and c open and all eligible for one batch; b is finished before c is refused
+    await seedTaskFile(tasks, task("a"), task("b"), task("c"));
+    const batches: string[][] = [];
+    // How long the queue waited between the end of one batch and the start of the next.
+    const gaps: number[] = [];
+    let previousEnded: number | undefined;
+    await queue({
+      // No wake comes. The fallback is longer than the harness's 3 s deadline, so a queue that waits for it
+      // is stopped before it fires, and never reaches a second batch.
+      watchFs, fallbackMs: 5_000, debounceMs: 5,
+      runBatch: async (_c, _d, ids) => {
+        if (previousEnded !== undefined) gaps.push(Date.now() - previousEnded);
+        batches.push(ids);
+        if (batches.length === 2) await requestStop();
+        previousEnded = Date.now();
+        return { done: ["b"], stoppedAt: "c", outcome: "refused", pending: ids.filter((id) => id !== "b") };
+      },
+      runOne: async () => { await requestStop(); return "done"; },
+    });
+    // What was finished may have made other tasks eligible, so the pass after the batch is not worth waiting for...
+    expect(batches).toEqual([["a", "b", "c"], ["a", "b"]]);
+    // ...and it began at once: no wake was sent before the second batch asked for the stop itself.
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]).toBeLessThan(1_000);
+  });
+
   it("leaves a refused task out of its candidates for five minutes by default", () => {
     expect(REFUSED_RETRY_MS).toBe(300_000);
   });
@@ -675,6 +702,37 @@ describe("run, add and split through the CLI", () => {
     expect(text).toContain("[batch] stopped at a (refused); unclaimed: b");
     expect(text).toContain("[scheduler] 1 task(s) refused by the budget guard; nothing was claimed for them");
     expect(promptCalls).toBe(0);
+  });
+
+  it("run prints the refusals beside the controller errors, and exits 1 for either", async () => {
+    // a has no model of its own, so it runs on the configured "zen/p" and is refused.
+    // b may run, and its store's next session append fails the way a full disk does (as in tests/fault-isolation.test.ts).
+    await seedTaskFile(tasks, buildTaskFile({ id: "a", title: "a" }), task("b", { model: "plan/m" }));
+    const real = new TaskStore(tasks);
+    const flaky = Object.create(real) as TaskStore;
+    let failNext = true;
+    flaky.appendSession = async (...args: Parameters<TaskStore["appendSession"]>) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("disk full");
+      }
+      return real.appendSession(...args);
+    };
+
+    expect(await runCli(["run", "--config", config], cli({
+      store: flaky,
+      adapter: { ...doneAdapter({ tasksDir: tasks, sessionId: (id) => `s-${id}` }), ...adapterOf(CATALOGUE, "plan/m") },
+      acceptance: passAcceptance,
+    }))).toBe(1);
+
+    const controller = lines.indexOf("[scheduler] 1 task(s) blocked by a controller error; see the controller-error line(s) above");
+    const refusal = lines.indexOf("[scheduler] 1 task(s) refused by the budget guard; nothing was claimed for them");
+    // Each line for its own count, the controller errors first: neither hides the other.
+    expect(controller).toBeGreaterThanOrEqual(0);
+    expect(refusal).toBeGreaterThanOrEqual(0);
+    expect(controller).toBeLessThan(refusal);
+    expect((await real.get("b")).status).toBe("blocked");
+    expect((await real.get("a")).status).toBe("open");
   });
 
   it("add refuses before it writes anything", async () => {
