@@ -123,6 +123,10 @@ export async function watchQueue(
       if (await stopRequested(cfg.tasksDir)) return;
       if (ownershipError !== undefined) throw ownershipError;
       const scheduled = await scheduleOnce(cfg, deps, runOne, runSelected, stopOrLost);
+      if (scheduled === "stopped") {
+        if (ownershipError !== undefined) throw ownershipError;
+        return;
+      }
       if (scheduled === "worked") continue;
       await waitForWake();
     }
@@ -144,7 +148,7 @@ async function scheduleOnce(
   runOne: typeof runTask,
   runSelected: typeof runBatch,
   shouldStop: () => Promise<boolean>,
-): Promise<"worked" | "wait"> {
+): Promise<"worked" | "wait" | "stopped"> {
   const board = await deps.store.list();
   assertAcyclic(board);
   let candidate = undefined as (typeof board)[number] | undefined;
@@ -168,6 +172,9 @@ async function scheduleOnce(
       : ready(board, done)[0];
   }
   if (candidate === undefined) return "wait";
+  // Selection has several await boundaries. Stop and heartbeat loss must be
+  // rechecked here, next to the ordinary claim, not only at the outer loop.
+  if (await shouldStop()) return "stopped";
   const outcome = await runOne(
     { ...cfg, workdir: taskWorkdir(cfg.workdir, candidate) },
     deps,

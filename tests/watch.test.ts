@@ -298,6 +298,72 @@ describe("watchQueue", () => {
     }
   });
 
+  it("does not claim ordinarily when stop arrives during the board read", async () => {
+    await seed(task("a"));
+    let boardStarted!: () => void;
+    let releaseBoard!: () => void;
+    const began = new Promise<void>((resolve) => { boardStarted = resolve; });
+    const blocked = new Promise<void>((resolve) => { releaseBoard = resolve; });
+    const blockedStore = Object.create(store) as TaskStore;
+    blockedStore.list = async () => {
+      boardStarted();
+      await blocked;
+      return store.list();
+    };
+    let claims = 0;
+    const running = watchQueue(cfg, deps(blockedStore), {
+      watchFs,
+      fallbackMs: 1_000,
+      debounceMs: 5,
+      runOne: async () => { claims++; return "done"; },
+    });
+    try {
+      await began;
+      await requestStop();
+      releaseBoard();
+      await running;
+    } finally {
+      releaseBoard();
+      await requestStop();
+      await running;
+    }
+    expect(claims).toBe(0);
+  });
+
+  it("does not claim ordinarily when ownership is lost during the board read", async () => {
+    await seed(task("a"));
+    let boardStarted!: () => void;
+    let releaseBoard!: () => void;
+    const began = new Promise<void>((resolve) => { boardStarted = resolve; });
+    const blocked = new Promise<void>((resolve) => { releaseBoard = resolve; });
+    const blockedStore = Object.create(store) as TaskStore;
+    blockedStore.list = async () => {
+      boardStarted();
+      await blocked;
+      return store.list();
+    };
+    let claims = 0;
+    const running = watchQueue(cfg, deps(blockedStore), {
+      watchFs,
+      fallbackMs: 1_000,
+      debounceMs: 5,
+      runOne: async () => { claims++; return "done"; },
+    });
+    try {
+      await began;
+      const owner = JSON.parse(await readFile(watchLockPath(tasks), "utf8")).worker as string;
+      await releaseWatchLock(tasks, owner);
+      await delay(50);
+      releaseBoard();
+      await expect(running).rejects.toThrow("ownership");
+    } finally {
+      releaseBoard();
+      await requestStop();
+      await running.catch(() => {});
+    }
+    expect(claims).toBe(0);
+  });
+
   it("settles the active task on stop and leaves the next task unclaimed", async () => {
     await seed(task("a"));
     await seed(task("b"));
