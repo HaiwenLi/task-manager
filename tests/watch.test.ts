@@ -13,7 +13,7 @@ import {
   releaseWatchLock,
   watchLockPath,
 } from "../src/watch-lock.js";
-import { stopRequestPath, watchQueue } from "../src/watch.js";
+import { stopRequestPath, watchDirectory, watchQueue } from "../src/watch.js";
 import type { WorkerConfig, WorkerDeps } from "../src/worker.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
 import {
@@ -124,6 +124,15 @@ afterEach(async () => {
 });
 
 describe("watch ownership", () => {
+  it("keeps a watcher error off the uncaught-exception path", () => {
+    // 目录被删等情况下 fs.watch 会发出 error 事件；没有监听器时 EventEmitter 直接抛出，
+    // 绕过 watchQueue 的 finally，看板锁就此残留。
+    const watcher = watchDirectory(tasks, () => {}) as unknown as { emit(event: string, error: Error): boolean; close(): void };
+
+    expect(() => watcher.emit("error", new Error("directory removed"))).not.toThrow();
+    watcher.close();
+  });
+
   it("creates, heartbeats, and releases only the same complete generation", async () => {
     const first = await acquireWatchLock(tasks, "watch-one:generation-1", cfg.lockTtlMs);
     expect(first.acquired).toBe(true);
@@ -456,6 +465,41 @@ describe("watch and stop CLI parsing", () => {
 
   it("watch requires --config", async () => {
     expect(await runCli(["watch"], { log: () => {}, err: () => {} })).toBe(2);
+  });
+
+  it("watch refuses while a stop request exists and names --resume", async () => {
+    await mkdir(control, { recursive: true });
+    await writeFile(stopRequestPath(tasks), "stop", "utf8");
+    const errors: string[] = [];
+
+    const code = await runWatchCli({
+      root, tasksDir: tasks, workdir: work, agent: adapter(), acceptance: passAcceptance,
+      err: (line) => { errors.push(line); }, watch: { watchFs, fallbackMs: 1_000, debounceMs: 5 },
+    });
+
+    expect(code).toBe(1);
+    expect(errors.join("\n")).toContain("watch --resume");
+  });
+
+  it("watch --resume clears an existing stop request and serves the board through the real CLI", async () => {
+    await mkdir(control, { recursive: true });
+    await writeFile(stopRequestPath(tasks), "stop", "utf8");
+    const errors: string[] = [];
+    const running = runWatchCli({
+      root, tasksDir: tasks, workdir: work, agent: adapter(), acceptance: passAcceptance, resume: true,
+      err: (line) => { errors.push(line); }, watch: { watchFs, fallbackMs: 1_000, debounceMs: 5 },
+    });
+    await waitFor(() => listeners.has(tasks));
+    await expect(readFile(stopRequestPath(tasks), "utf8")).rejects.toThrow("ENOENT");
+
+    await seed(task("a"));
+    listeners.get(tasks)?.();
+    await waitFor(() => turns.includes("a"));
+    await requestStop();
+
+    await expect(running).resolves.toBe(0);
+    expect(errors).toEqual([]);
+    expect((await store.get("a")).status).toBe("done");
   });
 
   it("discovers work through the real watch CLI and drains through the real stop CLI", async () => {

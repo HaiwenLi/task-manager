@@ -907,7 +907,10 @@ async function statusCommand(flags: Map<string, string>, log: (line: string) => 
 }
 
 /** Flags that stand alone, with no value token after them. */
-const BOOLEAN_FLAGS = new Set(["simple", "quick", "all", "apply", "json", "review-only"]);
+// `resume` was missing here until 2026-11-24: the usage text and the stop
+// refusal both send the operator to `watch --resume`, but the parser read it
+// as a value flag and exited 2, so a stopped queue could not be restarted.
+const BOOLEAN_FLAGS = new Set(["simple", "quick", "all", "apply", "json", "review-only", "resume"]);
 
 /** `taskctl board` — rewrite `.taskctl/board.md` and print the same content as a table. */
 async function boardCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {

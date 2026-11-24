@@ -153,16 +153,18 @@ export type WatchCliFixture = {
   store?: CliDeps["store"];
   log?: (line: string) => void;
   err?: (line: string) => void;
+  /** Pass the real `--resume` flag, as an operator restarting after `stop` does. */
+  resume?: boolean;
 };
 
 /** Run `watch --config` with the fixture config every CLI watch test uses. */
 export async function runWatchCli({
-  root, tasksDir, workdir, agent, acceptance, watch, review, store, log, err,
+  root, tasksDir, workdir, agent, acceptance, watch, review, store, log, err, resume,
 }: WatchCliFixture): Promise<number> {
   const configPath = await writeBatchConfig(root, {
     tasksDir, workdir, lockTtlMs: 5_000, heartbeatMs: 20,
   });
-  return runCli(["watch", "--config", configPath], {
+  return runCli(["watch", "--config", configPath, ...(resume ? ["--resume"] : [])], {
     adapter: agent,
     acceptance,
     ...(review === undefined ? {} : { review }),

@@ -33,6 +33,18 @@ async function stopRequested(tasksDir: string): Promise<boolean> {
 }
 
 /**
+ * The production watcher. A watcher error (its directory removed, a handle
+ * limit) is kept off the uncaught-exception path: an `error` event with no
+ * listener is thrown by the emitter, which would bypass the lock release in
+ * `watchQueue`. The fallback scan still wakes the loop meanwhile.
+ */
+export function watchDirectory(path: string, listener: () => void): { close(): void } {
+  const watcher = fsWatch(path, listener);
+  watcher.on("error", () => {});
+  return watcher;
+}
+
+/**
  * Own and drain one board until `.taskctl/stop.requested` appears. The loop is
  * sequential on purpose: new arrivals are considered only between operations,
  * and a stop never becomes a process-tree kill or an uncertain replay.
@@ -49,7 +61,7 @@ export async function watchQueue(
 
   const debounceMs = options.debounceMs ?? 250;
   const fallbackMs = options.fallbackMs ?? 30_000;
-  const watchFs: WatchFs = options.watchFs ?? ((path, listener) => fsWatch(path, listener));
+  const watchFs: WatchFs = options.watchFs ?? watchDirectory;
   const runOne = options.runOne ?? runTask;
   const runSelected = options.runBatch ?? runBatch;
   const watchers: Array<{ close(): void }> = [];
