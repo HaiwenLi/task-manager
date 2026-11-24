@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -100,7 +100,7 @@ describe("worker review stage", () => {
     expect((await store.get("a")).status).toBe("done");
   });
 
-  it("a failing review sends the task back to open with a note and a round", async () => {
+  it("a failing review resumes the same worker session with a note and a round", async () => {
     await seed();
     const failReview: ReviewResult = {
       verdict: "fail",
@@ -109,11 +109,30 @@ describe("worker review stage", () => {
       defects: ["宽度仍写死"],
       summary: "未达 C1",
     };
-    const deps = { store, adapter: adapter(), acceptance: pass, review: verdict(failReview) };
-    await runTask(config(), deps, await store.get("a"), "w1");
+    const sessions: (string | undefined)[] = [];
+    const prompts: string[] = [];
+    const worker: AgentAdapter = {
+      prompt: async (args) => {
+        sessions.push(args.sessionId);
+        prompts.push(args.text);
+        await mkdir(join(tasks, "a"), { recursive: true });
+        await writeFile(join(tasks, "a", "done.requested"), "done");
+        return { sessionId: "s", text: "done", exitCode: 0 };
+      },
+      contextUsage: async () => 0,
+      contextLimit: async () => 100,
+    };
+    const review = vi.fn().mockResolvedValueOnce(failReview).mockResolvedValueOnce(okReview);
+    const deps = { store, adapter: worker, acceptance: pass, review };
+
+    expect(await runTask(config(), deps, await store.get("a"), "w1")).toBe("done");
     const task = await store.get("a");
-    expect(task.status).toBe("open");
+    expect(task.status).toBe("done");
     expect(task.reviewRounds).toBe(1);
+    expect(sessions).toEqual([undefined, "s"]);
+    expect(prompts[1]).toContain("review-failed");
+    expect(prompts[1]).toContain("宽度仍写死");
+    expect(review).toHaveBeenCalledTimes(2);
     const note = await latestNote(tasks, "a");
     expect(note?.markdown).toContain("review-failed");
     expect(note?.markdown).toContain("宽度仍写死");
@@ -204,7 +223,7 @@ describe("worker review stage", () => {
       defects: ["C2 新问题"],
       summary: "C2 回升错误",
     };
-    const deps = { store, adapter: adapter(), acceptance: pass, review: verdict(flipped) };
+    const deps = { store, adapter: adapter(), acceptance: pass, review: vi.fn().mockResolvedValueOnce(flipped).mockResolvedValueOnce(okReview) };
 
     await mkdir(join(tasks, "a"), { recursive: true });
     const { writeRuntime } = await import("../src/runtime.js");
@@ -225,7 +244,8 @@ describe("worker review stage", () => {
 
     await runTask(config({ maxReviewRounds: 5 }), deps, await store.get("a"), "w1");
     const task = await store.get("a");
-    expect(task.status).toBe("open");
+    expect(task.status).toBe("done");
     expect(task.reviewRounds).toBe(2);
+    expect(deps.review).toHaveBeenCalledTimes(2);
   });
 });

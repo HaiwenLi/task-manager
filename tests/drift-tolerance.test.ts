@@ -219,7 +219,7 @@ describe("tolerated drift through the review stage", () => {
     expect((await journalTail(tasks, "a", 20)).join("\n")).toContain("definition-drift");
   });
 
-  it("does not turn a failing verdict into a pass", async () => {
+  it("does not finish on a failing verdict without a worker rework", async () => {
     await seed(["tolerate:", "  - new_column"]);
     const failed: ReviewResult = {
       verdict: "fail",
@@ -228,10 +228,15 @@ describe("tolerated drift through the review stage", () => {
       defects: ["少写 15 行"],
       summary: "本任务自己的行没写全",
     };
-    await runTask(config(), { store, adapter: adapter(), acceptance: pass, review: review(failed) }, await store.get("a"), "w1");
+    let verdicts = 0;
+    await runTask(config(), {
+      store, adapter: adapter(), acceptance: pass,
+      review: async () => ++verdicts === 1 ? failed : passedWithDrift,
+    }, await store.get("a"), "w1");
     const task = await store.get("a");
-    expect(task.status).toBe("open");
+    expect(task.status).toBe("done");
     expect(task.reviewRounds).toBe(1);
+    expect(verdicts).toBe(2);
   });
 
   it("keeps the reviewer's window and the acceptance facts in the prompt", async () => {

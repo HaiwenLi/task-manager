@@ -146,6 +146,7 @@ function buildTask(overrides: Partial<Task> & { id: string }): Task {
     status: "open",
     criteria: ["C1 fixture"],
     complexity: "simple",
+    execution: "continuous",
     risk: "normal",
     dependsOn: [],
     humanCheck: false,
@@ -194,6 +195,31 @@ describe("worker — mechanical verification", () => {
     expect(store.tasks.get("a")!.status).toBe("done");
   });
 
+  it("escalates a continuous turn without done immediately and resumes the same session", async () => {
+    const { cfg } = await workspace();
+    const task = buildTask({ id: "a", verify: "mechanical", acceptance: "npm test" });
+    const store = new FakeStore(new Map([[task.id, task]]));
+    const sessions: (string | undefined)[] = [];
+    const review = vi.fn(async () => ({ verdict: "pass" as const, criteria: [{ id: "C1", pass: true, evidence: "ok" }], defects: [], summary: "ok", externalChanges: [] }));
+    const adapter: AgentAdapter = {
+      prompt: async (args) => {
+        sessions.push(args.sessionId);
+        if (sessions.length === 1) return { sessionId: "s1", exitCode: 0, text: "还没完成" };
+        store.markers.add("a");
+        return { sessionId: "s1", exitCode: 0, text: "完成" };
+      },
+      contextUsage: async () => 0,
+      contextLimit: async () => 100,
+    };
+
+    const outcome = await runTask(cfg, { store, adapter, acceptance: passedGate, review }, task, "w-continuous");
+
+    expect(outcome).toBe("done");
+    expect(sessions).toEqual([undefined, "s1"]);
+    expect(review).toHaveBeenCalledTimes(1);
+    expect(store.tasks.get("a")!.sessions).toEqual(["s1"]);
+  });
+
   it("still waits for a human when the task is high risk", async () => {
     const { cfg } = await workspace();
     const task = buildTask({ id: "d", verify: "mechanical", acceptance: "npm test", risk: "high" });
@@ -233,6 +259,31 @@ describe("worker — mechanical verification", () => {
     expect(outcome).toBe("done");
     expect(review).toHaveBeenCalledTimes(1);
     expect(store.tasks.get("b")!.status).toBe("done");
+  });
+
+  it("keeps the review requirement across a later settled attempt", async () => {
+    const { cfg } = await workspace();
+    const task = buildTask({ id: "sticky", verify: "mechanical", acceptance: "npm test" });
+    const store = new FakeStore(new Map([[task.id, task]]));
+    const review = vi.fn()
+      .mockResolvedValueOnce({ verdict: "fail" as const, criteria: [{ id: "C1", pass: false, evidence: "not yet" }], defects: ["fix"], summary: "no", externalChanges: [] })
+      .mockResolvedValueOnce({ verdict: "pass" as const, criteria: [{ id: "C1", pass: true, evidence: "ok" }], defects: [], summary: "ok", externalChanges: [] });
+    let workerTurns = 0;
+    const adapter: AgentAdapter = {
+      prompt: async () => {
+        workerTurns++;
+        store.markers.add("sticky");
+        return { sessionId: "s-sticky", exitCode: 0, text: workerTurns === 1 ? "ESCALATE: needs another pass" : "done" };
+      },
+      contextUsage: async () => 0,
+      contextLimit: async () => 100,
+    };
+    const deps = { store, adapter, acceptance: passedGate, review, };
+
+    expect(await runTask({ ...cfg, maxReviewRounds: 0 }, deps, task, "w-first")).toBe("blocked");
+    await store.setStatus("sticky", "open");
+    expect(await runTask(cfg, deps, task, "w-second")).toBe("done");
+    expect(review).toHaveBeenCalledTimes(2);
   });
 });
 

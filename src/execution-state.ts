@@ -1,6 +1,5 @@
 import type { TaskExecution } from "./task-file.js";
 import { readRuntime, writeRuntime } from "./runtime.js";
-import { TaskStore } from "./task-store.js";
 
 const EXECUTION_STATE_FILE = "execution-state.json";
 const MAX_REASONS = 50;
@@ -22,11 +21,14 @@ export type ExecutionState = {
  * Read runtime execution facts. Missing state inherits the declared task policy;
  * malformed state always escalates and disables session reuse.
  */
-export async function readExecutionState(tasksDir: string, id: string): Promise<ExecutionState> {
-  const task = await new TaskStore(tasksDir).get(id);
+export async function readExecutionState(
+  tasksDir: string,
+  id: string,
+  fallbackExecution: TaskExecution = "iterative",
+): Promise<ExecutionState> {
   const fallback: ExecutionState = {
     requiresReview: false,
-    effectiveExecution: task.execution,
+    effectiveExecution: fallbackExecution,
     reasons: [],
     updatedAt: "",
   };
@@ -41,7 +43,7 @@ export async function readExecutionState(tasksDir: string, id: string): Promise<
     return conservative("invalid execution state; review required and session reuse disabled");
   }
   const requiresReview = value.requiresReview;
-  const effectiveExecution: TaskExecution = requiresReview || task.execution === "iterative" || value.effectiveExecution === "iterative"
+  const effectiveExecution: TaskExecution = requiresReview || fallbackExecution === "iterative" || value.effectiveExecution === "iterative"
     ? "iterative"
     : "continuous";
   return {
@@ -54,8 +56,10 @@ export async function readExecutionState(tasksDir: string, id: string): Promise<
 }
 
 /** Record an upward-only transition. Caller holds the task mutation/ownership lock. */
-export async function recordEscalation(tasksDir: string, id: string, reason: string): Promise<ExecutionState> {
-  const current = await readExecutionState(tasksDir, id);
+export async function recordEscalation(
+  tasksDir: string, id: string, reason: string, fallbackExecution: TaskExecution = "iterative",
+): Promise<ExecutionState> {
+  const current = await readExecutionState(tasksDir, id, fallbackExecution);
   const next: ExecutionState = {
     requiresReview: true,
     effectiveExecution: "iterative",
@@ -68,8 +72,10 @@ export async function recordEscalation(tasksDir: string, id: string, reason: str
 }
 
 /** Record the latest cleanly observed worker session. Caller holds the task lock. */
-export async function recordWorkerSession(tasksDir: string, id: string, worker: WorkerSessionFact): Promise<ExecutionState> {
-  const current = await readExecutionState(tasksDir, id);
+export async function recordWorkerSession(
+  tasksDir: string, id: string, worker: WorkerSessionFact, fallbackExecution: TaskExecution = "iterative",
+): Promise<ExecutionState> {
+  const current = await readExecutionState(tasksDir, id, fallbackExecution);
   const next: ExecutionState = {
     requiresReview: current.requiresReview,
     effectiveExecution: current.effectiveExecution,

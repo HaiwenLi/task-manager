@@ -6,7 +6,7 @@ import { latestNote, writeNote, type HandoffNote } from "./handoff.js";
 import { startAcceptance, type AcceptanceResult } from "./acceptance.js";
 import { buildWorkerPrompt } from "./protocol.js";
 import type { TaskStore } from "./task-store.js";
-import type { Task } from "./task-file.js";
+import type { Task, TaskExecution } from "./task-file.js";
 import type { AgentAdapter, PromptResult } from "./adapters/types.js";
 import type { Execution } from "./execution.js";
 import { reserveWorkspace, artifactDigest, type WorkspaceReservation } from "./workspace.js";
@@ -23,6 +23,7 @@ import { failureFingerprint } from "./fingerprint.js";
 import { startReview, type CriterionResult, type ReviewEvidence, type ReviewResult } from "./review.js";
 import { collectChangeEvidence } from "./changes.js";
 import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck } from "./render.js";
+import { readExecutionState, recordEscalation, recordWorkerSession, type ExecutionState } from "./execution-state.js";
 
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
 export const ACCEPTANCE_TIMEOUT_MS_DEFAULT = 10 * 60_000;
@@ -124,6 +125,8 @@ type Run = {
    * off for this attempt: an escalated run may not finish on its own evidence.
    */
   escalated: boolean;
+  /** Durable execution policy and same-model session facts for this task. */
+  executionState?: ExecutionState;
   /**
    * The inert-sweep reason (e.g. non-Git workdir) is journaled once per
    * attempt, not once per turn — every turn would only repeat the same line.
@@ -134,6 +137,8 @@ type Run = {
 };
 const emit = (r: Run, type: WorkerEventType, detail?: string) => r.deps.onEvent?.({ type, taskId: r.task.id, detail });
 const owned = <T>(r: Run, fn: () => Promise<T>) => withOwnership(r.cfg.tasksDir, r.task.id, r.owner, fn);
+const declaredExecution = (task: Task): TaskExecution => task.execution ?? (task.complexity === "simple" ? "continuous" : "iterative");
+const effectiveExecution = (r: Run): TaskExecution => r.executionState?.effectiveExecution ?? declaredExecution(r.task);
 
 export async function runWorker(cfg: WorkerConfig, deps: WorkerDeps): Promise<{ done: string[]; blocked: string[] }> {
   const result = { done: [] as string[], blocked: [] as string[] };
@@ -184,6 +189,13 @@ export async function runTask(cfg: WorkerConfig, deps: WorkerDeps, task: Task, w
     const current = await owned(r, async () => (await deps.store.list()).find(t => t.id === task.id));
     if (!current || (current.status !== "open" && current.status !== "running")) return "skipped";
     r.task = structuredClone(current); r.definition = definitionDigest(current);
+    r.executionState = await readExecutionState(cfg.tasksDir, task.id, declaredExecution(current));
+    r.escalated = r.executionState.requiresReview;
+    if (r.executionState.diagnostic) {
+      await owned(r, () => appendJournal(cfg.tasksDir, task.id, {
+        stage: "worker", event: "execution-state-invalid", detail: r.executionState!.diagnostic!,
+      }));
+    }
     const previous = await readAttempt(cfg.tasksDir, task.id);
     if ((previous && previous.phase !== "settled") || (!previous && current.status === "running")) {
       return await block(r, "interrupted execution requires operator reconciliation; not replayed");
@@ -265,7 +277,10 @@ async function fail(r: Run): Promise<boolean> {
 async function escalate(r: Run, reason: string): Promise<void> {
   if (r.escalated) return;
   r.escalated = true;
-  await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, { stage: "worker", event: "escalated", detail: reason }));
+  await owned(r, async () => {
+    r.executionState = await recordEscalation(r.cfg.tasksDir, r.task.id, reason, declaredExecution(r.task));
+    await appendJournal(r.cfg.tasksDir, r.task.id, { stage: "worker", event: "escalated", detail: reason });
+  });
   emit(r, "escalated", reason);
 }
 
@@ -579,9 +594,15 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       // A rejected turn did no work, and its session belongs to the backend that
       // refused it: recording it would both spend a session and hand the next
       // provider a transcript it never wrote.
-      if (result.sessionId && result.failure !== "provider" && result.sessionId !== recordedSession) {
-        await r.deps.store.appendSession(r.task.id, result.sessionId);
-        recordedSession = sessionId = result.sessionId; sessionsUsed++;
+      if (result.sessionId && result.failure !== "provider") {
+        if (result.sessionId !== recordedSession) {
+          await r.deps.store.appendSession(r.task.id, result.sessionId);
+          recordedSession = result.sessionId; sessionsUsed++;
+        }
+        sessionId = result.sessionId;
+        r.executionState = await recordWorkerSession(r.cfg.tasksDir, r.task.id, {
+          sessionId: result.sessionId, ...(model === undefined ? {} : { model }),
+        }, declaredExecution(r.task));
       }
     });
     turns++;
@@ -625,7 +646,15 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
       const verdict = await accept(r);
       if (verdict !== "retry") return verdict;
-      fresh = true;
+      if (effectiveExecution(r) === "continuous") {
+        await escalate(r, "continuous verification failed; iterative rework is required");
+      }
+      // The controller just wrote concrete failure feedback. Resume this
+      // same-model session instead of opening a fresh session that cannot see it.
+    } else if (effectiveExecution(r) === "continuous") {
+      // One agent turn may contain many tool calls, but a continuous task does
+      // not spend dozens of turns discovering whether it needs iteration.
+      await escalate(r, "continuous turn ended without a completion request");
     } else if (turns >= (r.cfg.maxTurnsPerSession ?? MAX_TURNS_PER_SESSION_DEFAULT)) {
       // Running out of turns is evidence about the task, not just about the
       // session: whatever this was, it did not fit in one go.
@@ -841,6 +870,14 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
     if (retries >= r.cfg.retryLimit) {
       await r.deps.store.setStatus(r.task.id, "blocked"); emit(r, "blocked", "retry limit reached"); return "blocked";
     }
+    const seq = ((await latestNote(r.cfg.tasksDir, r.task.id))?.seq ?? 0) + 1;
+    await writeNote(r.cfg.tasksDir, {
+      task: r.task.id, seq, status: "acceptance-failed",
+      done: `控制器验收失败（exit ${result.exitCode ?? "null"}），将带着本次证据返工。`,
+      found: `fingerprint: ${streak.fingerprint} (${streak.count}/${limit})\n${(result.output ?? "").slice(-4_000)}`,
+      next: "根据上面的控制器验收输出修复；先做有界定向自验，不要无意义重复全量验收。",
+      files: [],
+    });
     return "retry";
   });
   if (outcome === "review") {
@@ -917,7 +954,7 @@ async function acceptRender(
       event: "acceptance",
       detail: `render ok views=${check.views.length}`,
     }));
-    if (r.escalated) return "review";
+    if (r.escalated) return await reviewStage(r);
     const finished = await owned(r, () => finishVerified(r, "render check passed"));
     return finished;
   }
@@ -937,7 +974,7 @@ async function acceptRender(
  * evidence, and can never mark work done on its own when the task has no
  * criteria, is high risk, or asks for a human sign-off.
  */
-async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
+async function reviewStage(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "awaiting-human"> {
   const id = r.task.id;
   if (r.task.criteria.length === 0) {
     await owned(r, () => r.deps.store.setStatus(id, "awaiting-human"));
@@ -1063,7 +1100,7 @@ async function judge(
   r: Run,
   result: ReviewResult,
   prevCriteria: CriterionResult[] | null,
-): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
+): Promise<"done" | "blocked" | "retry" | "open" | "awaiting-human"> {
   const id = r.task.id;
   if (result.verdict === "unclear") {
     await owned(r, () => r.deps.store.setStatus(id, "awaiting-human"));
@@ -1120,7 +1157,9 @@ async function judge(
   const seq = ((await latestNote(r.cfg.tasksDir, id))?.seq ?? 0) + 1;
   await owned(r, async () => {
     await writeNote(r.cfg.tasksDir, reviewNote(r.task, seq, result));
-    await r.deps.store.setStatus(id, "open");
+    // Ordinary review rework continues inside this claim and resumes the same
+    // worker session. `open` is reserved for an actual later scheduler attempt.
+    await r.deps.store.setStatus(id, "running");
     await appendJournal(r.cfg.tasksDir, id, {
       stage: "review",
       event: "rework",
@@ -1128,7 +1167,7 @@ async function judge(
     });
   });
   emit(r, "rework", `round ${rounds}: ${result.defects.join("; ") || result.summary}`);
-  return "open";
+  return "retry";
 }
 
 /**

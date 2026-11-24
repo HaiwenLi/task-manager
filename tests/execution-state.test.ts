@@ -30,7 +30,7 @@ afterEach(async () => {
 
 describe("execution state", () => {
   it("derives an absent state and records the latest worker session", async () => {
-    expect(await readExecutionState(tasks, "a")).toMatchObject({
+    expect(await readExecutionState(tasks, "a", "continuous")).toMatchObject({
       requiresReview: false,
       effectiveExecution: "continuous",
       reasons: [],

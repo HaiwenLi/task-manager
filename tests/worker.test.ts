@@ -106,6 +106,7 @@ function task(overrides: Partial<Task> = {}): Task {
     status: "open",
     criteria: ["C1 fixture"],
     complexity: "complex",
+    execution: "iterative",
     risk: "normal",
     dependsOn: [],
     humanCheck: false,
@@ -448,6 +449,26 @@ describe("runWorker — 失败核算", () => {
     expect(adapter.calls).toHaveLength(3);
     expect(store.task("a").sessions).toEqual(["ses-1", "ses-2", "ses-3"]);
     await expect(lockHeld("a")).resolves.toBe(false);
+  });
+
+  it("acceptance retry resumes the same session with the controller failure feedback", async () => {
+    const store = FakeStore.seed(task({ acceptance: "npm test" }));
+    const adapter = new FakeAdapter(() => {
+      store.requestDone("a");
+      return { sessionId: "ses-a1", exitCode: 0, text: "再次声称完成" };
+    });
+    const acceptance = vi.fn()
+      .mockResolvedValueOnce({ passed: false, exitCode: 1, output: "断言失败： expected 2, got 1", skipped: false })
+      .mockResolvedValueOnce({ passed: true, exitCode: 0, output: "ok", skipped: false });
+
+    const result = await runWorker(cfg(tasksDir), { store, adapter, acceptance, review: passReview });
+
+    expect(result).toEqual({ done: ["a"], blocked: [] });
+    expect(adapter.calls).toHaveLength(2);
+    expect(adapter.calls[1].sessionId).toBe("ses-a1");
+    expect(adapter.calls[1].text).toContain("acceptance-failed");
+    expect(adapter.calls[1].text).toContain("断言失败： expected 2, got 1");
+    expect(store.task("a").sessions).toEqual(["ses-a1"]);
   });
 
   it("Review Focus 4：prompt exitCode 1 计为失败重试，不 reject", async () => {
