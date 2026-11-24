@@ -17,6 +17,7 @@
 | 处 | 原文 | 现状（已核实） |
 | --- | --- | --- |
 | 第 1 节 `tsc --noEmit` | 「从未执行过」（TSD 透明加密，`tsc` 读到密文） | 2026-11-24 在本机可以运行：`npx tsc --noEmit` 退出码 0，remediation plan 的每一轮门槛都有记录。原因没有查（白名单或加密状态变了），这里只记事实 |
+| 第 1 节 `tsc --noEmit`（检查范围） | 未提；此前只包含 `src/`，`tests/` 从未被类型检查 | 2026-11-25 起 `npm run typecheck`（`tsconfig.test.json`）同时检查 `tests/`、`scripts/` 和 `vitest.config.ts`。纳入时报出 46 个错误，全部在测试一侧（测试替身缺接口要求的方法、夹具缺必填字段、联合类型未收窄就读字段），已清零 |
 | 第 1 节「真实环境端到端」 | 「大部分未跑过」 | 2026-11-24 做过有界 Live 验证（`scripts/smoke.ps1 -Live`、`scripts/live-phase2.ps1 -Live` 15/15），见 README「测试」。仍未验证：真实后端的取消、中断恢复、进程信号、复核超时 |
 | 第 1 节末句的用例数 | `307 passed / 1 skipped` | 已过时；当前门槛见 [phase2-review-remediation](superpowers/plans/2026-11-24-phase2-review-remediation.md) |
 | 第 0 节「Simple/Complex 自动分流的分类 agent」 | 「分类器要等 `escalated` 事件积累出比例才有依据」 | 设计 §16 已经落地了模型分类（`taskctl add` 按模型给的车道决定是否等签字）。它与 ADR-0008/0009 的冲突尚未写 supersession，待所有者裁决 |
