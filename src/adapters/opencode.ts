@@ -98,9 +98,14 @@ export class OpenCodeAdapter implements AgentAdapter {
     return undefined;
   }
 
-  /** `opencode api model.list`, fetched once and kept for the process life. */
+  /**
+   * `opencode api model.list`, fetched once and kept while it holds. Only an
+   * answered fetch is kept: a failed one answers "nothing known" to the call
+   * that saw it, but it must not disable variant and context lookups for the
+   * life of a long-lived watcher — the next call asks the service again.
+   */
   private modelCatalogue(): Promise<Map<string, { variants: Set<string>; context?: number }>> {
-    this.modelList ??= this.api("model.list").then((envelope) => {
+    const fetched = (this.modelList ??= this.api("model.list").then((envelope) => {
       const catalogue = new Map<string, { variants: Set<string>; context?: number }>();
       if (Array.isArray(envelope.data)) {
         for (const entry of envelope.data) {
@@ -124,8 +129,11 @@ export class OpenCodeAdapter implements AgentAdapter {
         }
       }
       return catalogue;
-    }).catch(() => new Map<string, { variants: Set<string>; context?: number }>());
-    return this.modelList;
+    }));
+    void fetched.catch(() => {
+      if (this.modelList === fetched) this.modelList = undefined;
+    });
+    return fetched.catch(() => new Map<string, { variants: Set<string>; context?: number }>());
   }
 
   /** Run one agent turn and collect the session id, final text and exit code. */
@@ -343,6 +351,12 @@ export class OpenCodeAdapter implements AgentAdapter {
       if (!data) return "unavailable";
       const time = asObject(data.time);
       if (typeof time?.busy === "number" && time.idle === undefined && (data.outcome === undefined || data.outcome === null)) return "active";
+      // Idleness has to be proven, not inferred from the absence of one busy
+      // marker: this answer is what lets a second worker onto the session, so
+      // an unrecognised reply must refuse. v2.4.1 stamps time.idle once a
+      // turn ends and leaves only time.busy while it runs (verified live,
+      // 2026-11-24).
+      if (typeof time?.idle !== "number") return "unavailable";
       const directory = asObject(data.location)?.directory;
       const actualModel = await this.sessionModel(sessionId, data.model);
       const expectedModel = expected.model.replace(/#.*$/, "");

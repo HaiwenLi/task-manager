@@ -49,7 +49,7 @@
 //                      before 2.4 did
 //   FAKE_MESSAGE_LIST_FAILS — `api session.message.list` fails: a service
 //                      without the operation
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 
 const argv = process.argv.slice(2);
 
@@ -185,6 +185,15 @@ if (subcommand === "run") {
     process.exitCode = 0;
   }
 } else if (subcommand === "api" && operation === "model.list") {
+  // A failed fetch must not be remembered: name a marker file in
+  // FAKE_MODEL_LIST_FAILS_ONCE and the first call fails while creating it;
+  // every later call answers normally.
+  const failOnce = process.env.FAKE_MODEL_LIST_FAILS_ONCE;
+  if (failOnce && !existsSync(failOnce)) {
+    writeFileSync(failOnce, "failed once", "utf8");
+    process.stderr.write(`UnknownError: service unreachable\n`);
+    process.exitCode = 1;
+  } else {
   process.stdout.write(
     `${JSON.stringify({
       data: [
@@ -196,6 +205,7 @@ if (subcommand === "run") {
     })}\n`,
   );
   process.exitCode = 0;
+  }
 } else {
   process.stderr.write(`fake-opencode: unsupported argv ${JSON.stringify(argv)}\n`);
   process.exitCode = 2;

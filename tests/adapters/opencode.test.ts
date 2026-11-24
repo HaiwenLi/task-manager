@@ -34,6 +34,7 @@ afterEach(async () => {
   delete process.env.FAKE_MESSAGES_OLDEST_FIRST;
   delete process.env.FAKE_SESSION_MODEL_IN_GET;
   delete process.env.FAKE_MESSAGE_LIST_FAILS;
+  delete process.env.FAKE_MODEL_LIST_FAILS_ONCE;
   await rm(cwd, { recursive: true, force: true });
 });
 
@@ -213,6 +214,20 @@ describe("OpenCodeAdapter.contextLimit", () => {
     await expect(makeAdapter().contextLimit("someone-else/local-model")).resolves.toBe(8192);
   });
 
+  it("does not keep a failed model.list for the life of the adapter", async () => {
+    // 常驻的 watch 里 adapter 与进程同寿：一次失败的控制面调用若被缓存成空目录，
+    // context budget 与变体解析会在整个生命周期内静默失效。失败只影响看到它的那一次调用。
+    const log = join(cwd, "api-calls.log");
+    process.env.FAKE_API_LOG = log;
+    process.env.FAKE_MODEL_LIST_FAILS_ONCE = join(cwd, "model-list-failed.once");
+    const adapter = makeAdapter();
+
+    await expect(adapter.contextLimit("anthropic/sonnet")).rejects.toThrow(/unknown/i);
+    await expect(adapter.contextLimit("anthropic/sonnet")).resolves.toBe(200000);
+
+    expect((await readFile(log, "utf8")).trim().split(/\r?\n/)).toEqual(["api model.list", "api model.list"]);
+  });
+
   it("rejects when no listed model matches", async () => {
     // 找不到模型是配置错误：宁可失败也不要悄悄返回 0 让预算检查失效
     await expect(makeAdapter().contextLimit("nope/unknown")).rejects.toThrow(/unknown/i);
@@ -304,6 +319,16 @@ describe("OpenCodeAdapter session status and usage", () => {
     const usage = await adapter.sessionUsage("ses_fake123");
     expect(usage).toMatchObject({ input: 1000, output: 200 });
     expect("model" in usage).toBe(false);
+  });
+
+  it("refuses reuse when the reply proves neither a busy nor an idle session", async () => {
+    // 真实服务 v2.4.1（2026-11-24 Live 核实）：运行中的 session 只有 time.busy，
+    // 结束后盖 time.idle。两者都没有的回复是「不确定」，而探测的职责恰恰是
+    // 挡住第二个 worker——不能因为认不出形态就放行。
+    process.env.FAKE_SESSION_STATUS = "unknown";
+    process.env.FAKE_SESSION_CWD = cwd;
+
+    await expect(makeAdapter().canResumeSession("ses_fake123", { model: "anthropic/sonnet", cwd })).resolves.toBe("unavailable");
   });
 
   it("still reads a session.get that carries the model, as services before 2.4 did", async () => {
