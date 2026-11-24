@@ -9,6 +9,9 @@
 // its `env` over the parent's, so a hook doubles as proof that it arrived):
 //   FAKE_MCP_MODE     — how the session goes:
 //                         ok          every tools/call is answered
+//                         linger      every tools/call is answered too, then the
+//                                     server ignores the end of stdin and stays
+//                                     alive: the client has to end it
 //                         hang        initialize is answered, a tools/call
 //                                     never is: the server stays alive
 //                         crash       exits right after answering initialize
@@ -24,13 +27,14 @@ if (process.env.FAKE_MCP_PIDFILE) {
   writeFileSync(process.env.FAKE_MCP_PIDFILE, String(process.pid), "utf8");
 }
 
-if (mode !== "ok" && mode !== "hang" && mode !== "crash" && mode !== "tool-error") {
+if (mode !== "ok" && mode !== "linger" && mode !== "hang" && mode !== "crash" && mode !== "tool-error") {
   process.stderr.write(`fake-mcp: unsupported FAKE_MCP_MODE ${JSON.stringify(mode)}\n`);
   process.exitCode = 2;
 } else {
-  if (mode === "hang") {
-    // A call in flight that never completes: the timer keeps the server
-    // alive until the client ends it.
+  if (mode === "hang" || mode === "linger") {
+    // A server that has to be ended by the client: in `hang` a call is in
+    // flight and never completes, in `linger` everything was answered and the
+    // server just does not leave. The timer keeps it alive until then.
     setInterval(() => {}, 60_000);
   }
 
@@ -70,7 +74,7 @@ if (mode !== "ok" && mode !== "hang" && mode !== "crash" && mode !== "tool-error
   });
   lines.on("close", () => {
     // stdin is over, so the client is done talking: the server leaves. Only
-    // `hang` stays, and it is kept alive by its timer.
+    // `hang` and `linger` stay, and they are kept alive by their timer.
     process.stdin.destroy();
   });
 }

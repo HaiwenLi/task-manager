@@ -46,6 +46,17 @@ describe("memory layer", () => {
     expect(many.text.split("\n").length).toBeLessThan(5);
   });
 
+  it("renders a hit with line breaks on one line", () => {
+    expect(renderMemory([hit("a", 0.9, "w", "pitfall", "line one\nline two")], cfg).text).toBe("- [w/pitfall · -] line one line two");
+  });
+
+  it("cuts a hit to itemChars only after its line breaks were collapsed", () => {
+    // 900 characters as written, 899 once each line break is a space: the cut measures the latter.
+    const { text, truncated } = renderMemory([hit("a", 0.9, "w", "pitfall", "ab\n".repeat(300))], cfg);
+    expect(text).toBe(`- [w/pitfall · -] ${"ab ".repeat(133)}a…`);
+    expect(truncated).toBe(true);
+  });
+
   it("builds a whitespace-normalised query of at most 250 characters", () => {
     const query = buildRecallQuery({ title: "T", description: "d".repeat(300), spec: "## 目标\n" + "g".repeat(300) + "\n## 非目标\nx" });
     expect(query.length).toBe(243);   // 1 + 1 + 120 + 1 + 120: under the cut, nothing to trim
@@ -81,6 +92,60 @@ describe("memory layer", () => {
     expect(text).toContain("LESSON TEXT");
     expect(io.write).toHaveBeenCalledWith(expect.objectContaining({ outcome: "ok", hits: [expect.objectContaining({ drawerId: "a", chars: 11 })], backend: "fake" }));
     expect(io.journal).toHaveBeenCalledWith("recall", expect.stringMatching(/^outcome=ok hits=1 /));
+  });
+
+  it("asks the backend once, with the request list and the limit the plan names", async () => {
+    const searchAll = vi.fn(async () => [[hit("a", 0.6, "w", "pitfall", "LESSON TEXT")]]);
+
+    // A wing adds a second search, narrowed to it, in the same session; the limit is four per item at least.
+    expect(await runRecall({ ...cfg, wing: "IDT", maxItems: 7 }, { name: "fake", searchAll }, input, io)).toContain("LESSON TEXT");
+    expect(searchAll).toHaveBeenCalledTimes(1);
+    expect(searchAll).toHaveBeenCalledWith([{ query: "t d" }, { query: "t d", wing: "IDT" }], { limit: 28 });
+    // Without a wing there is the one search, and the limit never drops below 20.
+    searchAll.mockClear();
+    await runRecall(cfg, { name: "fake", searchAll }, input, io);
+    expect(searchAll).toHaveBeenCalledTimes(1);
+    expect(searchAll).toHaveBeenCalledWith([{ query: "t d" }], { limit: 20 });
+  });
+
+  it("writes the record and the journal line in the plan's format", async () => {
+    await runRecall({ ...cfg, wing: "IDT", maxItems: 7 }, fakeBackend([[hit("a", 0.6, "w", "pitfall", "LESSON TEXT")]]), input, io);
+
+    // What the owner can look at afterwards: what was asked, when, what was kept and what was dropped; never a text.
+    expect(io.write).toHaveBeenCalledTimes(1);
+    expect(io.write).toHaveBeenCalledWith({
+      query: "t d", backend: "fake", at: input.at, outcome: "ok",
+      hits: [{ drawerId: "a", wing: "w", room: "pitfall", similarity: 0.6, chars: 11 }],
+      filtered: { belowThreshold: 0, room: 0, wing: 0 }, truncated: false,
+    });
+    expect(io.journal).toHaveBeenCalledTimes(1);
+    expect(io.journal).toHaveBeenCalledWith("recall", "outcome=ok hits=1 below=0 room=0 wing=0 truncated=false backend=fake");
+  });
+
+  it("keeps the first 200 characters of a failure's message in the record and in the journal", async () => {
+    const message = "0123456789".repeat(30);
+    const backend: MemoryBackend = { name: "fake", searchAll: async () => { throw new Error(message); } };
+
+    expect(await runRecall(cfg, backend, input, io)).toBeNull();
+    const kept = "0123456789".repeat(20);
+    expect(io.write).toHaveBeenCalledTimes(1);
+    expect(io.write).toHaveBeenCalledWith({
+      query: "t d", backend: "fake", at: input.at, outcome: "error",
+      hits: [], filtered: { belowThreshold: 0, room: 0, wing: 0 }, truncated: false, detail: kept,
+    });
+    expect(io.journal).toHaveBeenCalledTimes(1);
+    // The same line as for a recall that worked, then the reason, cut to the same 200 characters.
+    expect(io.journal).toHaveBeenCalledWith(
+      "recall-unavailable",
+      "outcome=error hits=0 below=0 room=0 wing=0 truncated=false backend=fake error=" + kept,
+    );
+  });
+
+  it("counts a hit's characters as it was written, line breaks included", async () => {
+    // The prompt shows the hit on one line; the record says how long the drawer's text really is.
+    const text = await runRecall(cfg, fakeBackend([[hit("a", 0.6, "w", "pitfall", "line one\nline two")]]), input, io);
+    expect(text).toBe("- [w/pitfall · -] line one line two");
+    expect(io.write).toHaveBeenCalledWith(expect.objectContaining({ hits: [{ drawerId: "a", wing: "w", room: "pitfall", similarity: 0.6, chars: 17 }] }));
   });
 
   it("returns null and records the outcome when the result is not JSON", async () => {

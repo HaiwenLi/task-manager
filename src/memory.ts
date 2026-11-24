@@ -97,17 +97,22 @@ export function selectHits(
 
 /**
  * The hits as the lines the prompt shows: `- [wing/room · date] text`, one
- * per hit, the date being the day of `filedAt` or `-`. A text longer than
- * `itemChars` is cut and marked with `…`. Lines are added while the whole
- * stays within `maxChars`; `truncated` says a hit was left out or cut.
+ * per hit, the date being the day of `filedAt` or `-`. A text is put on one
+ * line first, whatever line breaks the drawer holds, and is then cut to
+ * `itemChars` and marked with `…` when it is longer. Lines are added while
+ * the whole stays within `maxChars`; `truncated` says a hit was left out or
+ * cut.
  */
 export function renderMemory(hits: readonly MemoryHit[], cfg: Pick<MemoryConfig, "maxChars" | "itemChars">): { text: string; truncated: boolean } {
   const lines: string[] = [];
   let total = 0;
   let truncated = false;
   for (const hit of hits) {
-    const cut = hit.text.length > cfg.itemChars;
-    const line = `- [${hit.wing}/${hit.room} · ${hit.filedAt === undefined ? "-" : hit.filedAt.slice(0, 10)}] ${cut ? `${hit.text.slice(0, cfg.itemChars)}…` : hit.text}`;
+    // Measured as the prompt shows it, so the cut lands on what is seen and a
+    // line break can never pass for the start of another hit.
+    const text = oneLine(hit.text);
+    const cut = text.length > cfg.itemChars;
+    const line = `- [${hit.wing}/${hit.room} · ${hit.filedAt === undefined ? "-" : hit.filedAt.slice(0, 10)}] ${cut ? `${text.slice(0, cfg.itemChars)}…` : text}`;
     const withLine = total + (lines.length === 0 ? 0 : 1) + line.length;
     if (withLine > cfg.maxChars) {
       truncated = true;
