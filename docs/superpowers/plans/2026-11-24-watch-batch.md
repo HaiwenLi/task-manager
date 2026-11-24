@@ -369,7 +369,7 @@ git commit -m "docs(batch): document watch and record offline acceptance"
 
 Report explicitly that no real-backend run was made unless the user separately authorizes one. Phase 2 is then ready for the separately requested X-Goldfish independent review; that review is not claimed by this plan.
 
-**Final evidence (2026-11-24):** `npm test` **609 passed / 1 skipped** across 208 test files; `npx tsc --noEmit` exit 0; `git diff --check` clean; `scripts/smoke.ps1` without `-Live` prepared the environment successfully. Targeted real-CLI config parsing accepted `batchMaxTasks`. No live-provider run was made, so the real OpenCode reuse probe and actual backend cross-task continuation remain unverified.
+**Final evidence (2026-11-24, gate at `d288964`):** `npm test` **609 passed / 1 skipped**; `npx tsc --noEmit` exit 0; `git diff --check` clean; `scripts/smoke.ps1` without `-Live` prepared the environment successfully. Targeted real-CLI config parsing accepted `batchMaxTasks`. The “208 test files” figure originally recorded here was not a reproducible Vitest file count and is superseded by the remediation evidence (63 files) in `2026-11-24-phase2-review-remediation.md`. No live-provider run was made, so the real OpenCode reuse probe and actual backend cross-task continuation remain unverified.
 
 Final proof additions and fixture findings:
 
