@@ -78,14 +78,21 @@ Write-SimpleTask (Join-Path $pending "c.md") "c"
 
 $env:PATH = "$bin;$env:PATH"
 
+function Read-TextFile([string]$Path) {
+  # 空文件或不存在的文件都读成空字符串：Get-Content -Raw 读 0 字节文件时不产生任何对象，
+  # 后续的 .Trim() / -match 会撞上 $null。ReadAllText 对空文件返回真正的 ""。
+  if (-not (Test-Path -PathType Leaf $Path)) { return "" }
+  $text = [System.IO.File]::ReadAllText($Path)
+  if ($null -eq $text) { return "" }
+  return $text
+}
+
 function Invoke-Taskctl([string]$Name, [string]$CliArgs) {
-  $out = Join-Path $root "$Name.out.log"
-  $err = Join-Path $root "$Name.err.log"
-  $process = Start-Process -FilePath "node" -ArgumentList "`"$tsx`" `"$entry`" $CliArgs" -WorkingDirectory $root -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+  $outFile = Join-Path $root "$Name.out.log"
+  $errFile = Join-Path $root "$Name.err.log"
+  $process = Start-Process -FilePath "node" -ArgumentList "`"$tsx`" `"$entry`" $CliArgs" -WorkingDirectory $root -NoNewWindow -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
   $process.WaitForExit()
-  $stdout = if (Test-Path $out) { Get-Content $out -Raw } else { "" }
-  $stderr = if (Test-Path $err) { Get-Content $err -Raw } else { "" }
-  return [pscustomobject]@{ Code = $process.ExitCode; Out = $stdout; Err = $stderr }
+  return [pscustomobject]@{ Code = $process.ExitCode; Out = (Read-TextFile $outFile); Err = (Read-TextFile $errFile) }
 }
 
 # 注册守卫不耗模型额度，两种模式都跑（与 smoke.ps1 相同的理由）。
@@ -122,18 +129,13 @@ function Read-State([string]$Id) {
 function Read-Usage([string]$Id) {
   $path = Join-Path $tasks "$Id\usage.jsonl"
   if (-not (Test-Path $path)) { return @() }
-  return @(Get-Content $path | Where-Object { $_.Trim().Length -gt 0 } | ForEach-Object { $_ | ConvertFrom-Json })
+  return @((Read-TextFile $path) -split "`r?`n" | Where-Object { $_.Trim().Length -gt 0 } | ForEach-Object { $_ | ConvertFrom-Json })
 }
 function Read-RunLog([string]$Id) {
   $dir = Join-Path $tasks "$Id\logs"
   if (-not (Test-Path $dir)) { return "" }
   $files = @(Get-ChildItem $dir -Filter "run-*.log" -File)
-  return (($files | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n")
-}
-function Read-Journal([string]$Id) {
-  $path = Join-Path $tasks "$Id\journal.md"
-  if (-not (Test-Path $path)) { return "" }
-  return Get-Content $path -Raw
+  return [string](($files | ForEach-Object { Read-TextFile $_.FullName }) -join "`n")
 }
 
 # --- 1. run --batch a,b：跨任务 session 复用与 run 入口的逐任务证据 ---
@@ -144,12 +146,12 @@ Add-Check "a and b reach done" ($afterBatch.Out -match "(?m)^\s*a\s+done" -and $
 
 $stateA = Read-State "a"
 $stateB = Read-State "b"
-$sessionA = $stateA.latestWorker.sessionId
-$sessionB = $stateB.latestWorker.sessionId
-Add-Check "b reuses a's session (one session for the batch)" ($sessionA -and $sessionB -and $sessionA -eq $sessionB) "a=$sessionA b=$sessionB"
-$journalB = Read-Journal "b"
+$sessionA = [string]$stateA.latestWorker.sessionId
+$sessionB = [string]$stateB.latestWorker.sessionId
+Add-Check "b reuses a's session (one session for the batch)" ($sessionA.Length -gt 0 -and $sessionA -eq $sessionB) "a=$sessionA b=$sessionB"
+$journalB = Read-TextFile (Join-Path $tasks "b\journal.md")
 $skipped = @($journalB -split "`r?`n" | Where-Object { $_ -match "session-reuse-skipped" })
-Add-Check "b records no session-reuse-skipped" ($skipped.Count -eq 0) ($skipped -join " | ")
+Add-Check "b records no session-reuse-skipped" ($skipped.Count -eq 0) ([string]($skipped -join " | "))
 
 $usageA = Read-Usage "a"
 $usageB = Read-Usage "b"
@@ -157,8 +159,8 @@ $tokensA = 0
 foreach ($record in $usageA) { if ($record.delta) { $tokensA += $record.delta.input + $record.delta.output + $record.delta.reasoning + $record.delta.cacheRead + $record.delta.cacheWrite } }
 $tokensB = 0
 foreach ($record in $usageB) { if ($record.delta) { $tokensB += $record.delta.input + $record.delta.output + $record.delta.reasoning + $record.delta.cacheRead + $record.delta.cacheWrite } }
-$usageOk = $usageA.Count -ge 1 -and $usageB.Count -ge 1 -and $tokensA -gt 0 -and $tokensB -gt 0 -and $usageB[0].sessionId -eq $usageA[0].sessionId
-Add-Check "usage captured for a and b in the shared session" $usageOk "a: $($usageA.Count) record(s), $tokensA tokens; b: $($usageB.Count) record(s), $tokensB tokens; sessions $($usageA[0].sessionId) / $($usageB[0].sessionId)"
+$usageOk = $usageA.Count -ge 1 -and $usageB.Count -ge 1 -and $tokensA -gt 0 -and $tokensB -gt 0 -and [string]$usageB[0].sessionId -eq [string]$usageA[0].sessionId
+Add-Check "usage captured for a and b in the shared session" $usageOk "a: $($usageA.Count) record(s), $tokensA tokens; b: $($usageB.Count) record(s), $tokensB tokens; sessions $($usageA[0].sessionId) / $($usageB[0].sessionId); model $($usageB[0].model)"
 
 $logA = Read-RunLog "a"
 $logB = Read-RunLog "b"
@@ -170,23 +172,27 @@ $watchErr = Join-Path $root "watch.err.log"
 $watch = Start-Process -FilePath "node" -ArgumentList "`"$tsx`" `"$entry`" watch --config taskctl.json" -WorkingDirectory $root -NoNewWindow -PassThru -RedirectStandardOutput $watchOut -RedirectStandardError $watchErr
 $null = $watch.Handle
 $lock = Join-Path $root ".taskctl\watch.lock"
-$lockDeadline = (Get-Date).AddSeconds(60)
-while (-not (Test-Path $lock) -and (Get-Date) -lt $lockDeadline) { Start-Sleep -Milliseconds 500 }
-Add-Check "watch takes ownership of the board" (Test-Path $lock) "lock present: $(Test-Path $lock)"
-
-$movedAt = Get-Date
-Move-Item (Join-Path $pending "c.md") (Join-Path $tasks "c.md")
-$doneDeadline = (Get-Date).AddSeconds(300)
 $status = $null
-do {
-  Start-Sleep -Seconds 3
-  $status = Invoke-Taskctl "status" "status --tasks-dir tasks"
-} until ($status.Out -match "(?m)^\s*c\s+done" -or (Get-Date) -gt $doneDeadline)
-$latency = [int]((Get-Date) - $movedAt).TotalSeconds
-Add-Check "watch discovers the newly added task and drains it" ($status.Out -match "(?m)^\s*c\s+done") "status after $latency s:`n$($status.Out.Trim())"
+$latency = -1
+try {
+  $lockDeadline = (Get-Date).AddSeconds(60)
+  while (-not (Test-Path $lock) -and (Get-Date) -lt $lockDeadline -and -not $watch.HasExited) { Start-Sleep -Milliseconds 500 }
+  Add-Check "watch takes ownership of the board" (Test-Path $lock) "lock present: $(Test-Path $lock)"
 
-$stop = Invoke-Taskctl "stop" "stop --tasks-dir tasks"
-if ($watch.WaitForExit(240000)) { $watchExit = $watch.ExitCode } else { Stop-Process -Id $watch.Id -Force; $watchExit = "killed" }
+  $movedAt = Get-Date
+  Move-Item (Join-Path $pending "c.md") (Join-Path $tasks "c.md")
+  $doneDeadline = (Get-Date).AddSeconds(300)
+  do {
+    Start-Sleep -Seconds 3
+    $status = Invoke-Taskctl "status" "status --tasks-dir tasks"
+  } until ([string]$status.Out -match "(?m)^\s*c\s+done" -or $watch.HasExited -or (Get-Date) -gt $doneDeadline)
+  $latency = [int]((Get-Date) - $movedAt).TotalSeconds
+} finally {
+  # 无论中途出了什么错，都不能留下一个常驻的 watch 进程。
+  $stop = Invoke-Taskctl "stop" "stop --tasks-dir tasks"
+  if ($watch.WaitForExit(240000)) { $watchExit = $watch.ExitCode } else { Stop-Process -Id $watch.Id -Force; $watchExit = "killed" }
+}
+Add-Check "watch discovers the newly added task and drains it" ([string]$status.Out -match "(?m)^\s*c\s+done") "status after $latency s:`n$(([string]$status.Out).Trim())"
 Add-Check "stop exits 0 and watch drains to exit 0" ($stop.Code -eq 0 -and $watchExit -eq 0) "stop exit $($stop.Code); watch exit $watchExit"
 Add-Check "watch releases its lock" (-not (Test-Path $lock)) "lock present after exit: $(Test-Path $lock)"
 
@@ -195,13 +201,15 @@ Add-Check "watch leaves the same per-task run-*.log evidence" ($logC -match "\[c
 $usageC = Read-Usage "c"
 Add-Check "watch captures usage for c" ($usageC.Count -ge 1) "c: $($usageC.Count) usage record(s)"
 $stateC = Read-State "c"
-Add-Check "c runs in its own fresh session" ($stateC.latestWorker.sessionId -and $stateC.latestWorker.sessionId -ne $sessionA) "a/b=$sessionA c=$($stateC.latestWorker.sessionId)"
+$sessionC = [string]$stateC.latestWorker.sessionId
+Add-Check "c runs in its own fresh session" ($sessionC.Length -gt 0 -and $sessionC -ne $sessionA) "a/b=$sessionA c=$sessionC"
 
 Write-Host ""
 $checks | Format-Table -AutoSize -Wrap | Out-String -Width 200 | Write-Host
 Write-Host "watch stdout:"
-Write-Host (Get-Content $watchOut -Raw)
-if ((Get-Content $watchErr -Raw).Trim().Length -gt 0) { Write-Host "watch stderr:"; Write-Host (Get-Content $watchErr -Raw) }
+Write-Host (Read-TextFile $watchOut)
+$watchErrText = Read-TextFile $watchErr
+if ($watchErrText.Trim().Length -gt 0) { Write-Host "watch stderr:"; Write-Host $watchErrText }
 Write-Host "b journal:"
 Write-Host $journalB
 
