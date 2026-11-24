@@ -106,23 +106,24 @@ export async function readFeedback(tasksDir: string): Promise<FeedbackRecord[]> 
 }
 
 /**
- * The notes worth showing one clarify session, best first — or `null` when
- * there is nothing of that task type.
+ * The notes worth showing one session, best first.
  *
- * Selection is deterministic and cheap: notes of another task type are left
+ * Selection is deterministic and cheap: the notes `keep` turns away are left
  * out, the rest are ranked by how many literal keywords they share with the
- * new intent, newest first on a tie, and the packet stops at an entry count
- * and a character budget. No embedding, no model call.
+ * `intent`, newest first on a tie, and the packet stops at an entry count and
+ * a character budget. No embedding, no model call.
  */
-export function selectRelevantFeedback(
-  records: FeedbackRecord[],
-  target: { type: TaskType; intent: string },
-  limits: { entries: number; chars: number } = { entries: FEEDBACK_PACKET_ENTRIES, chars: FEEDBACK_PACKET_CHARS },
+export function pickFeedback(
+  records: readonly FeedbackRecord[],
+  intent: string,
+  keep: (record: FeedbackRecord) => boolean,
+  maxEntries: number,
+  maxChars: number,
 ): FeedbackRecord[] {
-  const wanted = keywords(target.intent);
+  const wanted = keywords(intent);
   const ranked = records
     .flatMap((record, index) => {
-      if (record.taskType !== undefined && record.taskType !== target.type) return [];
+      if (!keep(record)) return [];
       const score = overlap(wanted, keywords(`${record.title ?? ""}\n${record.note}`));
       return [{ record, index, score }];
     })
@@ -132,11 +133,26 @@ export function selectRelevantFeedback(
   for (const { record } of ranked) {
     const cost = Array.from(renderEntry(record)).length;
     // The best note is always kept, whatever its length.
-    if (chosen.length > 0 && (chosen.length >= limits.entries || used + cost > limits.chars)) break;
+    if (chosen.length > 0 && (chosen.length >= maxEntries || used + cost > maxChars)) break;
     chosen.push(record);
     used += cost;
   }
   return chosen;
+}
+
+/**
+ * The notes worth showing one clarify session, best first — or `null` when
+ * there is nothing of that task type. A note recorded under another task type
+ * was about another kind of work, so it is left out; {@link pickFeedback}
+ * does the choosing.
+ */
+export function selectRelevantFeedback(
+  records: FeedbackRecord[],
+  target: { type: TaskType; intent: string },
+  limits: { entries: number; chars: number } = { entries: FEEDBACK_PACKET_ENTRIES, chars: FEEDBACK_PACKET_CHARS },
+): FeedbackRecord[] {
+  const sameType = (record: FeedbackRecord): boolean => record.taskType === undefined || record.taskType === target.type;
+  return pickFeedback(records, target.intent, sameType, limits.entries, limits.chars);
 }
 
 /** {@link selectRelevantFeedback} rendered for the clarify prompt, or `null` when empty. */
@@ -182,7 +198,11 @@ async function recordedTaskType(tasksDir: string, task: { id: string; title: str
   return typeof type === "string" && Object.hasOwn(TEMPLATES, type) ? (type as TaskType) : detectType(`${task.title} ${task.description}`);
 }
 
-function renderEntry(record: FeedbackRecord): string {
+/**
+ * One note as one line: when, which task it was about, what the human did,
+ * and the note itself with its line breaks turned into ` / `.
+ */
+export function renderEntry(record: FeedbackRecord): string {
   const who = record.title === undefined ? record.task : `${record.task}（${clip(record.title, 40)}）`;
   return `- ${record.at.slice(0, 10)}  ${who}  ${describe(record)}：${record.note.replace(/\s*\r?\n\s*/g, " / ")}`;
 }

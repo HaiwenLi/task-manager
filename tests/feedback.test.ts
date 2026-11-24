@@ -7,6 +7,7 @@ import {
   FEEDBACK_NOTE_LIMIT,
   FEEDBACK_PACKET_CHARS,
   FEEDBACK_PACKET_ENTRIES,
+  pickFeedback,
   readFeedback,
   readRelevantFeedback,
   recordFeedback,
@@ -265,5 +266,45 @@ describe("what becomes a preference", () => {
       ["audit", "pass", "证据链接保留这种写法"],
     ]);
     expect((await store.get("n")).status).toBe("done");
+  });
+});
+
+describe("pickFeedback", () => {
+  const target = { type: "code" as const, intent: "改登录页的横幅" };
+  /** The keep rule `selectRelevantFeedback` has always applied: a note of another task type is left out. */
+  const sameType = (record: FeedbackRecord): boolean => record.taskType === undefined || record.taskType === target.type;
+
+  it("is the packet selectRelevantFeedback hands a clarify session, the limits included", async () => {
+    await recordFeedback(tasks, note({ task: "old", note: "导出按钮宽度不要写死" }, 1));
+    await recordFeedback(tasks, note({ task: "rel-1", note: "登录页要保留旧路由" }, 2));
+    await recordFeedback(tasks, note({ task: "other-type", taskType: "office", note: "登录页表格保留原格式" }, 3));
+    await recordFeedback(tasks, note({ task: "rel-2", note: "登录页需要兼容 V1" }, 4));
+    const records = await readFeedback(tasks);
+
+    expect(pickFeedback(records, target.intent, sameType, FEEDBACK_PACKET_ENTRIES, FEEDBACK_PACKET_CHARS))
+      .toEqual(selectRelevantFeedback(records, target));
+    // The third parameter still reaches the selection: a tighter entry count, a tighter budget.
+    expect(selectRelevantFeedback(records, target, { entries: 1, chars: 3_000 }).map((record) => record.task)).toEqual(["rel-2"]);
+    expect(pickFeedback(records, target.intent, sameType, 1, 3_000))
+      .toEqual(selectRelevantFeedback(records, target, { entries: 1, chars: 3_000 }));
+    expect(pickFeedback(records, target.intent, sameType, FEEDBACK_PACKET_ENTRIES, 1))
+      .toEqual(selectRelevantFeedback(records, target, { entries: FEEDBACK_PACKET_ENTRIES, chars: 1 }));
+  });
+
+  it("ranks by the caller's keep rule and stops at the caller's limits", () => {
+    const records = [
+      note({ task: "worker-old", stage: "worker", note: "登录页要保留旧路由" }, 1),
+      note({ task: "reviewer", stage: "reviewer", note: "登录页需要兼容 V1" }, 4),
+      note({ task: "worker-new", stage: "worker", note: "登录页需要兼容 V1" }, 5),
+      note({ task: "unrelated", stage: "worker", note: "导出按钮宽度不要写死" }, 6),
+    ];
+    const workerNotes = (record: FeedbackRecord): boolean => record.stage === "worker";
+    // Only worker-stage notes are candidates, best first, and two of them fill the packet.
+    expect(pickFeedback(records, target.intent, workerNotes, 2, 3_000).map((record) => record.task))
+      .toEqual(["worker-new", "worker-old"]);
+    // The best note is kept whatever the budget: one character still yields it, alone.
+    expect(pickFeedback(records, target.intent, () => true, 8, 1).map((record) => record.task))
+      .toEqual(["worker-new"]);
+    expect(pickFeedback(records, target.intent, () => false, 8, 3_000)).toEqual([]);
   });
 });
