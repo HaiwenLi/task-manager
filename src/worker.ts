@@ -110,6 +110,14 @@ export type WorkerDeps = {
 export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
 export type TaskOutcome = "done" | "blocked" | "skipped" | "open" | "awaiting-human";
+export type RunTaskOptions = { reviewOnly?: boolean };
+type ReviewPendingRecord = {
+  definitionDigest: string;
+  artifactDigest: string;
+  createdAt: string;
+  updatedAt: string;
+  refusals: Array<{ model: string; reason: string }>;
+};
 export class WorkerTimeoutError extends Error {}
 class UncertainExecutionError extends Error {}
 class ReviewRequiredError extends Error {}
@@ -127,6 +135,7 @@ type Run = {
   escalated: boolean;
   /** Durable execution policy and same-model session facts for this task. */
   executionState?: ExecutionState;
+  reviewOnly: boolean;
   /**
    * The inert-sweep reason (e.g. non-Git workdir) is journaled once per
    * attempt, not once per turn — every turn would only repeat the same line.
@@ -152,17 +161,20 @@ export async function runWorker(cfg: WorkerConfig, deps: WorkerDeps): Promise<{ 
   return result;
 }
 
-export async function runTask(cfg: WorkerConfig, deps: WorkerDeps, task: Task, workerId: string): Promise<TaskOutcome> {
+export async function runTask(
+  cfg: WorkerConfig, deps: WorkerDeps, task: Task, workerId: string, options: RunTaskOptions = {},
+): Promise<TaskOutcome> {
   // Even callers reusing a worker label get a distinct fencing generation.
   const owner = `${workerId}:${randomUUID()}`;
   if (!await claim(cfg.tasksDir, task.id, owner, cfg.lockTtlMs)) return "skipped";
   let notifyLost!: () => void;
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
   const now = new Date().toISOString();
-  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, sweepSkipNoted: false,
+  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, sweepSkipNoted: false,
     dispatchFailures: new Map(),
     record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing" } };
   let reservation: WorkspaceReservation | null = null;
+  let reviewPending: ReviewPendingRecord | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let renewal: Promise<void> | undefined;
   let stopping = false;
@@ -187,7 +199,9 @@ export async function runTask(cfg: WorkerConfig, deps: WorkerDeps, task: Task, w
   try {
     // Re-read after claim: a queued snapshot is not authority to reopen a terminal task.
     const current = await owned(r, async () => (await deps.store.list()).find(t => t.id === task.id));
-    if (!current || (current.status !== "open" && current.status !== "running")) return "skipped";
+    if (!current || (r.reviewOnly
+      ? current.status !== "blocked"
+      : current.status !== "open" && current.status !== "running")) return "skipped";
     r.task = structuredClone(current); r.definition = definitionDigest(current);
     r.executionState = await readExecutionState(cfg.tasksDir, task.id, declaredExecution(current));
     r.escalated = r.executionState.requiresReview;
@@ -197,7 +211,15 @@ export async function runTask(cfg: WorkerConfig, deps: WorkerDeps, task: Task, w
       }));
     }
     const previous = await readAttempt(cfg.tasksDir, task.id);
-    if ((previous && previous.phase !== "settled") || (!previous && current.status === "running")) {
+    if (r.reviewOnly) {
+      if (!previous || previous.phase !== "settled") {
+        return await block(r, "review-only recovery requires a settled previous attempt");
+      }
+      reviewPending = await readRuntime<ReviewPendingRecord>(cfg.tasksDir, task.id, "review-pending.json");
+      if (!reviewPending || typeof reviewPending.definitionDigest !== "string" || typeof reviewPending.artifactDigest !== "string") {
+        return await block(r, "review-only recovery requires a valid review-pending record");
+      }
+    } else if ((previous && previous.phase !== "settled") || (!previous && current.status === "running")) {
       return await block(r, "interrupted execution requires operator reconciliation; not replayed");
     }
     reservation = await reserveWorkspace(cfg.workdir, owner);
@@ -217,7 +239,7 @@ export async function runTask(cfg: WorkerConfig, deps: WorkerDeps, task: Task, w
       await appendJournal(cfg.tasksDir, task.id, { stage: "worker", event: "claimed", detail: reservation?.cwd ?? cfg.workdir });
     });
     tick(); emit(r, "running");
-    const outcome = await loop(r);
+    const outcome = r.reviewOnly ? await resumeReviewOnly(r, reviewPending!) : await loop(r);
     // The entire run stays active between operations, including telemetry/handoffs.
     await checkpoint(r, "settled", "finished");
     return outcome;
@@ -760,6 +782,24 @@ async function clearAcceptanceFailures(r: Run): Promise<void> {
   await rm(join(r.cfg.tasksDir, r.task.id, ACCEPTANCE_FAILURES_FILE), { force: true });
 }
 
+async function resumeReviewOnly(r: Run, pending: ReviewPendingRecord): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
+  if (pending.definitionDigest !== await attemptDefinition(r)) {
+    throw new ReviewRequiredError("review-only recovery refused: the task definition changed; old evidence is stale");
+  }
+  const artifactNow = await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir], r.cfg.artifactIgnore ?? []);
+  if (pending.artifactDigest !== artifactNow) {
+    throw new ReviewRequiredError("review-only recovery refused: artifacts changed after the preserved worker/acceptance evidence");
+  }
+  const outcome = await reviewStage(r);
+  if (outcome === "retry") {
+    // A real fail verdict needs worker side effects, which a review-only claim
+    // deliberately cannot perform. The judge already wrote the feedback note.
+    await owned(r, () => r.deps.store.setStatus(r.task.id, "open"));
+    return "open";
+  }
+  return outcome;
+}
+
 async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "awaiting-human"> {
   // Which model produced the work is part of the evidence: after a handover it
   // is no longer the model the operator configured.
@@ -1072,6 +1112,7 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "retry" | "open
       // file edited while the reviewer was reading would otherwise be completed —
       // or reopened for rework — under a definition the reviewer never saw.
       await requireUnchangedDefinition(r, ["review"], "the task definition changed during the review; refusing to act on the verdict");
+      await rm(join(r.cfg.tasksDir, id, "review-pending.json"), { force: true });
       return await judge(r, result, prevCriteria);
     }
     await owned(r, () => appendJournal(r.cfg.tasksDir, id, {
@@ -1086,13 +1127,43 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "retry" | "open
       emit(r, "rework", "reviewer provider failure; retrying with the next model");
       continue;
     }
-    // No model left: spend an attempt and reopen. A full rerun is the only
-    // remaining option, and the operator can raise the quota and call `retry`.
-    if (await fail(r)) return "blocked";
-    await owned(r, () => r.deps.store.setStatus(id, "open"));
-    emit(r, "rework", "reviewer provider failure; retrying");
-    return "open";
+    // No reviewer is available, but the worker and acceptance already produced
+    // valid evidence. Park only the missing review instead of replaying those
+    // side effects on a later scheduler pass.
+    return await parkReviewPending(r, reviewerModel, result);
   }
+}
+
+async function parkReviewPending(
+  r: Run, reviewerModel: string | undefined, result: ReviewResult,
+): Promise<"blocked"> {
+  const acceptance = await readRuntime<Record<string, unknown>>(r.cfg.tasksDir, r.task.id, "acceptance.json");
+  const previous = await readRuntime<ReviewPendingRecord>(r.cfg.tasksDir, r.task.id, "review-pending.json");
+  const artifactDigestAfter = typeof acceptance?.artifactAfter === "string"
+    ? acceptance.artifactAfter
+    : await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir], r.cfg.artifactIgnore ?? []);
+  const now = new Date().toISOString();
+  const refusal = {
+    model: reviewerModel ?? "(default)",
+    reason: (result.summary || "review provider rejected the turn").slice(0, 1_000),
+  };
+  const pending: ReviewPendingRecord = {
+    definitionDigest: await attemptDefinition(r),
+    artifactDigest: artifactDigestAfter,
+    createdAt: previous?.createdAt ?? now,
+    updatedAt: now,
+    refusals: [...(previous?.refusals ?? []), refusal].slice(-20),
+  };
+  await owned(r, async () => {
+    await writeRuntime(r.cfg.tasksDir, r.task.id, "review-pending.json", pending);
+    await r.deps.store.setStatus(r.task.id, "blocked");
+    await appendJournal(r.cfg.tasksDir, r.task.id, {
+      stage: "review", event: "review-pending",
+      detail: `${refusal.model}: ${refusal.reason}; worker/acceptance preserved`,
+    });
+  });
+  emit(r, "blocked", "review pending: reviewer providers unavailable; worker and acceptance preserved; retry with --review-only");
+  return "blocked";
 }
 
 /** Act on a verdict that actually judged the work. */

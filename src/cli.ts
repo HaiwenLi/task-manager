@@ -3,7 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import { LOCK_TTL_MS_DEFAULT } from "./claim.js";
 import { latestNote, writeNote } from "./handoff.js";
 import { TaskStore } from "./task-store.js";
-import { runWorker, type WorkerConfig } from "./worker.js";
+import { runTask, runWorker, type WorkerConfig, type WorkerDeps } from "./worker.js";
 import { runScheduler } from "./scheduler.js";
 import { OpenCodeAdapter } from "./adapters/opencode.js";
 import type { AgentAdapter } from "./adapters/types.js";
@@ -27,6 +27,8 @@ import { resolveArtifacts } from "./artifacts.js";
 export type CliDeps = {
   adapter?: AgentAdapter;
   acceptance?: (command: string, cwd: string) => Promise<AcceptanceResult>;
+  /** Test seam for review-only recovery without starting a reviewer agent. */
+  review?: WorkerDeps["review"];
   now?: () => Date;
   log?: (line: string) => void;
   err?: (line: string) => void;
@@ -55,7 +57,7 @@ const USAGE = [
   "  taskctl audit --task <id> --verdict pass|fail [--stage …] [--note \"…\"] [--tasks-dir <dir>]",
   "  taskctl metrics [--tasks-dir <dir>]",
   "  taskctl reconcile --task <id> [--tasks-dir <dir>]",
-  "  taskctl retry --task <id> [--tasks-dir <dir>]",
+  "  taskctl retry --task <id> [--review-only] [--tasks-dir <dir>]",
   "  taskctl findings --task <id> [--out <file>] [--tasks-dir <dir>]",
   "  taskctl learn --note \"<原话 → 改法>\" [--tasks-dir <dir>]",
   "  taskctl template [--type code|office|research|design]",
@@ -168,8 +170,8 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
       checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return reconcileCommand(flags, log);
     case "retry":
-      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
-      return retryCommand(flags, log);
+      checkFlags(command, flags, ["task", "tasks-dir", "config", "review-only"], ["task"]);
+      return retryCommand(flags, deps, log);
     case "findings":
       checkFlags(command, flags, ["task", "out", "tasks-dir", "config"], ["task"]);
       return findingsCommand(flags, log);
@@ -518,7 +520,7 @@ async function statusCommand(flags: Map<string, string>, log: (line: string) => 
 }
 
 /** Flags that stand alone, with no value token after them. */
-const BOOLEAN_FLAGS = new Set(["simple", "quick", "all", "apply", "json"]);
+const BOOLEAN_FLAGS = new Set(["simple", "quick", "all", "apply", "json", "review-only"]);
 
 /** `taskctl board` — rewrite `.taskctl/board.md` and print the same content as a table. */
 async function boardCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
@@ -736,18 +738,39 @@ async function reconcileCommand(flags: Map<string, string>, log: (line: string) 
   for (const note of findings.notes) log(`  - ${note}`);
   for (const reservation of findings.reservations) log(`  reservation ${reservation.token} -> ${reservation.cwd}`);
   log(`  verdict: ${findings.verdict}`);
-  if (findings.verdict === "retry-allowed") log(`  next: taskctl retry --task ${findings.id}`);
+  const reviewPending = findings.verdict === "retry-allowed"
+    && await readRuntime(tasksDir, findings.id, "review-pending.json") !== null;
+  if (findings.verdict === "retry-allowed") {
+    log(`  next: taskctl retry --task ${findings.id}${reviewPending ? " --review-only" : ""}`);
+  }
   if (findings.verdict === "manual-review") {
     log("  next: confirm the execution is really gone, then reconcile the evidence by hand (ADR-0007)");
   }
   return 0;
 }
 
-/** `taskctl retry --task <id>` — reopen a blocked task once nothing is running. */
-async function retryCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+/** `taskctl retry --task <id>` — reopen work, or only finish a preserved review. */
+async function retryCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
   const tasksDir = await tasksDirFor(flags);
   const cfg = await configFor(flags);
-  const outcome = await retryTask(tasksDir, flags.get("task")!, { baseWorkdir: cfg.workdir });
+  const id = flags.get("task")!;
+  if (flags.has("review-only")) {
+    const store = new TaskStore(tasksDir);
+    const task = await store.get(id);
+    const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+    const outcome = await runTask({ ...cfg, tasksDir }, {
+      store, adapter,
+      ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
+      ...(deps.review === undefined ? {} : { review: deps.review }),
+      onEvent: (evt) => log(`[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`),
+    }, task, `review-only-${process.pid}-${id}`, { reviewOnly: true });
+    await refreshBoardFile(tasksDir).catch(() => {});
+    log(outcome === "done" || outcome === "awaiting-human" || outcome === "open"
+      ? `review-only recovery finished: ${outcome}`
+      : `review-only recovery refused or still unavailable: ${outcome}`);
+    return outcome === "done" || outcome === "awaiting-human" || outcome === "open" ? 0 : 1;
+  }
+  const outcome = await retryTask(tasksDir, id, { baseWorkdir: cfg.workdir });
   if (!outcome.ok) {
     log(`retry refused: ${outcome.reason}`);
     return 1;

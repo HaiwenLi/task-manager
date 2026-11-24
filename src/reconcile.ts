@@ -122,7 +122,7 @@ export type RetryOutcome = { ok: true; archive: string } | { ok: false; reason: 
  * the operator may have restored the quota that made the head model fail, and
  * the rotation costs nothing to rebuild (one rejected attempt).
  */
-const ATTEMPT_EVIDENCE = ["attempt.json", "acceptance.json", "review.json", "models.json"] as const;
+const ATTEMPT_EVIDENCE = ["attempt.json", "acceptance.json", "review.json", "models.json", "review-pending.json"] as const;
 
 /**
  * Reopen a blocked task whose previous attempt is settled and unreferenced.

@@ -217,15 +217,16 @@ describe("reviewer model fallback", () => {
     expect(models.filter((model) => model.startsWith("review:"))).toEqual(["review:r/one", "review:r/two"]);
   });
 
-  it("reopens for a full rerun only when no reviewer model is left", async () => {
+  it("parks review-pending without rerunning successful work when no reviewer model is left", async () => {
     await seed();
     const models: string[] = [];
     const agent = adapter({ turns: { "w/one": "done" }, reviews: { "r/one": rejected("r/one") } }, models);
 
-    // One model, no fallback: the rejected review spends an attempt and reopens.
-    expect(await run(agent, [], { reviewerModel: "r/one", retryLimit: 2 })).toBe("open");
+    expect(await run(agent, [], { reviewerModel: "r/one", retryLimit: 2 })).toBe("blocked");
+    expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one"]);
     expect(models.filter((model) => model.startsWith("review:"))).toEqual(["review:r/one"]);
-    expect((await store.get("a")).retries).toBe(1);
+    expect((await store.get("a")).retries).toBe(0);
+    expect((await store.get("a")).status).toBe("blocked");
   });
 });
 
