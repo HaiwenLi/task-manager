@@ -1,5 +1,6 @@
 repos/
 node_modules/
+.codegraph/
 dist/
 *.log
 /tasks/*
