@@ -63,12 +63,21 @@ describe("rename retry policy", () => {
   });
 
   it("gives up after the bounded number of retries instead of looping", async () => {
+    // Taken before the clock is faked: a way to yield to the event loop for real.
+    const realSetTimeout = globalThis.setTimeout;
     vi.useFakeTimers();
     state.plan = Array.from({ length: 20 }, () => errno("EPERM"));
     const attempt = renameWithRetry(join(root, "a.tmp"), join(root, "b"));
     const settled = expect(attempt).rejects.toMatchObject({ code: "EPERM" });
     // 1 initial call + the declared retries; the schedule is 5/25/125/625/3125ms.
-    await vi.advanceTimersByTimeAsync(5 + 25 + 125 + 625 + 3_125);
+    // Each wait is armed only after the helper has looked at the destination.
+    // That lookup is real I/O, which the faked clock cannot deliver, so every
+    // wait gets its own turn of the real event loop before its time is advanced.
+    for (const wait of [5, 25, 125, 625, 3_125]) {
+      while (vi.getTimerCount() === 0) await new Promise<void>((resolve) => { realSetTimeout(resolve, 1); });
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(wait);
+    }
     await settled;
     expect(state.calls).toBe(6);
     vi.useRealTimers();

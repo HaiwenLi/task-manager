@@ -160,6 +160,34 @@ describe("a file replace the OS refused", () => {
     expect(await run(config("q/two"), handedOver)).toBe("done");
     expect(seen).toEqual(["w/one", "q/two"]);
   });
+
+  it("does not spend the retry budget when the destination is a directory", async () => {
+    // Windows refuses a rename onto a directory with the same EPERM as a busy
+    // file. Unlike a busy file, no wait makes the destination stop being a
+    // directory, so the refusal is final and is reported on the first attempt.
+    const dir = join(root, "models.json");
+    const plan = join(root, "models.json.tmp");
+    await mkdir(dir);
+    await writeFile(plan, "{}", "utf8");
+    refuse("models.json", "EPERM", "EPERM", "EPERM", "EPERM", "EPERM", "EPERM");
+
+    await expect(renameWithRetry(plan, dir)).rejects.toMatchObject({ code: "EPERM" });
+    expect(state.attempts.get("models.json")).toBe(1);
+    // What was to be written is still there: nothing of the caller's is lost.
+    expect(await readFile(plan, "utf8")).toBe("{}");
+  });
+
+  it("still retries a first write whose destination does not exist yet", async () => {
+    // Giving up at once is for a directory at the destination only. A
+    // destination that is merely not there yet is the ordinary first write,
+    // and a refusal of it is retried like any other.
+    const plan = join(root, "fresh.json.tmp");
+    await writeFile(plan, "{}", "utf8");
+    refuse("fresh.json", "EPERM");
+
+    await expect(renameWithRetry(plan, join(root, "fresh.json"))).resolves.toBeUndefined();
+    expect(await readFile(join(root, "fresh.json"), "utf8")).toBe("{}");
+  });
 });
 
 describe("the lock heartbeat", () => {

@@ -1,4 +1,4 @@
-import { rename } from "node:fs/promises";
+import { lstat, rename } from "node:fs/promises";
 
 /**
  * Backoff for a rename that Windows refused.
@@ -25,6 +25,15 @@ const RENAME_RETRY_DELAYS_MS: readonly number[] = [5, 25, 125, 625, 3125];
  */
 const TRANSIENT_RENAME_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
 
+/** Whether `path` is a directory. Anything else, including a missing path, is not. */
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await lstat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /** Rename, retrying only a destination held by a concurrent handle. */
 export async function renameWithRetry(from: string, to: string): Promise<void> {
   for (let attempt = 0; ; attempt++) {
@@ -35,6 +44,10 @@ export async function renameWithRetry(from: string, to: string): Promise<void> {
       const code = (err as NodeJS.ErrnoException).code;
       const delay = RENAME_RETRY_DELAYS_MS[attempt];
       if (code === undefined || !TRANSIENT_RENAME_CODES.has(code) || delay === undefined) throw err;
+      // Windows refuses a rename onto a directory with the same EPERM as a busy
+      // file. No wait makes the destination stop being a directory, so this
+      // refusal is final: it is reported now, not after the whole budget.
+      if (await isDirectory(to)) throw err;
       await new Promise<void>((resolve) => setTimeout(resolve, delay));
     }
   }
