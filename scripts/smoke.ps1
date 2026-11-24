@@ -3,7 +3,7 @@
 #   .\scripts\smoke.ps1              # 只准备临时项目并打印命令，不调用模型
 #   .\scripts\smoke.ps1 -Live        # 真跑一次（会消耗模型额度）
 #
-# 退出码：0 通过；1 任务没有到 done；2 环境不满足（找不到 opencode 或 node）。
+# 退出码：0 通过；1 任务没有注册或没有到 done；2 环境不满足（找不到 opencode 或 node）。
 param(
   [switch]$Live,
   [string]$OpencodeExe = ""
@@ -48,6 +48,7 @@ node "$tsx" "$entry" %*
 
 @'
 ---
+schema: taskctl/v1
 title: 写一个 hello 文件
 status: open
 acceptance: node -e "process.exit(require('fs').readFileSync('hello.txt','utf8').trim()==='hi'?0:1)"
@@ -61,8 +62,21 @@ review_rounds: 0
 在工作目录创建 hello.txt，内容为 hi。完成后运行 taskctl done --task 001-hello 请求完成。
 '@ | Set-Content (Join-Path $root "tasks\001-hello.md") -Encoding utf8
 
+# 注册守卫不耗模型额度，两种模式都跑：没有声明 schema 的任务文件会被归入 ignored，
+# run 面对空看板什么也不做，后面的 done 检查只会白白失败。
+$env:PATH = "$bin;$env:PATH"
+Push-Location $root
+$board = (taskctl status --tasks-dir tasks) -join "`n"
+Pop-Location
+
 Write-Host "临时项目：$root"
 Write-Host "opencode：$OpencodeExe"
+Write-Host ""
+Write-Host $board
+if ($board -notmatch "001-hello\s+open") {
+  Write-Error "冒烟任务 001-hello 没有注册为 open（看板见上）；先修本脚本里的任务文件。"
+  exit 1
+}
 if (-not $Live) {
   Write-Host ""
   Write-Host "未加 -Live，只准备了环境。真跑："
@@ -70,7 +84,6 @@ if (-not $Live) {
   exit 0
 }
 
-$env:PATH = "$bin;$env:PATH"
 Push-Location $root
 try {
   taskctl run --config taskctl.json
