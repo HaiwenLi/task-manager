@@ -22,7 +22,7 @@ import { definitionDigest, readAttempt, readDefinitionSnapshot, readRuntime, wri
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
 import { chainPosition, readModelRotation, resetChainCycles, rotateModel, reviewerChain as configuredReviewerChain, taskChain, type Handover, type ModelRole } from "./models.js";
-import { checkModels, noteReported, renderVerdicts, reviewerModels, workerModels } from "./budget.js";
+import { checkModels, noteReported, renderVerdicts, reviewerModels, workerModels, type ModelVerdict } from "./budget.js";
 import { classifyDispatchFailure, quotaBackoffMs } from "./dispatch.js";
 import { failureFingerprint } from "./fingerprint.js";
 import { startReview, type CriterionResult, type ReviewEvidence, type ReviewResult } from "./review.js";
@@ -141,14 +141,20 @@ export type WorkerDeps = {
   memory?: MemoryBackend;
   onEvent?: (evt: WorkerEvent) => void;
 };
-/** `refused` is reported before the claim, once per process for a task and the models it was refused for; its detail is the guard's verdicts. */
+/**
+ * `refused` is reported once per process for a task and the reason it was
+ * refused, which is what its detail holds (the guard's verdicts): the same
+ * verdicts at a later offer say nothing new, other verdicts are news.
+ */
 export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error" | "refused";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
 /**
- * `refused`: the budget guard said no before anything was claimed. The task
- * stays `open` and unclaimed, nothing was written into its directory, and no
- * model session started, so it is neither progress nor a reason to wait for a
- * human; it needs no recovery.
+ * `refused`: the budget guard said no before anything ran. The task stays as
+ * the board has it (`open`, and unclaimed once the attempt has returned), no
+ * model session started, and nothing of an attempt was written into its
+ * directory, so it is neither progress nor a reason to wait for a human; it
+ * needs no recovery. `runTask` judges twice: before the claim, and right
+ * after the workspace is reserved, on the task as the board then holds it.
  */
 export type TaskOutcome = "done" | "blocked" | "skipped" | "open" | "awaiting-human" | "refused";
 export type RunTaskOptions = {
@@ -232,6 +238,19 @@ export async function runWorker(cfg: WorkerConfig, deps: WorkerDeps): Promise<{ 
   return result;
 }
 
+/**
+ * Report a refusal, once per process for a task and the reason it was refused.
+ *
+ * The key is the guard's verdict lines, not only the models they name: a task
+ * first refused because the catalogue could not be read is reported again when
+ * the same models are later refused as paid, while the same verdicts at every
+ * wake of a queue are said once.
+ */
+function reportRefusal(deps: WorkerDeps, taskId: string, refused: readonly ModelVerdict[]): void {
+  const detail = renderVerdicts(refused);
+  if (noteReported(taskId, [detail])) deps.onEvent?.({ type: "refused", taskId, detail });
+}
+
 export async function runTask(
   cfg: WorkerConfig, deps: WorkerDeps, task: Task, workerId: string, options: RunTaskOptions = {},
 ): Promise<TaskOutcome> {
@@ -241,15 +260,13 @@ export async function runTask(
   // may run on is judged first, and a refusal leaves the task `open`, with
   // nothing written into its directory and no session started. A review-only
   // recovery runs the reviewer alone, so the worker's models are not judged.
+  // This is the snapshot the caller passed; the task is judged again below, as
+  // the board holds it once the claim has been made.
   const refused = await checkModels(cfg, deps.adapter, options.reviewOnly
     ? { reviewer: reviewerModels(cfg) }
     : { worker: workerModels(cfg, task), reviewer: reviewerModels(cfg) });
   if (refused.length > 0) {
-    // Reported once per process for a task and the models it was refused for:
-    // a queue that offers the task again gets the same answer and says nothing new.
-    if (noteReported(task.id, refused.map((verdict) => verdict.ref))) {
-      deps.onEvent?.({ type: "refused", taskId: task.id, detail: renderVerdicts(refused) });
-    }
+    reportRefusal(deps, task.id, refused);
     return "refused";
   }
   if (!await claim(cfg.tasksDir, task.id, owner, cfg.lockTtlMs)) return "skipped";
@@ -328,6 +345,26 @@ export async function runTask(
     if (!reservation) return await block(r, "workspace reserved by another or uncertain execution; reconcile before retry");
     r.record.workspace = reservation.cwd;
     r.cfg = { ...cfg, workdir: reservation.cwd };
+    // Judged again, on what this attempt will really run. The first guard took
+    // the snapshot the caller passed, and the task was re-read after the claim
+    // (`r.task`): a `model:` edited onto it in between must not run unjudged.
+    // The catalogue is remembered, so wherever the first guard could read it
+    // this is a second judgement, not a second call; and it is read in the
+    // directory the session starts in. Nothing has been emitted or written for
+    // the attempt yet.
+    const refusedHere = await checkModels(r.cfg, deps.adapter, r.reviewOnly
+      ? { reviewer: reviewerModels(r.cfg) }
+      : { worker: workerModels(r.cfg, r.task), reviewer: reviewerModels(r.cfg) });
+    if (refusedHere.length > 0) {
+      reportRefusal(deps, r.task.id, refusedHere);
+      // On this path the claim's lock record was written (`claim`, above) and
+      // is released again by the `finally`. The workspace reservation is given
+      // back here: the `finally` releases only the reservation of a record
+      // that settled, and no record was written for this attempt. The task is
+      // left exactly as the board holds it.
+      await reservation.release();
+      return "refused";
+    }
     emit(r, task.status === "running" ? "takeover" : "claimed");
     await owned(r, async () => {
       await writeRuntime(cfg.tasksDir, task.id, "attempt.json", r.record);

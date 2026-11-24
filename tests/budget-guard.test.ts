@@ -14,6 +14,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { AgentAdapter } from "../src/adapters/types.js";
 import type { AcceptanceResult } from "../src/acceptance.js";
 import { runBatch } from "../src/batch.js";
+import { claim, lockLive, release } from "../src/claim.js";
 import { resetGuardState } from "../src/budget.js";
 import { runCli, type CliDeps } from "../src/cli.js";
 import { readJournal } from "../src/journal.js";
@@ -309,6 +310,75 @@ describe("runTask: the guard before the claim", () => {
     expect(await readdir(config.tasksDir)).toEqual(["a.md"]);
   });
 
+  it("judges the task the attempt really runs, not only the snapshot the caller passed", async () => {
+    // The caller's snapshot names the free plan/m; the board holds the same task with the paid zen/p, edited onto
+    // it after the caller read it. The first guard passes; the second, on the task as the board holds it, refuses.
+    const store = await seeded();
+    store.tasks.set("a", { ...unit(), model: "zen/p" });
+    const adapter = guarded(noTurn);
+    const config = cfg({ model: "plan/m" });
+
+    expect(await runTask(config, watched(store, adapter), { ...unit(), model: "plan/m" }, "w")).toBe("refused");
+
+    expect(adapter.calls).toHaveLength(0);
+    expect(store.task("a").status).toBe("open");
+    expect(events).toEqual([{ type: "refused", taskId: "a", detail: PAID_LINE }]);
+    // Nothing of the attempt was written: the claim created the task's directory, and nothing else is in it.
+    expect(await readdir(join(config.tasksDir, "a"))).toEqual([]);
+    // The claim's lock is free again, for a later claim...
+    expect(await lockLive(config.tasksDir, "a", config.lockTtlMs)).toBe(false);
+    expect(await claim(config.tasksDir, "a", "later", config.lockTtlMs)).toBe(true);
+    await release(config.tasksDir, "a", "later");
+    // ...and so is the workspace: the task runs once its model is allowed, with no human in between.
+    events.length = 0;
+    const allowed = cfg({ model: "plan/m", allowedModels: ["zen/p"] });
+    expect(await runTask(allowed, watched(store, guarded(asksForDone(store))), { ...unit(), model: "plan/m" }, "w")).toBe("done");
+    expect(events.some((e) => e.type === "refused")).toBe(false);
+  });
+
+  it("reports a refusal again when its reason changes, for the same models", async () => {
+    const store = await seeded();
+    // First the catalogue cannot be read at all; then it can, and the model turns out to be paid.
+    let readable = false;
+    // The backend's default is the same paid model, so both refusals name the same refs: an unreadable catalogue
+    // refuses every model it was asked about, the default included.
+    const adapter = Object.assign(new FakeAdapter(noTurn), adapterOf(CATALOGUE, "zen/p"), {
+      modelCatalog: async () => { if (!readable) throw new Error("service unreachable"); return CATALOGUE; },
+    });
+    const config = cfg({ model: "zen/p" });
+    const run = () => runTask(config, watched(store, adapter), unit(), "w");
+    expect(await run()).toBe("refused");
+    readable = true;
+    expect(await run()).toBe("refused");
+    // The same task and the same model, refused for another reason: news, so it is reported.
+    expect(events.map((e) => e.type)).toEqual(["refused", "refused"]);
+    expect(events[0]!.detail).toContain("模型目录读不到");
+    expect(events[1]!.detail).toBe(PAID_LINE);
+    // The same reason again is still said once.
+    expect(await run()).toBe("refused");
+    expect(events).toHaveLength(2);
+  });
+
+  it("asks for the catalogue in the directory the session runs in", async () => {
+    const store = await seeded();
+    const catalogueDirs: Array<string | undefined> = [];
+    const defaultDirs: Array<string | undefined> = [];
+    const adapter = Object.assign(new FakeAdapter(asksForDone(store)), {
+      modelCatalog: async (cwd?: string) => { catalogueDirs.push(cwd); return CATALOGUE; },
+      defaultModelRef: async (cwd?: string) => { defaultDirs.push(cwd); return "plan/m"; },
+    });
+    const config = cfg({ model: "plan/m" });
+    expect(await runTask(config, watched(store, adapter), unit(), "w")).toBe("done");
+
+    // The session runs in the reserved workspace, and every read of the catalogue and of the default was asked
+    // there: in that directory, or in the configured workdir that names it.
+    const sessionDir = adapter.calls[0]!.cwd;
+    expect(new Set(catalogueDirs)).toEqual(new Set([config.workdir, sessionDir]));
+    expect(new Set(defaultDirs)).toEqual(new Set([config.workdir, sessionDir]));
+    // Once per directory, not once per guard.
+    expect(catalogueDirs).toHaveLength(sessionDir === config.workdir ? 1 : 2);
+  });
+
   it("does not guard an adapter that cannot list models", async () => {
     // The fakes every other suite runs on have no `modelCatalog`: nothing is known about them, so nothing is refused.
     const store = await seeded();
@@ -558,21 +628,29 @@ describe("a batch and the watch queue", () => {
     expect(REFUSED_RETRY_MS).toBe(300_000);
   });
 
-  it("still offers a task with a dead lock while it is cooling: a dead lock must be taken over", async () => {
-    // a is `running` on the board, but its lock stopped heartbeating a minute ago.
-    await seedTaskFile(tasks, task("a", { status: "running" }));
+  it("offers a task with a dead lock first, but leaves it out while it cools and runs the rest of the board", async () => {
+    // a is `running` on the board, but its lock stopped heartbeating a minute ago; b is open behind it.
+    await seedTaskFile(tasks, task("a", { status: "running" }), buildTaskFile({ id: "b", title: "b" }));
     await mkdir(join(tasks, "a"), { recursive: true });
     await writeFile(join(tasks, "a", "lock.json"), JSON.stringify({ worker: "dead-worker", heartbeat: Date.now() - 60_000 }), "utf8");
     const offered: string[] = [];
+    const at: number[] = [];
+    const refusedRetryMs = 300;
     await queue({
-      watchFs, fallbackMs: 20, debounceMs: 5,
+      watchFs, fallbackMs: 20, debounceMs: 5, refusedRetryMs,
       runOne: async (_c, _d, offeredTask) => {
         offered.push(offeredTask.id);
-        if (offered.length >= 2) await requestStop();
+        at.push(Date.now());
+        // Judged a second time: the end of the test.
+        if (offered.filter((id) => id === "a").length === 2) await requestStop();
         return "refused";
       },
     });
-    expect(offered).toEqual(["a", "a"]);
+    // A dead lock is still taken over first, whatever the guard says about it. But a refusal cools it like any
+    // other task, so the task behind it runs instead of the same task being offered at every wake...
+    expect(offered).toEqual(["a", "b", "a"]);
+    // ...and it is offered again only after the retry interval.
+    expect(at[2]! - at[0]!).toBeGreaterThanOrEqual(refusedRetryMs - 20);
   });
 });
 

@@ -12,8 +12,11 @@ export const stopRequestPath = (tasksDir: string): string => join(controlDir(tas
 
 /**
  * How long the queue leaves a task the budget guard refused out of its
- * candidates before it offers the task again. The catalogue or the policy
- * may have changed by then; offering it at every wake would not.
+ * candidates before it offers the task again. Offering it at every wake would
+ * not change the answer: the policy is fixed for the life of the process, and
+ * a catalogue that was read is remembered. What can have changed by then is a
+ * catalogue that could not be read — a backend that was down, or that answered
+ * nothing — because a failed read is never remembered and is asked for again.
  */
 export const REFUSED_RETRY_MS = 300_000;
 
@@ -212,9 +215,13 @@ async function scheduleOnce(
   const board = await deps.store.list();
   assertAcyclic(board);
   let candidate = undefined as (typeof board)[number] | undefined;
-  // Never filtered by `cooling`: a dead lock must still be taken over, whatever the guard says about the task.
+  // Before anything else, and whatever the guard says about the task: a dead
+  // lock must still be taken over. But a task the guard refused is left out
+  // until the retry interval has passed, like any other — offered at every
+  // wake, it would be refused at every wake, and the rest of the board would
+  // never run.
   for (const task of board) {
-    if (task.status === "running" && !await lockLive(cfg.tasksDir, task.id, cfg.lockTtlMs)) {
+    if (task.status === "running" && !cooling(task.id) && !await lockLive(cfg.tasksDir, task.id, cfg.lockTtlMs)) {
       candidate = task;
       break;
     }
