@@ -1,5 +1,5 @@
 import type { AgentAdapter, CatalogueCost, CatalogueModel } from "./adapters/types.js";
-import { configChain, modelChain } from "./models.js";
+import { modelChain, taskChain } from "./models.js";
 import type { Task } from "./task-file.js";
 import type { WorkerConfig } from "./worker.js";
 
@@ -149,9 +149,13 @@ export function classify(ref: string, catalogue: readonly CatalogueModel[] | nul
   return decide(verdict, policy);
 }
 
-/** The models the worker of one task may run on: the task's own model when it has one, then the configured chain. */
+/**
+ * The models the worker of one task may run on: exactly the chain the worker
+ * dispatches on (`taskChain`), so the guard judges no model the worker would
+ * never run and misses none it might.
+ */
 export function workerModels(cfg: WorkerConfig, task: Task): string[] {
-  return unique([...modelChain(task.model, undefined), ...configChain(cfg.model, cfg.modelChain, cfg.modelFallbacks)]);
+  return unique(taskChain(cfg, task));
 }
 
 /** The models the reviewer may run on: its own chain, never the task's or the worker's. */

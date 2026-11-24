@@ -47,7 +47,11 @@ describe("budget guard", () => {
     expect(classify("plan/m", [disabled], {}).reason).toBe("后端里已禁用");
   });
   it("collects the worker and reviewer models of a task", () => {
-    expect(workerModels(cfg, { ...task, model: "task/one#low" })).toEqual(["task/one", "cfg/two"]);
+    // The worker's real chain: a task with its own model never runs the configured `model`, so it is not judged.
+    expect(workerModels(cfg, { ...task, model: "task/one#low" })).toEqual(["task/one"]);
+    // What may follow the task's model is the configured chain, then the fallbacks.
+    expect(workerModels({ ...cfg, modelChain: ["cfg/two", "cfg/three"] }, { ...task, model: "task/one#low" })).toEqual(["task/one", "cfg/two", "cfg/three"]);
+    expect(workerModels(cfg, task)).toEqual(["cfg/two"]);
     expect(reviewerModels(cfg)).toEqual(["cfg/review"]);
   });
   it("answers nothing when the adapter cannot list models", async () => {
@@ -237,7 +241,8 @@ describe("budget guard", () => {
     expect(workerModels(chained, task)).toEqual(["chain/one", "chain/two", "fb/one"]);
     expect(workerModels(chained, { ...task, model: "task/one" })).toEqual(["task/one", "chain/one", "chain/two", "fb/one"]);
     expect(workerModels({ ...chained, modelChain: undefined }, task)).toEqual(["cfg/one", "chain/two", "fb/one"]);
-    expect(workerModels({ ...chained, modelChain: undefined }, { ...task, model: "task/one" })).toEqual(["task/one", "cfg/one", "chain/two", "fb/one"]);
+    // With no configured chain the task's model is followed by the fallbacks alone: still never by the configured `model`.
+    expect(workerModels({ ...chained, modelChain: undefined }, { ...task, model: "task/one" })).toEqual(["task/one", "chain/two", "fb/one"]);
     expect(reviewerModels(chained)).toEqual(["r/one", "r/two"]);
     expect(workerModels({ reviewerModel: "r" } as WorkerConfig, { ...task, model: "task/one" })).toEqual(["task/one"]);
     expect(workerModels({} as WorkerConfig, task)).toEqual([]);

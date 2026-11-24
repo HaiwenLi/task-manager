@@ -21,7 +21,7 @@ import {
 import { definitionDigest, readAttempt, readDefinitionSnapshot, readRuntime, writeDefinitionSnapshot, writeRuntime, type AttemptRecord } from "./runtime.js";
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
-import { chainPosition, configChain, modelChain, readModelRotation, resetChainCycles, rotateModel, type Handover, type ModelRole } from "./models.js";
+import { chainPosition, modelChain, readModelRotation, resetChainCycles, rotateModel, taskChain, type Handover, type ModelRole } from "./models.js";
 import { classifyDispatchFailure, quotaBackoffMs } from "./dispatch.js";
 import { failureFingerprint } from "./fingerprint.js";
 import { startReview, type CriterionResult, type ReviewEvidence, type ReviewResult } from "./review.js";
@@ -513,10 +513,8 @@ async function controlled<T>(
   } finally { r.execution = undefined; if (timer) clearTimeout(timer); }
 }
 
-/** The worker's chain: the task's own model (else the configured chain), then fallbacks. */
-const workerChain = (r: Run): string[] => r.task.model === undefined
-  ? configChain(r.cfg.model, r.cfg.modelChain, r.cfg.modelFallbacks)
-  : modelChain(r.task.model, [...(r.cfg.modelChain ?? []), ...(r.cfg.modelFallbacks ?? [])]);
+/** The worker's chain, the one definition of it: the task's own model (else the configured chain), then fallbacks. See `taskChain`. */
+const workerChain = (r: Run): string[] => taskChain(r.cfg, r.task);
 /** The reviewer's chain: its own model, then its fallbacks — never the task's silently. */
 const reviewerChain = (r: Run): string[] => modelChain(r.cfg.reviewerModel, r.cfg.reviewerModelFallbacks);
 

@@ -86,6 +86,22 @@ export function configChain(
   return modelChain(primary, fallbacks);
 }
 
+/**
+ * The chain a task's worker dispatches on: the task's own model, else the
+ * configured chain, then fallbacks. With a task model the configured `model`
+ * is not an alternative: the task named the model its work runs on, so that
+ * one is the head, and what may follow it is the rest of the configured chain
+ * and the fallbacks. The budget guard judges exactly this list.
+ */
+export function taskChain(
+  cfg: { model?: string; modelChain?: string[]; modelFallbacks?: string[] },
+  task: { model?: string },
+): string[] {
+  return task.model === undefined
+    ? configChain(cfg.model, cfg.modelChain, cfg.modelFallbacks)
+    : modelChain(task.model, [...(cfg.modelChain ?? []), ...(cfg.modelFallbacks ?? [])]);
+}
+
 /** Where the chain actually stands: a position recorded for a different model is stale. */
 export function chainPosition(chain: readonly string[], entry: RotationEntry | undefined): number {
   if (entry === undefined) return 0;
