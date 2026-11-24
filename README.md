@@ -75,7 +75,7 @@ npx tsx src/main.ts <子命令> [参数]
 | 子键 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `backend` | string | `"none"` | 只有 `"mempalace"` 会召回；写别的值配置直接报错 |
-| `command` | string[] | `["mempalace-mcp"]` | MemPalace 的 MCP 服务怎么启动。和 `opencodeBin` 一样，Windows 下要指向真实的可执行文件 |
+| `command` | string[] | `["mempalace-mcp"]` | MemPalace 的 MCP 服务怎么启动，照抄 OpenCode 配置里那一整条命令，包括 `--palace <目录>` 这样的参数（默认值里没有它）。和 `opencodeBin` 一样，Windows 下要指向真实的可执行文件 |
 | `wing` | string | 不设置 | 设置后额外做一次限定到这个 wing 的检索 |
 | `excludeWings` | string[] | `[]` | 不放进来的 wing |
 | `rooms` | string[] | `["pitfall","pattern","decision"]` | 只保留这些 room。**不能为空**：空了等于永远召回不到东西，配置直接报错 |
@@ -463,7 +463,7 @@ npx tsx src/main.ts status [--tasks-dir <dir>]
 - **目录和默认模型按会话所在的目录读**：后端按目录回答 `model.list` 和 `model.default`，项目里放一份 `opencode.json` 就会改变两者。`taskctl models` 判的是配置里的 `workdir`：从任务的目录运行它，或者把 `workdir` 指过去，否则看到的不是任务真正会用的那份目录。
 - **模型目录的条目带凭据**：条目里有 `settings.apiKey` 和 `headers`，任何路径都不打印、不记录它。`opencode api` 调用失败时，拒绝理由里只有操作名和一个代码（如 `opencode api model.list failed: exit 1`），不引用服务的输出。
 - **被护栏拒绝是什么样子**：任务保持 `open`，没有模型会话被启动，不需要人工恢复。领取之前的那次拒绝什么都不写。领取之后、会话启动之前还会按重读到的任务再判一次，调度器的快照和领取之间被改过 `model` 的任务就在这里被拦；那条路上锁和工作目录预留已经写下、又都释放了（执行状态读不出来时 journal 里会留一条 `execution-state-invalid`）。同一个任务、同一条理由在一个进程里只报一次，理由变了会再报。`taskctl run` 打印 `[scheduler] N task(s) refused by the budget guard; no model session was started for them` 并以退出码 1 结束；`watch` 五分钟内不再拿出这个任务，之后重新判。
-- **目录读不到、或读回来是空的，一律按拒绝处理**：这样的答案不会被记住，下一次会再读，后端恢复后重跑 `run` 就能过。后端报不出默认模型时，链为空的那个角色被拒，理由是 `后端默认模型无法确认`（配置里一个模型都没写，或者只写了 `model` 没写 `reviewerModel`，都会落到这里）。
+- **目录读不到、或读回来是空的，一律按拒绝处理**：这样的答案不会被记住，下一次会再读，后端恢复后重跑 `run` 就能过。后端报不出默认模型时，链为空的那个角色被拒，理由是 `后端默认模型无法确认`（配置里一个模型都没写，或者只写了 `model` 没写 `reviewerModel`，都会落到这里）。`opencode` 还是 npm 的 `.cmd` shim 时，理由是 `opencode api model.list failed: ENOENT`，原因和下面「Windows 下 spawn opencode 失败」相同：把 `opencodeBin` 指向真实的 exe。
 - **记忆召回默认关闭**：`memory.backend` 不是 `mempalace` 时没有召回、没有 `recall.json`、没有子进程。开着时后端出任何问题都只降级，任务不会因此 `blocked`。`memory.rooms` 不能为空。召回拉起的子进程在 Windows 上总会被结束；POSIX 上一个忽略 SIGTERM 的服务可以在两秒等待之后继续活着。
 
 ## 排障

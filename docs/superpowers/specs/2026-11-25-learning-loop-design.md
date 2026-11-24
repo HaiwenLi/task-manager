@@ -1,6 +1,6 @@
 # 学习闭环：让记忆到达干活的那一刻
 
-Status: 已实现于分支 feat/learning-loop，待所有者签字；真实后端与真实宫殿未验证。2026-11-25 所有者指示"尽可能自动执行，只有完全需要拍板的才问"，因此第一期实现在分支 `feat/learning-loop` 上进行，不合入 `main`。  
+Status: 已实现于分支 feat/learning-loop，待所有者签字；真实后端与真实宫殿在 2026-11-25 做过一次只读验证（护栏判定与一次召回，见计划 `2026-11-25-learning-loop.md` 的 As built 一节），带模型会话的真实运行未做。2026-11-25 所有者指示"尽可能自动执行，只有完全需要拍板的才问"，因此第一期实现在分支 `feat/learning-loop` 上进行，不合入 `main`。  
 Date: 2026-11-25  
 Applies to: `main@b587dd9`  
 Related evidence: `docs/superpowers/plans/2026-11-24-handoff.md` §3 第 2、7 项；`docs/reviews/2026-11-24-idtrecon-orchestration-retro.md` P01、P02、P10、P21、P25；`docs/reviews/2026-11-16-real-task-retro.md` §2；`docs/findings/README.md` L0；`docs/superpowers/specs/2026-11-16-review-loop-design.md` §8.9、§11；`docs/backlog.md`「方向（2026-11-17 定）」

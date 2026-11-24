@@ -1488,7 +1488,19 @@ No assertion was loosened, and `tests/protocol.test.ts` is untouched.
 - The first correction is kept whatever its length.
 - Tests are not type-checked (`tsc` covers `src` only).
 - Pre-existing and unchanged: the stderr tail of a failed model turn or usage call is journaled.
-- The checks against the real backend and the real palace are recorded by the coordinator below this section.
+- The checks against the real backend and the real palace are below, under "Real services".
+
+### Real services, checked by the coordinator on 2026-11-25 at about 06:40
+
+The branch's `taskctl`, run from source with `npx tsx src/main.ts`, against the real backend and the real palace. Control-plane calls and one search only: no model session, so no quota. Each of the five outputs was checked for `apiKey`, `headers`, `sk-`, `Bearer` and `Authorization`; none matched.
+
+- With the default binary name and no `opencodeBin`: exit 1, `(backend default) … 拒绝：后端默认模型无法确认`. On that machine `opencode` is the npm shim, which cannot be spawned with `shell: false` (`ENOENT`); the guard fails closed, with the cause the README's spawn trap already names. The checks below set `opencodeBin` to the real `opencode.exe` behind the shim.
+- No model named: exit 1. The backend's default was `kimi-coding-plan/kimi-for-coding`; it reports no cost, so it was refused as `成本未知` in both directories tried (the workspace and this repository).
+- `model: zhipuai-coding-plan/glm-5.4` with `reviewerModel: opencode-go/kimi-k3.1-pro`: exit 1. The first is `放行（免费）`, the second `拒绝：按量计费，约 $12 / 百万 token；未列入 allowedModels`.
+- `allowedProviders: ["kimi-coding-plan"]`: exit 0, `放行（成本未知）`.
+- `taskctl recall --query "方舟 AgentPlan 生图"`, with the command the OpenCode config uses for the MemPalace server (`mempalace-mcp --palace <palace directory>`): exit 0, `outcome: ok, hits: 1`, one hit from `multi_agent/decision`. The hit was only loosely related to the query: at `minSimilarity` 0.55 a borderline drawer gets through.
+- The backend changed under the work. At about 02:10 the default was the same `kimi-coding-plan` model and the list held 124 entries from 11 providers; at about 05:10 one probe saw no default and 159 entries from 9 providers; at 06:40 the default was back. What the backend answers is a fact with a timestamp, not a setting.
+- Not verified against real services: anything that starts a model session, and a `watch` process left running for more than a few minutes.
 
 ## Final verification
 
