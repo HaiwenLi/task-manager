@@ -1,5 +1,5 @@
 import type { AgentAdapter, CatalogueCost, CatalogueModel } from "./adapters/types.js";
-import { modelChain, taskChain } from "./models.js";
+import { reviewerChain, taskChain } from "./models.js";
 import type { Task } from "./task-file.js";
 import type { WorkerConfig } from "./worker.js";
 
@@ -54,10 +54,14 @@ export const CATALOGUE_TIMEOUT_MS = 30_000;
 export type GuardState = {
   /** `${taskId}\n${refs}` keys already reported in this process. */
   reported: Set<string>;
-  /** At most one fetch per adapter. An entry is deleted the moment its promise rejects, so a failure is never remembered. */
-  catalogues: WeakMap<AgentAdapter, Promise<CatalogueModel[]>>;
-  /** The same for the backend's default model. A backend without one answers `null`, and that is kept. */
-  defaultRefs: WeakMap<AgentAdapter, Promise<string | null>>;
+  /**
+   * At most one fetch per adapter and directory, keyed by the directory the
+   * catalogue was asked in. An entry is deleted the moment its promise rejects,
+   * so a failure is never remembered.
+   */
+  catalogues: WeakMap<AgentAdapter, Map<string, Promise<CatalogueModel[]>>>;
+  /** The same, per directory, for the backend's default model. A backend without one answers `null`, and that is kept. */
+  defaultRefs: WeakMap<AgentAdapter, Map<string, Promise<string | null>>>;
   timeoutMs: number;
 };
 
@@ -158,28 +162,39 @@ export function workerModels(cfg: WorkerConfig, task: Task): string[] {
   return unique(taskChain(cfg, task));
 }
 
-/** The models the reviewer may run on: its own chain, never the task's or the worker's. */
+/** The models the reviewer may run on: its own chain (`reviewerChain`), never the task's or the worker's. */
 export function reviewerModels(cfg: WorkerConfig): string[] {
-  return unique(modelChain(cfg.reviewerModel, cfg.reviewerModelFallbacks));
+  return unique(reviewerChain(cfg));
 }
 
-/** `null` when the adapter has no `modelCatalog`. Rejects when the call fails or exceeds the state's timeout. */
-export function catalogueOf(adapter: AgentAdapter, state: GuardState = moduleState): Promise<CatalogueModel[] | null> {
+/**
+ * `null` when the adapter has no `modelCatalog`. Rejects when the call fails
+ * or exceeds the state's timeout. The catalogue is read in `cwd` — the
+ * directory the session runs in, since the backend answers by it — and kept
+ * per adapter and directory; with no directory it is the process's own.
+ */
+export function catalogueOf(adapter: AgentAdapter, state: GuardState = moduleState, cwd?: string): Promise<CatalogueModel[] | null> {
   if (typeof adapter.modelCatalog !== "function") return Promise.resolve(null);
   // An empty list is no answer: zero models is never a stable truth about a backend that can run anything.
-  return kept(state.catalogues, adapter, state.timeoutMs, () => adapter.modelCatalog!(), (models) => !Array.isArray(models) || models.length === 0);
+  return kept(state.catalogues, adapter, cwd, state.timeoutMs, () => adapter.modelCatalog!(cwd), (models) => !Array.isArray(models) || models.length === 0);
 }
 
-/** `null` when the backend has no default. Rejects when it cannot be read; a failure is not remembered. */
-export function defaultRefOf(adapter: AgentAdapter, state: GuardState = moduleState): Promise<string | null> {
+/**
+ * `null` when the backend has no default. Rejects when it cannot be read; a
+ * failure is not remembered. Read in `cwd` and kept per directory, like the
+ * catalogue ({@link catalogueOf}).
+ */
+export function defaultRefOf(adapter: AgentAdapter, state: GuardState = moduleState, cwd?: string): Promise<string | null> {
   if (typeof adapter.defaultModelRef !== "function") return Promise.resolve(null);
-  return kept(state.defaultRefs, adapter, state.timeoutMs, () => adapter.defaultModelRef!(), () => false);
+  return kept(state.defaultRefs, adapter, cwd, state.timeoutMs, () => adapter.defaultModelRef!(cwd), () => false);
 }
 
 /**
  * The disallowed verdicts for the roles that will run in one task. An absent
  * role is not judged. Never throws: an adapter that cannot list models answers
  * `[]`, and a backend that cannot be read refuses everything it was asked about.
+ * The backend is asked in `cfg.workdir`: the directory the task's sessions
+ * start in, which the backend answers by.
  */
 export async function checkModels(
   cfg: WorkerConfig,
@@ -194,7 +209,7 @@ export async function checkModels(
   const asked = unique(lists.flat());
   try {
     // A role with an empty chain runs on the backend default, so that is judged too, once.
-    const verdicts = await judge(asked, lists.some((list) => list.length === 0), policyOf(cfg), adapter, state);
+    const verdicts = await judge(asked, lists.some((list) => list.length === 0), policyOf(cfg), adapter, state, cfg.workdir);
     return verdicts.filter((v) => !v.allowed);
   } catch (error) {
     return closed(asked, `${UNJUDGED}（${messageOf(error)}）`);
@@ -203,18 +218,21 @@ export async function checkModels(
 
 /**
  * Every verdict for one list of refs, each ref once, in the order given; an
- * empty list judges the backend default. Never throws.
+ * empty list judges the backend default. Never throws. The backend is asked
+ * in `cwd`, the directory the session would start in; with none, in the
+ * process's own.
  */
 export async function judgeRefs(
   refs: readonly string[],
   policy: BudgetPolicy,
   adapter: AgentAdapter,
   state: GuardState = moduleState,
+  cwd?: string,
 ): Promise<ModelVerdict[]> {
   if (typeof adapter.modelCatalog !== "function") return [];
   const asked = unique(refs);
   try {
-    return await judge(asked, asked.length === 0, policy, adapter, state);
+    return await judge(asked, asked.length === 0, policy, adapter, state, cwd);
   } catch (error) {
     return closed(asked.length > 0 ? asked : [BACKEND_DEFAULT], `${UNJUDGED}（${messageOf(error)}）`);
   }
@@ -237,7 +255,7 @@ export function renderVerdicts(verdicts: readonly ModelVerdict[]): string {
  * default when a chain is empty. The default is judged as if it were in the
  * chain, so it names the default's own ref; a default nobody could name is
  * its own verdict. A catalogue that cannot be read, or that is empty, refuses
- * every ref it was asked about.
+ * every ref it was asked about. Both reads are made in `cwd`.
  */
 async function judge(
   asked: readonly string[],
@@ -245,11 +263,12 @@ async function judge(
   policy: BudgetPolicy,
   adapter: AgentAdapter,
   state: GuardState,
+  cwd?: string,
 ): Promise<ModelVerdict[]> {
   // Both reads go out together, so a backend that answers neither costs one timeout, not two.
   const [fallback, listing] = await Promise.allSettled([
-    onDefault ? defaultRefOf(adapter, state) : Promise.resolve<string | null>(null),
-    catalogueOf(adapter, state),
+    onDefault ? defaultRefOf(adapter, state, cwd) : Promise.resolve<string | null>(null),
+    catalogueOf(adapter, state, cwd),
   ]);
   const refs = [...asked];
   const verdicts: ModelVerdict[] = [];
@@ -300,25 +319,32 @@ function unconfirmedDefault(): ModelVerdict {
 }
 
 /**
- * The one promise a state keeps per adapter for a read of the backend, bounded
- * by the state's timeout. It is dropped the moment it rejects, and when it
- * answers nothing usable, so the next call asks again: a failure is never
- * remembered, and neither is an empty answer.
+ * The one promise a state keeps per adapter and directory for a read of the
+ * backend, bounded by the state's timeout. It is dropped the moment it
+ * rejects, and when it answers nothing usable, so the next call asks again: a
+ * failure is never remembered, and neither is an empty answer — for that
+ * directory, while another directory's answer stays.
  */
 function kept<T>(
-  slot: WeakMap<AgentAdapter, Promise<T>>,
+  slot: WeakMap<AgentAdapter, Map<string, Promise<T>>>,
   adapter: AgentAdapter,
+  cwd: string | undefined,
   timeoutMs: number,
   read: () => Promise<T>,
   answersNothing: (value: T) => boolean,
 ): Promise<T> {
-  const pending = slot.get(adapter);
+  // No directory is the process's own, which is where an adapter asks without one: one entry for both.
+  const directory = cwd ?? process.cwd();
+  const perDirectory = slot.get(adapter) ?? new Map<string, Promise<T>>();
+  slot.set(adapter, perDirectory);
+  const pending = perDirectory.get(directory);
   if (pending !== undefined) return pending;
   const started = bounded(read, timeoutMs);
-  slot.set(adapter, started);
+  perDirectory.set(directory, started);
   // Only its own entry: a reset, or a later fetch, must not be undone by this one settling late.
   const forget = () => {
-    if (slot.get(adapter) === started) slot.delete(adapter);
+    const current = slot.get(adapter);
+    if (current === perDirectory && current.get(directory) === started) current.delete(directory);
   };
   void started.then((value) => { if (answersNothing(value)) forget(); }, forget);
   return started;

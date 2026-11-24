@@ -6,6 +6,7 @@ import {
 } from "../src/budget.js";
 import type { Task } from "../src/task-file.js";
 import type { WorkerConfig } from "../src/worker.js";
+import { reviewerChain } from "../src/models.js";
 import { CATALOGUE, DISABLED, FREE, PAID, UNKNOWN, adapterOf, entry } from "./helpers/catalogue-fixture.js";
 
 describe("budget guard", () => {
@@ -243,8 +244,75 @@ describe("budget guard", () => {
     expect(workerModels({ ...chained, modelChain: undefined }, task)).toEqual(["cfg/one", "chain/two", "fb/one"]);
     // With no configured chain the task's model is followed by the fallbacks alone: still never by the configured `model`.
     expect(workerModels({ ...chained, modelChain: undefined }, { ...task, model: "task/one" })).toEqual(["task/one", "chain/two", "fb/one"]);
+    // One definition of the reviewer's chain, shared with the worker that dispatches on it: the guard judges it
+    // with the variant suffix dropped and repeats removed.
+    expect(reviewerChain(chained)).toEqual(["r/one", "r/one#low", "r/two"]);
+    expect(reviewerChain({})).toEqual([]);
     expect(reviewerModels(chained)).toEqual(["r/one", "r/two"]);
     expect(workerModels({ reviewerModel: "r" } as WorkerConfig, { ...task, model: "task/one" })).toEqual(["task/one"]);
     expect(workerModels({} as WorkerConfig, task)).toEqual([]);
+  });
+
+  it("keeps the catalogue per directory: the same model is judged by the directory it runs in", async () => {
+    // The real service answers by the directory it is asked in (2026-11-25), so a model can be free in one project
+    // and cost in another.
+    const free = "/work/free";
+    const paid = "/work/paid";
+    const asked: Array<string | undefined> = [];
+    const byDirectory = {
+      ...adapterOf(catalogue),
+      modelCatalog: async (cwd?: string) => {
+        asked.push(cwd);
+        return cwd === paid ? [entry("plan/m", [{ input: 3, output: 12 }])] : catalogue;
+      },
+    };
+    const state = newGuardState(1_000);
+    expect(await judgeRefs(["plan/m"], {}, byDirectory, state, free)).toMatchObject([{ ref: "plan/m", allowed: true }]);
+    expect(await judgeRefs(["plan/m"], {}, byDirectory, state, paid)).toMatchObject([{ ref: "plan/m", allowed: false, costClass: "paid" }]);
+    // Each directory is asked once, however often it is judged.
+    await judgeRefs(["plan/m"], {}, byDirectory, state, paid);
+    await judgeRefs(["plan/m"], {}, byDirectory, state, free);
+    expect(asked).toEqual([free, paid]);
+
+    // `checkModels` takes the directory from the configuration it judges: the task's own workdir.
+    expect(await checkModels({ ...cfg, workdir: paid }, byDirectory, { worker: ["plan/m"] }, state)).toMatchObject([{ ref: "plan/m", allowed: false }]);
+    expect(await checkModels({ ...cfg, workdir: free }, byDirectory, { worker: ["plan/m"] }, state)).toEqual([]);
+    expect(asked).toEqual([free, paid]);
+  });
+
+  it("forgets a failed answer for its directory alone, and keeps the backend's default per directory", async () => {
+    const free = "/work/free";
+    const paid = "/work/paid";
+    let failFree = true;
+    const asked: Array<string | undefined> = [];
+    const flaky = {
+      ...adapterOf(catalogue),
+      modelCatalog: async (cwd?: string) => {
+        asked.push(cwd);
+        if (cwd === free && failFree) {
+          failFree = false;
+          throw new Error("service unreachable");
+        }
+        return catalogue;
+      },
+    };
+    const state = newGuardState(1_000);
+    expect((await checkModels({ ...cfg, workdir: free }, flaky, { worker: ["plan/m"] }, state))[0].reason).toContain("模型目录读不到");
+    // The other directory is asked once and remembered, while the first is asked again.
+    expect(await checkModels({ ...cfg, workdir: paid }, flaky, { worker: ["plan/m"] }, state)).toEqual([]);
+    expect(await checkModels({ ...cfg, workdir: free }, flaky, { worker: ["plan/m"] }, state)).toEqual([]);
+    expect(await checkModels({ ...cfg, workdir: paid }, flaky, { worker: ["plan/m"] }, state)).toEqual([]);
+    expect(asked).toEqual([free, paid, free]);
+
+    // The backend's default is kept per directory too: the paid model in one, the free one in the other.
+    const defaults: Array<string | undefined> = [];
+    const byDirectory = {
+      ...adapterOf(catalogue),
+      defaultModelRef: async (cwd?: string) => { defaults.push(cwd); return cwd === paid ? "zen/p" : "plan/m"; },
+    };
+    expect(await judgeRefs([], {}, byDirectory, state, paid)).toMatchObject([{ ref: "zen/p", allowed: false }]);
+    expect(await judgeRefs([], {}, byDirectory, state, free)).toMatchObject([{ ref: "plan/m", allowed: true }]);
+    await judgeRefs([], {}, byDirectory, state, paid);
+    expect(defaults).toEqual([paid, free]);
   });
 });

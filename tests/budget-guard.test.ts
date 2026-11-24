@@ -607,6 +607,8 @@ describe("run, add and split through the CLI", () => {
   let lines: string[];
   let errors: string[];
   let catalogueCalls: number;
+  /** The directory each read of the catalogue was asked in. */
+  let catalogueDirs: Array<string | undefined>;
   let promptCalls: number;
   let adapter: AgentAdapter;
   let listeners: Map<string, () => void>;
@@ -644,10 +646,11 @@ describe("run, add and split through the CLI", () => {
     lines = [];
     errors = [];
     catalogueCalls = 0;
+    catalogueDirs = [];
     promptCalls = 0;
     // Answers the guard from the shared catalogue, and a clarify or planner session with a spec.
     adapter = {
-      modelCatalog: async () => { catalogueCalls += 1; return CATALOGUE; },
+      modelCatalog: async (cwd?: string) => { catalogueCalls += 1; catalogueDirs.push(cwd); return CATALOGUE; },
       defaultModelRef: async () => "plan/m",
       prompt: async () => { promptCalls += 1; return { sessionId: "s-1", exitCode: 0, text: SPEC }; },
       contextUsage: async () => 0,
@@ -743,6 +746,8 @@ describe("run, add and split through the CLI", () => {
     expect(await readdir(tasks)).toEqual([]);
     // The verdict lines, then the error the command died of.
     expect(errors).toEqual([PAID_LINE, "taskctl: budget guard refused: zen/p"]);
+    // Asked in the directory the clarify session would have started in: the backend answers by it.
+    expect(catalogueDirs).toEqual([work]);
   });
 
   it("add --quick is not checked", async () => {
@@ -767,6 +772,8 @@ describe("run, add and split through the CLI", () => {
     expect(refusal?.detail).toBe("zen/p");
     expect(await readSplitPlan(tasks, "a")).toBeNull();
     expect(errors).toEqual([PAID_LINE]);
+    // The planner session's directory, as for the clarify session.
+    expect(catalogueDirs).toEqual([work]);
   });
 
   it("watch logs the refusal once and writes nothing into the task's directory", async () => {

@@ -182,6 +182,18 @@ describe("taskctl models", () => {
     expect(adapter.calls).toEqual([]);
   });
 
+  it("asks for the catalogue in the configured workdir, the directory a session would start in", async () => {
+    config = await writeConfig({ model: "zen/p" });
+    const asked: Array<string | undefined> = [];
+    const recording = {
+      ...adapterOf(CATALOGUE, "plan/m"),
+      modelCatalog: async (cwd?: string) => { asked.push(cwd); return CATALOGUE; },
+    };
+    await models(recording);
+    // Every list is judged in that one directory, so the catalogue is read once, there.
+    expect(asked).toEqual([work]);
+  });
+
   it("refuses every line when the catalogue cannot be read, and says why on each", async () => {
     config = await writeConfig({ model: "plan/m" });
     const unreachable: AgentAdapter = {

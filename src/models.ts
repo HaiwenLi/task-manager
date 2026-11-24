@@ -102,6 +102,16 @@ export function taskChain(
     : modelChain(task.model, [...(cfg.modelChain ?? []), ...(cfg.modelFallbacks ?? [])]);
 }
 
+/**
+ * The chain the reviewer dispatches on: its own model, then its fallbacks —
+ * never the task's or the worker's. One definition of it, for the worker and
+ * for the budget guard. With no reviewer model the chain is empty, and the
+ * reviewer runs on the backend's default.
+ */
+export function reviewerChain(cfg: { reviewerModel?: string; reviewerModelFallbacks?: string[] }): string[] {
+  return modelChain(cfg.reviewerModel, cfg.reviewerModelFallbacks);
+}
+
 /** Where the chain actually stands: a position recorded for a different model is stale. */
 export function chainPosition(chain: readonly string[], entry: RotationEntry | undefined): number {
   if (entry === undefined) return 0;

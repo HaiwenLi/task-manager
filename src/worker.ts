@@ -21,7 +21,7 @@ import {
 import { definitionDigest, readAttempt, readDefinitionSnapshot, readRuntime, writeDefinitionSnapshot, writeRuntime, type AttemptRecord } from "./runtime.js";
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
-import { chainPosition, modelChain, readModelRotation, resetChainCycles, rotateModel, taskChain, type Handover, type ModelRole } from "./models.js";
+import { chainPosition, readModelRotation, resetChainCycles, rotateModel, reviewerChain as configuredReviewerChain, taskChain, type Handover, type ModelRole } from "./models.js";
 import { checkModels, noteReported, renderVerdicts, reviewerModels, workerModels } from "./budget.js";
 import { classifyDispatchFailure, quotaBackoffMs } from "./dispatch.js";
 import { failureFingerprint } from "./fingerprint.js";
@@ -538,8 +538,8 @@ async function controlled<T>(
 
 /** The worker's chain, the one definition of it: the task's own model (else the configured chain), then fallbacks. See `taskChain`. */
 const workerChain = (r: Run): string[] => taskChain(r.cfg, r.task);
-/** The reviewer's chain: its own model, then its fallbacks — never the task's silently. */
-const reviewerChain = (r: Run): string[] => modelChain(r.cfg.reviewerModel, r.cfg.reviewerModelFallbacks);
+/** The reviewer's chain for this attempt: the one definition of it (`reviewerChain` in `./models.ts`), which the budget guard judges too. */
+const reviewerChain = (r: Run): string[] => configuredReviewerChain(r.cfg);
 
 /**
  * The model a role should use now, per the rotation recorded for this task.

@@ -545,8 +545,9 @@ async function modelsCommand(flags: Map<string, string>, deps: CliDeps, log: (li
     reviewerModels(cfg),
     ...board.flatMap((task) => task.status !== "done" && task.model !== undefined ? [[task.model]] : []),
   ];
-  // Asked together: every list reads the same catalogue, so a backend that is slow or down is asked once.
-  const judged = await Promise.all(lists.map((refs) => judgeRefs(refs, policy, adapter)));
+  // Asked together, in the configured workdir (where a session would start): every list reads the same catalogue,
+  // so a backend that is slow or down is asked once.
+  const judged = await Promise.all(lists.map((refs) => judgeRefs(refs, policy, adapter, undefined, cfg.workdir)));
   const verdicts: ModelVerdict[] = [];
   for (const list of judged) {
     for (const verdict of list) {
@@ -633,7 +634,8 @@ async function refreshBoardFile(tasksDir: string): Promise<void> {  const tasks 
  * session may start. An adapter that cannot list models is not guarded.
  */
 async function sessionRefusals(cfg: ResolvedConfig, adapter: AgentAdapter): Promise<ModelVerdict[]> {
-  const verdicts = await judgeRefs(cfg.model ? [cfg.model] : [], policyOf(cfg), adapter);
+  // Asked in `cfg.workdir`: the directory the session starts in, which the backend answers by.
+  const verdicts = await judgeRefs(cfg.model ? [cfg.model] : [], policyOf(cfg), adapter, undefined, cfg.workdir);
   return verdicts.filter((verdict) => !verdict.allowed);
 }
 
