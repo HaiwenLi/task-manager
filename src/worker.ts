@@ -118,7 +118,9 @@ type ReviewPendingRecord = {
   updatedAt: string;
   refusals: Array<{ model: string; reason: string }>;
 };
-export class WorkerTimeoutError extends Error {}
+export class WorkerTimeoutError extends Error {
+  constructor(message: string, readonly partialOutput?: string) { super(message); }
+}
 class UncertainExecutionError extends Error {}
 class ReviewRequiredError extends Error {}
 
@@ -386,6 +388,10 @@ async function controlled<T>(
         ? ` — last output: ${settledOutput.replace(/\s+/g, " ").trim().slice(-400)}`
         : "";
       throw new UncertainExecutionError(`${label}: shutdown unconfirmed; automatic retry prohibited${tail}`);
+    }
+    if (err instanceof WorkerTimeoutError) {
+      const partial = (execution as Execution<T> & { partialOutput?: () => string }).partialOutput;
+      throw new WorkerTimeoutError(err.message, typeof partial === "function" ? partial.call(execution) : err.partialOutput);
     }
     throw err;
   } finally { r.execution = undefined; if (timer) clearTimeout(timer); }
@@ -853,7 +859,10 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
       () => r.deps.acceptance ? legacyExecution(() => r.deps.acceptance!(command, r.cfg.workdir)) : startAcceptance(command, r.cfg.workdir, "check"));
   } catch (err) {
     if (!(err instanceof WorkerTimeoutError)) throw err;
-    result = { passed: false, skipped: false, exitCode: null, output: err.message };
+    result = {
+      passed: false, skipped: false, exitCode: null,
+      output: [err.message, err.partialOutput].filter((part) => part !== undefined && part.length > 0).join("\n"),
+    };
   }
   const artifactAfter = await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir], r.cfg.artifactIgnore ?? []);
   // All controller writers use the same mutex as takeover for final validation/write.

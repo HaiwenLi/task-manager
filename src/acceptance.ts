@@ -23,6 +23,11 @@ export type AcceptanceResult =
  */
 export type AcceptanceMode = "generate" | "check";
 
+export type AcceptanceExecution = Execution<AcceptanceResult> & {
+  /** Output captured so far, including output available after cancellation. */
+  partialOutput(): string;
+};
+
 /** Environment variable carrying {@link AcceptanceMode} to the command. */
 export const ACCEPTANCE_MODE_ENV = "TASKCTL_ACCEPTANCE_MODE";
 
@@ -42,12 +47,13 @@ export async function runAcceptance(command: string, cwd: string, mode: Acceptan
 }
 
 /** Start the gate immediately and expose its process lifecycle to the worker. */
-export function startAcceptance(command: string, cwd: string, mode: AcceptanceMode = "generate"): Execution<AcceptanceResult> {
+export function startAcceptance(command: string, cwd: string, mode: AcceptanceMode = "generate"): AcceptanceExecution {
   if (command.trim().length === 0) {
     return {
       result: Promise.resolve({ passed: false, skipped: true }),
       inspect: () => ({ state: "exited" }),
       cancel: async () => true,
+      partialOutput: () => "",
     };
   }
   const isWindows = process.platform === "win32";
@@ -59,17 +65,17 @@ export function startAcceptance(command: string, cwd: string, mode: AcceptanceMo
     windowsVerbatimArguments: isWindows,
   });
 
+  // stdout and stderr are merged so a failure carries the command's own
+  // diagnostics. Keep the raw chunks outside the result promise: cancellation
+  // may legitimately happen before `close`, and the partial log is still evidence.
+  const chunks: Uint8Array[] = [];
+  const output = (): string => Buffer.concat(chunks).toString("utf8");
   const result = new Promise<AcceptanceResult>((resolve) => {
     // The command line is the whole program; never let it block on stdin.
     child.stdin?.end();
 
-    // stdout and stderr are merged so a failure carries the command's own
-    // diagnostics. Buffers are decoded once at the end to keep multi-byte
-    // characters intact across chunk boundaries.
-    const chunks: Uint8Array[] = [];
     child.stdout?.on("data", (chunk: Buffer) => chunks.push(chunk));
     child.stderr?.on("data", (chunk: Buffer) => chunks.push(chunk));
-    const output = (): string => Buffer.concat(chunks).toString("utf8");
 
     // The shell itself could not start: no exit code exists, the gate fails.
     child.on("error", () => {
@@ -79,5 +85,5 @@ export function startAcceptance(command: string, cwd: string, mode: AcceptanceMo
       resolve({ passed: code === 0, exitCode: code, output: output(), skipped: false });
     });
   });
-  return processExecution(child, result);
+  return { ...processExecution(child, result), partialOutput: output };
 }

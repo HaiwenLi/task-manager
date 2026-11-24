@@ -525,6 +525,21 @@ describe("runWorker — 失败核算", () => {
     expect(store.task("a").retries).toBe(0); // injected legacy gate cannot prove shutdown
     await expect(lockHeld("a")).resolves.toBe(false);
   });
+
+  it("acceptance timeout evidence keeps output captured before cancellation", async () => {
+    const command = `"${process.execPath}" -e "console.log('partial-acceptance-marker'); setInterval(() => {}, 1000)"`;
+    const store = FakeStore.seed(task({ acceptance: command }));
+    const adapter = new FakeAdapter(() => {
+      store.requestDone("a");
+      return { sessionId: "ses-a1", exitCode: 0, text: "done" };
+    });
+
+    await runWorker(cfg(tasksDir, { retryLimit: 1, acceptanceTimeoutMs: 25 }), { store, adapter });
+
+    const evidence = JSON.parse(await readFile(join(tasksDir, "a", "acceptance.json"), "utf8")) as { output?: string };
+    expect(evidence.output).toContain("acceptance timed out");
+    expect(evidence.output).toContain("partial-acceptance-marker");
+  }, 10_000);
 });
 
 describe("runWorker — 循环上限（binding ruling）", () => {

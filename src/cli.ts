@@ -17,11 +17,12 @@ import type { AcceptanceResult } from "./acceptance.js";
 import { renderBoardMarkdown, renderBoardTable, writeBoard } from "./board.js";
 import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
-import { readRuntime } from "./runtime.js";
+import { readRuntime, readAttempt, writeRuntime } from "./runtime.js";
 import { reconcileTask, retryTask } from "./reconcile.js";
 import { checkRender, describeFailures, RenderUnavailableError, DEFAULT_VIEWPORTS } from "./render.js";
 import { taskWorkdir } from "./scheduler.js";
 import { resolveArtifacts } from "./artifacts.js";
+import { runSelfCheck } from "./self-check.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
 export type CliDeps = {
@@ -48,6 +49,7 @@ const USAGE = [
   "  taskctl run [--log <file>] [--config taskctl.json]",
   "  taskctl verify --task <id> [--viewport 1440x900,390x844] [--config taskctl.json]",
   "  taskctl done --task <id> [--tasks-dir <dir>]",
+  "  taskctl check --task <id> [--tasks-dir <dir>]",
   "  taskctl note --task <id> --status <s> --done <d> --found <f> --next <n> [--files <a,b>] [--tasks-dir <dir>]",
   "  taskctl status [--tasks-dir <dir>]",
   "  taskctl board [--all] [--json] [--tasks-dir <dir>]",
@@ -133,6 +135,9 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "done":
       checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return doneCommand(flags, deps, log);
+    case "check":
+      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
+      return checkCommand(flags, log);
     case "note":
       checkFlags(command, flags, ["task", "status", "done", "found", "next", "files", "tasks-dir", "config"], [
         "task",
@@ -467,6 +472,33 @@ async function doneCommand(flags: Map<string, string>, deps: CliDeps, log: (line
   await writeFile(marker, (deps.now ?? (() => new Date))().toISOString(), "utf8");
   log(marker);
   return 0;
+}
+
+/** `taskctl check` — run the declared worker-side bounded generation/check. */
+async function checkCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const cfg = await configFor(flags);
+  const id = flags.get("task")!;
+  const task = await new TaskStore(tasksDir).get(id);
+  const attempt = await readAttempt(tasksDir, id);
+  if (task.status !== "running" || attempt?.phase !== "active") {
+    throw new Error(`task ${id} is not running with an active attempt; worker self-check refused`);
+  }
+  const command = task.workerSelfCheck?.trim();
+  if (!command) throw new Error(`task ${id} has no worker_self_check declaration`);
+  const timeoutMs = task.workerSelfCheckTimeoutMs ?? 20 * 60_000;
+  const turnBound = cfg.turnTimeoutMs ?? 30 * 60_000;
+  if (timeoutMs > turnBound) {
+    throw new Error(`task ${id}: worker_self_check_timeout_ms ${timeoutMs} exceeds turnTimeoutMs ${turnBound}`);
+  }
+  const startedAt = new Date().toISOString();
+  const result = await runSelfCheck({ command, cwd: taskWorkdir(cfg.workdir, task), timeoutMs });
+  await writeRuntime(tasksDir, id, "self-check.json", {
+    command, mode: "generate", startedAt, finishedAt: new Date().toISOString(), result,
+  });
+  const exitCode = "exitCode" in result ? result.exitCode : null;
+  log(`${id}  self-check ${result.passed ? "passed" : "failed"}  exit=${exitCode ?? "null"}`);
+  return result.passed ? 0 : 1;
 }
 
 /** `taskctl note …` — append the next numbered handoff note, print its path. */
