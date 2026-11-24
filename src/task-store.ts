@@ -18,7 +18,10 @@ export type TaskScan = {
 
 /** The pipeline fields a caller may patch in one guarded write. */
 export type TaskFieldsPatch = Partial<
-  Pick<Task, "status" | "criteria" | "workdir" | "complexity" | "execution" | "risk" | "humanCheck" | "dependsOn" | "retries" | "reviewRounds">
+  Pick<
+    Task,
+    "status" | "description" | "criteria" | "workdir" | "complexity" | "execution" | "risk" | "humanCheck" | "dependsOn" | "retries" | "reviewRounds"
+  >
 >;
 
 /**

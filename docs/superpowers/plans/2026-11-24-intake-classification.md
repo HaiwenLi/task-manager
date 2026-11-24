@@ -30,20 +30,37 @@
 
 **Files:** `src/intake.ts`, `src/cli.ts`, `tests/intake.test.ts`, `tests/cli-add.test.ts`
 
-- [ ] Write failing tests for quick/simple/complex, clear/assumptions/needs-information, invalid fallback, three-question bound, explicit overrides and classification.json.
-- [ ] Run them and confirm current add lacks assessment behavior.
-- [ ] Implement `parseIntakeAssessment` and extend the existing clarify prompt/output with `管理分类`, `信息充分性`, `分类理由`, `补问` while preserving criteria extraction.
-- [ ] Apply the selected lane without changing risk/verify; write questions.md and keep needs-information in draft.
-- [ ] Run focused tests and commit `feat(intake): classify management effort and information gaps`.
+- [x] Write failing tests for quick/simple/complex, clear/assumptions/needs-information, invalid fallback, three-question bound, explicit overrides and classification.json.
+- [x] Run them and confirm current add lacks assessment behavior.
+- [x] Implement `parseIntakeAssessment` and extend the existing clarify prompt/output with `管理分类`, `信息充分性`, `分类理由`, `补问` while preserving criteria extraction.
+- [x] Apply the selected lane without changing risk/verify; write questions.md and keep needs-information in draft.
+- [x] Run focused tests and commit `feat(intake): classify management effort and information gaps`.
 
 ### Task 2: Answers and inspectable feedback history
 
 **Files:** Create `src/feedback.ts`; modify `src/cli.ts`, `src/spec.ts`; test `tests/feedback.test.ts`, `tests/cli-add.test.ts`, `tests/pipeline-e2e.test.ts`
 
-- [ ] Write failing tests for `taskctl answer --task <id> --file`, approval blocked by unresolved questions, and clarify rejection returning to draft rather than open.
-- [ ] Write failing feedback tests showing reject/audit notes feed the next similar clarify while plain passes and model output do not mutate preferences.
-- [ ] Implement answer append + marker clearing, deterministic feedback.jsonl recording/relevance selection, and clarify-stage re-intake.
-- [ ] Run focused tests and commit `feat(intake): close the consensus feedback loop`.
+- [x] Write failing tests for `taskctl answer --task <id> --file`, approval blocked by unresolved questions, and clarify rejection returning to draft rather than open.
+- [x] Write failing feedback tests showing reject/audit notes feed the next similar clarify while plain passes and model output do not mutate preferences.
+- [x] Implement answer append + marker clearing, deterministic feedback.jsonl recording/relevance selection, and clarify-stage re-intake.
+- [x] Run focused tests and commit `feat(intake): close the consensus feedback loop`.
+
+**Evidence (2026-11-24):** `tests/feedback.test.ts` 11 tests; full suite 469 passed / 1 skipped; `npx tsc --noEmit` clean.
+Mutation check (one guard reversed at a time, control run clean, file restored): approve-block, clarify→draft,
+feedback injection, answer-into-task-body, marker clearing, empty-note skip, task-type filter, history bound,
+packet budget and answer-as-feedback were each killed by the test named for that guard.
+
+Implementation notes the plan did not fix:
+
+- `answer` appends to `spec.md` **and** the task body. The worker's brief is the body, not `spec.md`, so an
+  answer written only to the spec would be a constraint the worker never saw but the reviewer judges by.
+  Both are definition text, so the revised task has a new digest.
+- A clarify-attributed `reject` writes the reason as an open question (`questions.md`), so the same
+  `answer` → `approve` loop serves both model-raised and human-raised questions.
+- `accept --note` was added: the design lists human accept reasons as a feedback source, and `accept` had no
+  way to carry one. A plain accept still records nothing.
+- Answers are recorded as feedback (`action: answer`), which is how §16.2's "do not re-ask an answered
+  question" is honoured without scanning old specs.
 
 ### Task 3: First-pass metrics and documentation
 

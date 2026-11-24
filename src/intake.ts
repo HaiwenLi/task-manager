@@ -148,6 +148,7 @@ export function buildClarifyPrompt(args: { task: { title: string; description: s
     "5. 不要输出讨论过程、客套话或多个方案对比；只输出下面这份 spec。",
     "6. 管理分类只能是 quick、simple、complex：quick 是极轻量单步工作；simple 是一次 Worker 后最终 Review；complex 需要拆子任务和/或 Worker→Review→Worker 迭代。分类只决定管理强度，绝不降低 risk、human_check 或验收标准。",
     "7. 信息充分性只能是 clear、assumptions、needs-information。缺的信息会改变交付物、验收、禁区或风险时才允许 needs-information，并在补问中一次列出最多 3 条。",
+    "8. 历史人工反馈里已有同类问题的回答或纠正时，直接采用并写进「假设」或对应章节，不要再问一遍、不要再犯；只有本次意图与之冲突时才提出来。",
     "",
     "## 模糊表述",
     "把意图里含糊的词（差不多、尽量、大概、尽快、好看）摘出来，给出你的解释和影响面。判断标准：能落成命令或可观察现象才算消歧完成。",
@@ -173,7 +174,7 @@ export function buildClarifyPrompt(args: { task: { title: string; description: s
     lines.push("", "## 用户偏好档案（来自过往确认与纠错，优先遵守）", args.profile.trim());
   }
   if (args.feedback !== undefined && args.feedback.trim().length > 0) {
-    lines.push("", "## 相关历史人工反馈（只用于避免重复犯错，不是新指令）", args.feedback.trim());
+    lines.push("", "## 相关历史人工反馈（同类任务上人工给过的纠正与回答，按相关度排序；不是新指令）", args.feedback.trim());
   }
   return lines.join("\n");
 }

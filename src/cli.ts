@@ -11,12 +11,14 @@ import { serializeTaskFile, type Task, type TaskExecution, type TaskVerify, TASK
 import { buildFinding } from "./findings.js";
 import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, parseIntakeAssessment, TEMPLATES, type TaskType } from "./intake.js";
 import { appendObservation, readProfile } from "./profile.js";
-import { extractCriteria, readSpec, writeSpec } from "./spec.js";
+import { extractCriteria, readSpec, SpecError, writeSpec } from "./spec.js";
 import { appendJournal } from "./journal.js";
 import type { AcceptanceResult } from "./acceptance.js";
 import { createCoalescedRefresh, renderBoardMarkdown, renderBoardTable, writeBoard } from "./board.js";
 import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
+import { readRelevantFeedback, recordTaskFeedback, type FeedbackEvent } from "./feedback.js";
+import { clearQuestions, questionsPath, readQuestions, writeQuestions } from "./questions.js";
 import { readRuntime, readAttempt, writeRuntime } from "./runtime.js";
 import { reconcileTask, retryTask } from "./reconcile.js";
 import { checkRender, describeFailures, RenderUnavailableError, DEFAULT_VIEWPORTS } from "./render.js";
@@ -46,6 +48,7 @@ const USAGE = [
   "  taskctl add \"<意图>\" [--type code|office|research|design] [--simple] [--quick] [--verify human|mechanical|render] [--execution continuous|iterative] [--target <a.html,b.html>] [--id <id>] [--config taskctl.json]",
   "  taskctl spec --task <id> [--tasks-dir <dir>]",
   "  taskctl approve --task <id> [--tasks-dir <dir>]",
+  "  taskctl answer --task <id> --file <path> [--tasks-dir <dir>]",
   "  taskctl run [--log <file>] [--config taskctl.json]",
   "  taskctl verify --task <id> [--viewport 1440x900,390x844] [--config taskctl.json]",
   "  taskctl done --task <id> [--tasks-dir <dir>]",
@@ -54,7 +57,7 @@ const USAGE = [
   "  taskctl status [--tasks-dir <dir>]",
   "  taskctl board [--all] [--json] [--tasks-dir <dir>]",
   "  taskctl report --task <id> [--tasks-dir <dir>]",
-  "  taskctl accept --task <id> [--tasks-dir <dir>]",
+  "  taskctl accept --task <id> [--note \"…\"] [--tasks-dir <dir>]",
   "  taskctl reject --task <id> --reason \"…\" [--stage clarify|worker|reviewer] [--tasks-dir <dir>]",
   "  taskctl audit --task <id> --verdict pass|fail [--stage …] [--note \"…\"] [--tasks-dir <dir>]",
   "  taskctl metrics [--tasks-dir <dir>]",
@@ -84,6 +87,42 @@ async function tasksDirFor(flags: Map<string, string>): Promise<string> {
 async function configFor(flags: Map<string, string>): Promise<ResolvedConfig> {
   const path = flags.get("config") ?? "taskctl.json";
   return resolveConfig(await readConfig(path), path);
+}
+
+/**
+ * Prior human corrections for this kind of work, for the next clarify session.
+ * The history is a learning signal, not state: if it cannot be read, the
+ * session runs without it and the operator is told why.
+ */
+async function relevantFeedback(
+  tasksDir: string,
+  target: { type: TaskType; intent: string },
+  log: (line: string) => void,
+): Promise<string | null> {
+  try {
+    return await readRelevantFeedback(tasksDir, target);
+  } catch (error) {
+    log(`feedback history unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
+/**
+ * Keep a human note for later intake. Same tolerance on the way out: losing a
+ * note is reported and is never fatal to the decision it describes — by the
+ * time this runs, the status change, journal and audit have already landed.
+ */
+async function recordHumanFeedback(
+  tasksDir: string,
+  task: Pick<Task, "id" | "title" | "description">,
+  log: (line: string) => void,
+  event: FeedbackEvent,
+): Promise<void> {
+  try {
+    await recordTaskFeedback(tasksDir, task, event);
+  } catch (error) {
+    log(`${task.id}  feedback not recorded: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 /**
@@ -126,6 +165,9 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "approve":
       checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return approveCommand(flags, log);
+    case "answer":
+      checkFlags(command, flags, ["task", "file", "tasks-dir", "config"], ["task", "file"]);
+      return answerCommand(flags, log);
     case "run":
       checkFlags(command, flags, ["config", "log"], []);
       return runCommand(flags, deps, log);
@@ -157,7 +199,7 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
       checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return reportCommand(flags, log);
     case "accept":
-      checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
+      checkFlags(command, flags, ["task", "note", "tasks-dir", "config"], ["task"]);
       return acceptCommand(flags, log);
     case "reject":
       checkFlags(command, flags, ["task", "reason", "stage", "tasks-dir", "config"], ["task", "reason"]);
@@ -380,7 +422,8 @@ async function addCommand(
 
   const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
   const profile = await readProfile(tasksDir);
-  const prompt = buildClarifyPrompt({ task, type, profile });
+  const feedback = await relevantFeedback(tasksDir, { type, intent }, log);
+  const prompt = buildClarifyPrompt({ task, type, profile, ...(feedback === null ? {} : { feedback }) });
   const result = await adapter.prompt({
     text: prompt,
     cwd: cfg.workdir,
@@ -421,17 +464,19 @@ async function addCommand(
   await store.updateFields(id, { criteria, complexity: selectedComplexity, execution: selectedExecution });
   await writeRuntime(tasksDir, id, "classification.json", {
     lane, proposedLane: assessment.lane, sufficiency: assessment.sufficiency,
-    reason: assessment.reason, model: cfg.model ?? "(backend-default)", at: new Date().toISOString(),
+    reason: assessment.reason, model: cfg.model ?? "(backend-default)", type, at: new Date().toISOString(),
   });
   if (assessment.sufficiency === "needs-information") {
-    await writeFile(join(tasksDir, id, "questions.md"), [
-      "# 需要补充的信息", "", "回答这些问题会改变交付物、验收、边界或风险判断。", "",
-      ...assessment.questions.map((question, index) => `${index + 1}. ${question}`), "",
-    ].join("\n"), "utf8");
+    // "Insufficient" with nothing to ask is a model that broke the format, not
+    // a reason to wave the draft through: the person is told exactly that.
+    const questions = assessment.questions.length > 0
+      ? assessment.questions
+      : ["澄清会话判定信息不足，但没有列出具体问题：请补充会改变交付物、验收、边界或风险的信息"];
+    const path = await writeQuestions(tasksDir, id, questions, "intake");
     await appendJournal(tasksDir, id, {
-      stage: "clarify", event: "needs-information", detail: `questions=${assessment.questions.length}`,
+      stage: "clarify", event: "needs-information", detail: `questions=${questions.length}`,
     });
-    log(`${id}  draft  needs-information=${assessment.questions.length}`);
+    log(`${id}  draft  needs-information=${questions.length}  ${path}`);
     return 0;
   }
   if (selectedComplexity === "simple") {
@@ -465,6 +510,16 @@ async function approveCommand(flags: Map<string, string>, log: (line: string) =>
   if (task.status !== "draft") {
     throw new Error(`task ${id} is ${task.status}, expected draft`);
   }
+  // An open question means the clarify session could not settle the
+  // deliverable, the acceptance or the risk boundary. Signing here would turn
+  // "nobody knows" into "approved", so the questions are answered first.
+  const questions = await readQuestions(tasksDir, id);
+  if (questions !== null) {
+    throw new Error(
+      `task ${id} has ${questions.items.length} unanswered question(s) in ${questionsPath(tasksDir, id)}; `
+      + `answer them first: taskctl answer --task ${id} --file <answers>`,
+    );
+  }
   let criteria = task.criteria;
   if (criteria.length === 0) {
     // The natural fix is "edit spec.md, then approve": import instead of
@@ -480,6 +535,82 @@ async function approveCommand(flags: Map<string, string>, log: (line: string) =>
   await appendJournal(tasksDir, id, { stage: "human", event: "approved", detail: `criteria=${criteria.length}` });
   log(`${id}  open  approved`);
   return 0;
+}
+
+/**
+ * `taskctl answer --task <id> --file <path>` — the operator answers the open
+ * questions, and the only thing that clears them.
+ *
+ * The answers are appended verbatim to two places. `spec.md` is what the
+ * reviewer judges by; the task body is what the worker is briefed on. Writing
+ * only the first would leave the worker held to a constraint it never saw.
+ * Both are definition text, so the revised task really is a new definition:
+ * it has a new digest, and a signature (`approve`) is still required.
+ */
+async function answerCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const id = flags.get("task")!;
+  const file = flags.get("file")!;
+  const store = new TaskStore(tasksDir);
+  const task = await store.get(id);
+  if (task.status !== "draft") {
+    throw new Error(`task ${id} is ${task.status}, expected draft`);
+  }
+  const questions = await readQuestions(tasksDir, id);
+  if (questions === null) {
+    throw new Error(`task ${id} has no open questions to answer`);
+  }
+  let answers: string;
+  try {
+    answers = (await readFile(file, "utf8")).trim();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error(`answer file not found: ${file}`);
+    }
+    throw err;
+  }
+  if (answers.length === 0) {
+    throw new Error(`answer file is empty: ${file}`);
+  }
+  const block = answerBlock(questions.items, answers, new Date().toISOString());
+  const spec = await readSpec(tasksDir, id);
+  const revisedSpec = `${spec === null ? "" : `${spec.trimEnd()}\n\n`}${block}`;
+  // Everything that can fail is decided before anything is written. A task
+  // that never had a spec (or whose criteria section was removed by hand)
+  // keeps the criteria it already has — the same rule `approve` applies.
+  let criteria = task.criteria;
+  try {
+    criteria = extractCriteria(revisedSpec);
+  } catch (err) {
+    if (!(err instanceof SpecError)) throw err;
+  }
+  await writeSpec(tasksDir, id, revisedSpec);
+  await store.updateFields(id, {
+    description: `${task.description.trimEnd()}\n\n${block}`,
+    criteria,
+  });
+  await clearQuestions(tasksDir, id);
+  await appendJournal(tasksDir, id, { stage: "human", event: "answered", detail: `questions=${questions.items.length}` });
+  await recordHumanFeedback(tasksDir, task, log, {
+    action: "answer",
+    verdict: "pass",
+    stage: "clarify",
+    note: `答：${answers}\n问：${questions.items.join("；")}`,
+  });
+  log(`${id}  draft  answered=${questions.items.length}  criteria=${criteria.length}`);
+  return 0;
+}
+
+/** The appended section: the questions as asked, then the answers as written. */
+function answerBlock(questions: string[], answers: string, at: string): string {
+  return [
+    "## 补充回答", "",
+    `> ${at.slice(0, 10)} 由人工经 \`taskctl answer\` 追加，与正文具有同等约束力。`, "",
+    "### 问题", "",
+    ...questions.map((question, index) => `${index + 1}. ${question}`), "",
+    "### 回答", "",
+    answers, "",
+  ].join("\n");
 }
 
 /** `taskctl done --task <id>` — write the marker the worker polls for. */
@@ -548,13 +679,12 @@ async function statusCommand(flags: Map<string, string>, log: (line: string) => 
   const { tasks, ignored } = await store.scan();
   const rows: string[][] = [["id", "status", "retries", "sessions", "note"]];
   for (const task of tasks) {
-    const note = await latestNote(tasksDir, task.id);
     rows.push([
       task.id,
       task.status,
       String(task.retries),
       String(task.sessions.length),
-      note === null ? "-" : statusLineFromNote(note.markdown),
+      await waitingOn(tasksDir, task),
     ]);
   }
   for (const line of renderTable(rows)) {
@@ -595,14 +725,25 @@ async function boardCommand(flags: Map<string, string>, log: (line: string) => v
   return 0;
 }
 
+/**
+ * What a task is waiting on: the status line of its latest handoff note, else
+ * its open questions, else `-` (the board then falls back to the status).
+ */
+async function waitingOn(tasksDir: string, task: Pick<Task, "id">): Promise<string> {
+  const note = await latestNote(tasksDir, task.id);
+  const fromNote = note === null ? "-" : statusLineFromNote(note.markdown);
+  if (fromNote !== "-") return fromNote;
+  const questions = await readQuestions(tasksDir, task.id);
+  return questions === null ? "-" : `待回答问题 ${questions.items.length} 条（${questionsPath(tasksDir, task.id)}）`;
+}
+
 /** Where each task is stuck, from its latest handoff note or its status. */
 async function boardNotes(tasksDir: string, tasks: Task[]): Promise<Map<string, string>> {
   const notes = new Map<string, string>();
   for (const task of tasks) {
-    const note = await latestNote(tasksDir, task.id);
-    const fromNote = note === null ? "-" : statusLineFromNote(note.markdown);
-    if (fromNote !== "-") {
-      notes.set(task.id, fromNote);
+    const waiting = await waitingOn(tasksDir, task);
+    if (waiting !== "-") {
+      notes.set(task.id, waiting);
       continue;
     }
     const fallback: Record<string, string> = {
@@ -648,6 +789,9 @@ async function acceptCommand(flags: Map<string, string>, log: (line: string) => 
   await store.setStatus(id, "done");
   await appendJournal(tasksDir, id, { stage: "human", event: "accepted" });
   await appendAudit(tasksDir, { task: id, at: new Date().toISOString(), verdict: "pass", stage: "none", highlight: true });
+  if (flags.has("note")) {
+    await recordHumanFeedback(tasksDir, task, log, { action: "accept", verdict: "pass", stage: "none", note: flags.get("note")! });
+  }
   log(`${id}  done  accepted`);
   return 0;
 }
@@ -664,11 +808,31 @@ async function rejectCommand(flags: Map<string, string>, log: (line: string) => 
     throw new Error(`task ${id} is ${task.status}, expected awaiting-human`);
   }
   const seq = ((await latestNote(tasksDir, id))?.seq ?? 0) + 1;
-  await writeNote(tasksDir, { task: id, seq, status: "rejected", done: "人工放行未通过", found: reason, next: reason, files: [] });
-  await store.setStatus(id, "open");
+  if (stage === "clarify") {
+    // The specification itself is wrong. Reopening the worker would spend a
+    // turn executing a definition the human has just rejected, so the task
+    // goes back to intake: draft, the reason held as an open question, and a
+    // new signature once that question is settled.
+    const questions = questionsPath(tasksDir, id);
+    await writeNote(tasksDir, {
+      task: id,
+      seq,
+      status: "规格被人工退回（clarify）：回答 questions.md 或修订 spec 后重新 approve",
+      done: "人工判定问题出在澄清/spec，而不是执行",
+      found: reason,
+      next: `解决 ${questions} 后执行 taskctl approve`,
+      files: [],
+    });
+    await store.setStatus(id, "draft");
+    await writeQuestions(tasksDir, id, [reason], "rejection");
+  } else {
+    await writeNote(tasksDir, { task: id, seq, status: "rejected", done: "人工放行未通过", found: reason, next: reason, files: [] });
+    await store.setStatus(id, "open");
+  }
   await appendJournal(tasksDir, id, { stage: "human", event: "rejected", detail: `stage=${stage} ${reason}` });
   await appendAudit(tasksDir, { task: id, at: new Date().toISOString(), verdict: "fail", stage, note: reason });
-  log(`${id}  open  rejected (stage=${stage})`);
+  await recordHumanFeedback(tasksDir, task, log, { action: "reject", verdict: "fail", stage, note: reason });
+  log(`${id}  ${stage === "clarify" ? "draft" : "open"}  rejected (stage=${stage})`);
   return 0;
 }
 
@@ -695,6 +859,9 @@ async function auditCommand(flags: Map<string, string>, log: (line: string) => v
     ...(note === undefined ? {} : { note }),
     ...(verdict === "pass" ? { highlight: true } : {}),
   });
+  if (note !== undefined) {
+    await recordHumanFeedback(tasksDir, task, log, { action: "audit", verdict, stage, note });
+  }
   log(`${id}  audit ${verdict}  stage=${stage}`);
   return 0;
 }
