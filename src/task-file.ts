@@ -12,6 +12,9 @@ export type TaskStatus = "draft" | "open" | "running" | "review" | "awaiting-hum
 /** How much clarification a task gets before execution starts. */
 export type TaskComplexity = "simple" | "complex";
 
+/** How the controller paces work; independent of intake complexity and proof. */
+export type TaskExecution = "continuous" | "iterative";
+
 /** `high` tasks never finish on the reviewer's verdict alone. */
 export type TaskRisk = "normal" | "high";
 
@@ -76,6 +79,11 @@ export type Task = {
   /** Numbered acceptance criteria (`C1 …`); the reviewer judges exactly these. */
   criteria: string[];
   complexity: TaskComplexity;
+  /** Continuous starts with one turn; iterative permits bounded feedback loops. */
+  execution: TaskExecution;
+  /** Optional worker-side bounded generation/check, distinct from acceptance. */
+  workerSelfCheck?: string;
+  workerSelfCheckTimeoutMs?: number;
   risk: TaskRisk;
   /** Workspace for this task, relative to the configured workdir. */
   workdir?: string;
@@ -148,6 +156,7 @@ export function declaredTaskSchema(raw: string): unknown {
 
 const STATUSES: readonly TaskStatus[] = ["draft", "open", "running", "review", "awaiting-human", "done", "blocked"];
 const COMPLEXITIES: readonly TaskComplexity[] = ["simple", "complex"];
+const EXECUTIONS: readonly TaskExecution[] = ["continuous", "iterative"];
 const RISKS: readonly TaskRisk[] = ["normal", "high"];
 const VERIFIES: readonly TaskVerify[] = ["human", "mechanical", "render"];
 
@@ -177,6 +186,7 @@ export function parseTaskFile(raw: string, id: string): Task {
   // A render check with no target would report success having opened nothing, so
   // the pairing is validated here rather than at the point of use.
   const verify = parseEnum(data, "verify", VERIFIES, "human", id);
+  const complexity = parseEnum(data, "complexity", COMPLEXITIES, "complex", id);
   const renderTargets = parseStringList(data, "render_targets", id);
   if (verify === "render" && renderTargets.length === 0) {
     throw new TaskFileError(`task file ${id}: verify render needs at least one render_targets entry`);
@@ -190,7 +200,10 @@ export function parseTaskFile(raw: string, id: string): Task {
     effort: optionalString(data, "effort", id),
     acceptance: optionalString(data, "acceptance", id),
     criteria: parseCriteria(data, id),
-    complexity: parseEnum(data, "complexity", COMPLEXITIES, "complex", id),
+    complexity,
+    execution: parseEnum(data, "execution", EXECUTIONS, complexity === "simple" ? "continuous" : "iterative", id),
+    workerSelfCheck: optionalString(data, "worker_self_check", id),
+    workerSelfCheckTimeoutMs: optionalPositiveInteger(data, "worker_self_check_timeout_ms", id),
     risk: parseEnum(data, "risk", RISKS, "normal", id),
     workdir: optionalString(data, "workdir", id),
     keepAtRoot: parseStringList(data, "keep_at_root", id),
@@ -224,6 +237,9 @@ export function serializeTaskFile(task: Task): string {
     ...(task.acceptance !== undefined && { acceptance: task.acceptance }),
     ...(task.criteria.length > 0 && { criteria: task.criteria }),
     complexity: task.complexity,
+    execution: task.execution,
+    ...(task.workerSelfCheck !== undefined && { worker_self_check: task.workerSelfCheck }),
+    ...(task.workerSelfCheckTimeoutMs !== undefined && { worker_self_check_timeout_ms: task.workerSelfCheckTimeoutMs }),
     ...(task.risk === "high" && { risk: task.risk }),
     ...(task.workdir !== undefined && { workdir: task.workdir }),
     ...(task.keepAtRoot.length > 0 && { keep_at_root: task.keepAtRoot }),
@@ -265,6 +281,15 @@ function optionalString(data: Record<string, unknown>, key: string, id: string):
   }
   if (typeof value !== "string") {
     throw new TaskFileError(`task file ${id}: field ${key} must be a string`);
+  }
+  return value;
+}
+
+function optionalPositiveInteger(data: Record<string, unknown>, key: string, id: string): number | undefined {
+  const value = data[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw new TaskFileError(`task file ${id}: field ${key} must be a positive integer`);
   }
   return value;
 }

@@ -44,6 +44,33 @@ retries: 0
     expect(t.acceptance).toBeUndefined();
   });
 
+  it("derives execution from complexity unless explicitly declared", () => {
+    const simple = parseTaskFile(raw.replace("status: open", "status: open\ncomplexity: simple"), "fix-login");
+    expect(simple.execution).toBe("continuous");
+    expect(parseTaskFile(raw, "fix-login").execution).toBe("iterative");
+
+    const explicit = parseTaskFile(raw.replace("status: open", "status: open\ncomplexity: simple\nexecution: iterative"), "fix-login");
+    expect(explicit.execution).toBe("iterative");
+    expect(parseTaskFile(serializeTaskFile(explicit), explicit.id)).toEqual(explicit);
+  });
+
+  it("round-trips bounded worker self-check fields and rejects invalid values", () => {
+    const withCheck = parseTaskFile(raw.replace(
+      "status: open",
+      "status: open\nworker_self_check: node scripts/generate.js\nworker_self_check_timeout_ms: 1200000",
+    ), "fix-login");
+    expect(withCheck.workerSelfCheck).toBe("node scripts/generate.js");
+    expect(withCheck.workerSelfCheckTimeoutMs).toBe(1200000);
+    expect(parseTaskFile(serializeTaskFile(withCheck), withCheck.id)).toEqual(withCheck);
+
+    expect(() => parseTaskFile(raw.replace("status: open", "status: open\nexecution: automatic"), "fix-login"))
+      .toThrow(/execution.*continuous, iterative/);
+    expect(() => parseTaskFile(raw.replace("status: open", "status: open\nworker_self_check_timeout_ms: 0"), "fix-login"))
+      .toThrow(/worker_self_check_timeout_ms/);
+    expect(() => parseTaskFile(raw.replace("status: open", "status: open\nworker_self_check_timeout_ms: 1.5"), "fix-login"))
+      .toThrow(/worker_self_check_timeout_ms/);
+  });
+
   it("round-trips serialize→parse idempotent", () => {
     // serializeTaskFile(parseTaskFile(raw)) 再解析字段相等
     const t = parseTaskFile(raw, "fix-login");

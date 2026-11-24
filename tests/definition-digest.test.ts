@@ -94,6 +94,9 @@ describe("definitionDigest covers intent, not lifecycle", () => {
       { description: "different body" },
       { verify: "mechanical" as const },
       { renderTargets: ["index.html"] },
+      { execution: "continuous" as const },
+      { workerSelfCheck: "node scripts/generate.js" },
+      { workerSelfCheckTimeoutMs: 1_200_000 },
     ]) {
       expect(definitionDigest({ ...base(), ...edit })).not.toBe(before);
     }

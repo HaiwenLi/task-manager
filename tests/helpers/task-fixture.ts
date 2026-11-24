@@ -24,6 +24,7 @@ export function buildTaskFile(overrides: Partial<Task> & { id: string; title?: s
     title: overrides.title ?? overrides.id,
     status,
     complexity,
+    execution: overrides.execution ?? (complexity === "simple" ? "continuous" : "iterative"),
     risk,
     verify,
   };

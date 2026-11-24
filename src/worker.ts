@@ -83,6 +83,8 @@ export type WorkerConfig = {
    * so a task parks for a human only when the whole cycle is out of allowance.
    */
   chainCycles?: number;
+  /** Shared re-probe window for a provider/model refusal (default 15 minutes). */
+  modelCooldownMs?: number;
   /** How many tasks the scheduler may run at once (default 2). */
   parallel?: number;
   /** Viewports a `verify: render` task must pass (default 1440x900 and 390x844). */

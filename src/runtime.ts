@@ -88,6 +88,9 @@ export function definitionFields(task: Task): Record<string, unknown> {
     // How much clarification the task gets, and whether it may finish on its own
     // evidence, decide the bar rather than decorating it.
     complexity: task.complexity,
+    execution: task.execution,
+    workerSelfCheck: task.workerSelfCheck,
+    workerSelfCheckTimeoutMs: task.workerSelfCheckTimeoutMs,
     risk: task.risk,
     humanCheck: task.humanCheck,
     dependsOn: task.dependsOn,

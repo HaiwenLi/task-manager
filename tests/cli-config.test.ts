@@ -10,6 +10,12 @@ describe("resolveConfig", () => {
     expect(resolved.filter((key) => !CONFIG_KEYS.has(key))).toEqual([]);
   });
 
+  it("accepts a positive shared model cooldown", () => {
+    expect(resolveConfig({ modelCooldownMs: 900_000 }, "taskctl.json").modelCooldownMs).toBe(900_000);
+    expect(resolveConfig({}, "taskctl.json").modelCooldownMs).toBeUndefined();
+    expect(() => resolveConfig({ modelCooldownMs: 0 }, "taskctl.json")).toThrow(/positive/);
+  });
+
   it("accepts a wrap budget for the model chain, zero included", () => {
     expect(resolveConfig({ chainCycles: 2 }, "taskctl.json").chainCycles).toBe(2);
     // 0 is the documented "linear chain" setting, not a missing value.

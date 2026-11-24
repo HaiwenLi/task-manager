@@ -87,6 +87,20 @@ describe("taskctl add", () => {
     expect((await new TaskStore(dir).get("006-login")).acceptance).toBe("npm test");
   });
 
+  it("records an explicit execution policy independent of complexity", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
+    const adapter = fakeAdapter("## 目标\n好\n## 验收标准\n- C1 好\n");
+    const code = await runCli([
+      "add", "--simple", "--execution", "iterative", "修 README 错字",
+      "--tasks-dir", dir, "--id", "006-policy",
+    ], { ...silent, adapter });
+
+    expect(code).toBe(0);
+    const task = await new TaskStore(dir).get("006-policy");
+    expect(task.complexity).toBe("simple");
+    expect(task.execution).toBe("iterative");
+  });
+
   it("assigns the next numeric id when none is given", async () => {
     const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
     const adapter = fakeAdapter("## 目标\n好\n## 验收标准\n- C1 好\n");

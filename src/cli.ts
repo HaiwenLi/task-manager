@@ -7,7 +7,7 @@ import { runWorker, type WorkerConfig } from "./worker.js";
 import { runScheduler } from "./scheduler.js";
 import { OpenCodeAdapter } from "./adapters/opencode.js";
 import type { AgentAdapter } from "./adapters/types.js";
-import { serializeTaskFile, type Task, type TaskVerify, TASK_SCHEMA } from "./task-file.js";
+import { serializeTaskFile, type Task, type TaskExecution, type TaskVerify, TASK_SCHEMA } from "./task-file.js";
 import { buildFinding } from "./findings.js";
 import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, TEMPLATES, type TaskType } from "./intake.js";
 import { appendObservation, readProfile } from "./profile.js";
@@ -40,7 +40,7 @@ class UsageError extends Error {}
 
 const USAGE = [
   "usage:",
-  "  taskctl add \"<意图>\" [--type code|office|research|design] [--simple] [--quick] [--verify human|mechanical|render] [--target <a.html,b.html>] [--id <id>] [--config taskctl.json]",
+  "  taskctl add \"<意图>\" [--type code|office|research|design] [--simple] [--quick] [--verify human|mechanical|render] [--execution continuous|iterative] [--target <a.html,b.html>] [--id <id>] [--config taskctl.json]",
   "  taskctl spec --task <id> [--tasks-dir <dir>]",
   "  taskctl approve --task <id> [--tasks-dir <dir>]",
   "  taskctl run [--log <file>] [--config taskctl.json]",
@@ -114,7 +114,7 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
   }
   switch (command) {
     case "add":
-      checkFlags(command, flags, ["type", "simple", "quick", "verify", "target", "id", "config", "risk", "workdir", "tasks-dir", "acceptance"], []);
+      checkFlags(command, flags, ["type", "simple", "quick", "verify", "execution", "target", "id", "config", "risk", "workdir", "tasks-dir", "acceptance"], []);
       return addCommand(positionals, flags, deps, log);
     case "spec":
       checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
@@ -330,6 +330,9 @@ async function addCommand(
   // encodes; keeping them in one field avoids a task that claims to be complex
   // while sitting in `open`.
   const complexity = quick || flags.has("simple") ? "simple" : detectComplexity(intent);
+  const execution = flags.has("execution")
+    ? parseExecution(flags.get("execution")!)
+    : complexity === "simple" ? "continuous" : "iterative";
   const workdir = flags.get("workdir");
   const task: Task = {
     id,
@@ -338,6 +341,7 @@ async function addCommand(
     status: "draft",
     criteria: [],
     complexity,
+    execution,
     risk,
     ...(workdir !== undefined && { workdir }),
     keepAtRoot: [],
@@ -793,6 +797,14 @@ function parseVerify(value: string): TaskVerify {
   return value as TaskVerify;
 }
 
+function parseExecution(value: string): TaskExecution {
+  const allowed: TaskExecution[] = ["continuous", "iterative"];
+  if (!allowed.includes(value as TaskExecution)) {
+    throw new UsageError(`unknown --execution "${value}" (expected one of: ${allowed.join(", ")})`);
+  }
+  return value as TaskExecution;
+}
+
 /** First non-empty line, used as the task title. */
 function firstLine(text: string): string {
   return text.split(/\r?\n/).find((line) => line.trim().length > 0)?.trim() ?? "task";
@@ -857,6 +869,7 @@ export const CONFIG_KEYS = new Set([
   "maxSessionsPerTask",
   "maxTurnsPerSession",
   "chainCycles",
+  "modelCooldownMs",
   "maxReviewRounds",
   "reviewerModel",
   "reviewerEffort",
@@ -898,6 +911,7 @@ export function resolveConfig(raw: Record<string, unknown>, path: string): Resol
     maxSessionsPerTask: integer(raw, "maxSessionsPerTask", path),
     maxTurnsPerSession: integer(raw, "maxTurnsPerSession", path),
     chainCycles: nonNegativeInteger(raw, "chainCycles", path),
+    modelCooldownMs: number(raw, "modelCooldownMs", path),
     maxReviewRounds: integer(raw, "maxReviewRounds", path),
     reviewerModel: string(raw, "reviewerModel", path),
     reviewerEffort: string(raw, "reviewerEffort", path),

@@ -32,6 +32,9 @@ const FIRST_SESSION_PROMPT = `# 任务：组装任务协议
 - 临时文件与日志一律写 ${ctx.logDir}（环境变量 $TASKCTL_LOG_DIR）；工作目录根目录只放交付物
 - 完成全部要求后，运行：taskctl done --task protocol-a --tasks-dir "${ctx.tasksDir}"
 - 阶段性发现请随时运行：taskctl note --task protocol-a --tasks-dir "${ctx.tasksDir}" --status <一句话状态> --done <已完成> --found <关键发现> --next <下一步> --files <逗号分隔文件>
+- acceptance 全量验收由控制器在 done 后运行；不要自行重复运行。自验只跑有界的定向检查
+- 若任务声明了 worker_self_check，用 taskctl check --task protocol-a --tasks-dir "${ctx.tasksDir}" 执行，不要用 shell 绕过超时
+- 若任务实际比声明更复杂，单独输出一行 ESCALATE: <原因>；只能升级管理强度，不能自行降低验收标准
 - 若收到"上下文预算告急"的收尾指令：立即运行一次 taskctl note（尽量详尽，同上参数），然后只回复 HANDOFF_READY
 
 ## 上一段会话的交接笔记
@@ -80,8 +83,8 @@ describe("buildWorkerPrompt", () => {
 
   it("double-quotes the absolute tasks dir on every taskctl invocation", () => {
     const prompt = buildWorkerPrompt(task(), ctx);
-    // done 与 note 两处都要带双引号绝对路径（Worker 的 cwd 是 workdir）
-    expect(prompt.split(`--tasks-dir "${ctx.tasksDir}"`)).toHaveLength(3);
+    // done、note 与 check 三处都要带双引号绝对路径（Worker 的 cwd 是 workdir）
+    expect(prompt.split(`--tasks-dir "${ctx.tasksDir}"`)).toHaveLength(4);
   });
 
   it("leaks no unescaped braces down either path", () => {
