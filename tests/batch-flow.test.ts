@@ -7,6 +7,7 @@ import { runCli } from "../src/cli.js";
 import { readRuntime } from "../src/runtime.js";
 import type { Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
+import type { WorkerDeps } from "../src/worker.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
 import { doneAdapter, passAcceptance, seedTaskFile, writeBatchConfig } from "./helpers/watch-fixture.js";
 
@@ -35,21 +36,30 @@ function adapter(onTurn?: (id: string) => Promise<void>): AgentAdapter {
 
 const acceptance = passAcceptance;
 
+/** A passing review verdict in the shape the worker's review seam returns. */
+const passingReview: NonNullable<WorkerDeps["review"]> = async (evidence) => ({
+  verdict: "pass",
+  criteria: evidence.task.criteria.map((criterion) => ({ id: criterion.split(/\s+/)[0]!, pass: true, evidence: "ok" })),
+  externalChanges: [],
+  defects: [],
+  summary: "ok",
+});
+
 async function cli(
   args: string[],
   agent: AgentAdapter,
-  review?: () => Promise<void>,
+  review?: NonNullable<WorkerDeps["review"]>,
 ): Promise<{ code: number; reviews: number }> {
   let reviews = 0;
   const code = await runCli(args, {
     adapter: agent,
     acceptance,
-    review: async () => {
+    review: async (evidence) => {
       reviews++;
       if (review === undefined) {
         throw new Error("unexpected review for a mechanical continuous batch task");
       }
-      await review();
+      return review(evidence);
     },
     log: () => {},
     err: (line) => { errors.push(line); },
@@ -130,6 +140,18 @@ describe("taskctl run --batch", () => {
     expect((await store.get("b")).status).toBe("open");
     expect((await store.get("c")).status).toBe("open");
     expect(await readRuntime(tasks, "b", "acceptance.json")).toBeNull();
+  });
+
+  it("reviews a human-verified task exactly once through the run review seam", async () => {
+    await seed(task("a", { verify: "human" }));
+
+    const { code, reviews } = await cli(["run", "--config", configPath], adapter(), passingReview);
+
+    expect(code, errors.join("\n")).toBe(0);
+    expect(reviews).toBe(1);
+    expect((await store.get("a")).status).toBe("done");
+    expect((await store.get("b")).status).toBe("done");
+    expect((await store.get("c")).status).toBe("done");
   });
 
   it("does not fall through to the ordinary scheduler after the selection finishes", async () => {

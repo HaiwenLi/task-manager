@@ -95,16 +95,16 @@ async function createControllerTelemetry(cfg: ResolvedConfig, teeTarget?: string
 }
 
 function createWorkerDeps({
-  deps, adapter, store, telemetry, log, review = false,
+  deps, adapter, store, telemetry, log,
 }: {
   deps: CliDeps; adapter: AgentAdapter; store: TaskStore;
-  telemetry: ControllerTelemetry; log: (line: string) => void; review?: boolean;
+  telemetry: ControllerTelemetry; log: (line: string) => void;
 }): WorkerDeps {
   return {
     store,
     adapter,
     ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
-    ...(review && deps.review !== undefined ? { review: deps.review } : {}),
+    ...(deps.review === undefined ? {} : { review: deps.review }),
     onEvent: (evt) => {
       const line = workerEventLine(evt);
       log(line);
@@ -362,7 +362,7 @@ async function watchCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
   const telemetry = await createControllerTelemetry(cfg);
   telemetry.refreshBoard();
   try {
-    await watchQueue(cfg, createWorkerDeps({ deps, adapter, store, telemetry, log, review: true }),
+    await watchQueue(cfg, createWorkerDeps({ deps, adapter, store, telemetry, log }),
       { ...deps.watch, resume: flags.has("resume") });
   } finally {
     await telemetry.flush();
