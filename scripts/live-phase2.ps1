@@ -79,10 +79,19 @@ Write-SimpleTask (Join-Path $pending "c.md") "c"
 $env:PATH = "$bin;$env:PATH"
 
 function Read-TextFile([string]$Path) {
-  # 空文件或不存在的文件都读成空字符串：Get-Content -Raw 读 0 字节文件时不产生任何对象，
-  # 后续的 .Trim() / -match 会撞上 $null。ReadAllText 对空文件返回真正的 ""。
+  # 空文件、不存在的文件、以及正被另一个进程写入的文件，都读成字符串：
+  # Get-Content -Raw 读 0 字节文件时不产生任何对象（后续的 .Trim() 会撞上 $null），
+  # ReadAllText 读不了仍被重定向打开的日志。共享读写方式打开对三者都成立。
   if (-not (Test-Path -PathType Leaf $Path)) { return "" }
-  $text = [System.IO.File]::ReadAllText($Path)
+  $text = $null
+  try {
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+      $reader = New-Object System.IO.StreamReader($stream)
+      $text = $reader.ReadToEnd()
+      $reader.Close()
+    } finally { $stream.Close() }
+  } catch { return "" }
   if ($null -eq $text) { return "" }
   return $text
 }
