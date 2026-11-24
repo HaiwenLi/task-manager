@@ -178,7 +178,7 @@ taskctl answer --task <id> --file <answers.md>   回答 questions.md（needs-inf
 taskctl approve --task <id> 签字 → open
 taskctl run                 并发执行 → 验收命令 → 独立复核 → done / 返工 / 等放行
 taskctl run --batch C,B,A   严格按给定顺序跑连续批次；每项仍独立领取、验收、留证
-taskctl watch --config taskctl.json [--resume]   常驻看板；新任务自动调度，合格任务自动成批
+taskctl watch --config taskctl.json [--resume]   常驻看板；新任务自动调度，合格任务自动成批；逐任务事件与 run 一样落 tasks/<id>/logs/run-*.log
 taskctl stop --tasks-dir tasks   请求优雅收尾；当前 attempt 结算后退出，不强杀 worker
 taskctl board               总台账（同时重写 .taskctl/board.md，可用浏览器打开）
 taskctl report --task <id>  单任务证据页
