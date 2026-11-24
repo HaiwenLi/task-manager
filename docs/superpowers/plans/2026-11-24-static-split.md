@@ -96,7 +96,7 @@ Implementation notes the plan did not fix:
 
 ### Task 4: Planning
 
-**Files:** `src/split.ts` (new), `src/review.ts`; test `tests/split.test.ts`
+**Files:** `src/split.ts` (new), `src/review.ts`; test `tests/split-plan.test.ts`
 
 - [x] Write failing tests for id allocation, key-to-id mapping, and every rejection: unknown/self/cyclic
       references, missing criteria, `mechanical` without a command, `render` without targets, duplicate or
@@ -105,7 +105,7 @@ Implementation notes the plan did not fix:
 
 ### Task 5: Idempotent publication
 
-**Files:** `src/split.ts`; test `tests/split.test.ts`
+**Files:** `src/split.ts`; test `tests/split-plan.test.ts`
 
 - [x] Write failing tests for publication order, gating after publication, resume after a crash before the parent
       link, byte-identical re-apply after it, and refusal on a non-draft parent, a stale digest, a differing

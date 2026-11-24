@@ -38,7 +38,7 @@
 - Modify: `src/runtime.ts`
 - Modify: `src/protocol.ts`
 - Modify: `src/cli.ts` (add/config flags only)
-- Test: `tests/task-file.test.ts`, `tests/definition-digest.test.ts`, `tests/protocol.test.ts`, `tests/config.test.ts`
+- Test: `tests/task-file.test.ts`, `tests/definition-digest.test.ts`, `tests/protocol.test.ts`, `tests/cli-config.test.ts`
 
 **Interfaces:**
 - Produces: `type TaskExecution = "continuous" | "iterative"`; `Task.execution`, `Task.workerSelfCheck?`, `Task.workerSelfCheckTimeoutMs?`.
@@ -143,7 +143,7 @@
 **Files:**
 - Create: `src/usage.ts`
 - Modify: `src/worker.ts`, `src/review.ts`, `src/report.ts`, `src/artifacts.ts`, `src/cli.ts`, `src/workspace.ts`, `README.md`
-- Test: `tests/usage.test.ts`, `tests/report.test.ts`, `tests/artifacts.test.ts`, `tests/workspace.test.ts`
+- Test: `tests/usage.test.ts`, `tests/pipeline-e2e.test.ts`, `tests/artifacts.test.ts`, `tests/workspace.test.ts`
 
 **Interfaces:**
 - Produces: append-only `usage.jsonl` snapshots/deltas and reviewer session ID in `review.json`.

@@ -47,7 +47,7 @@ npx tsx src/main.ts <子命令> [参数]
 | `acceptanceTimeoutMs` | number | `600000` | 单次验收命令的超时 |
 | `maxSessionsPerTask` | number | `20` | 一个任务全会话链的长度上限（含交接与重试） |
 | `maxTurnsPerSession` | number | `40` | 单会话内工作回合数上限 |
-| `parallel` | number | `2` | 同时执行的任务数；同一工作目录仍只跑一个 |
+| `parallel` | number | `2` | 同时执行的任务数；同一工作目录仍只跑一个。`watch` 不读它，严格串行 |
 | `batchMaxTasks` | number | `5` | watch 自动连续批次的任务数上限；`1` = 关闭自动成批，手动 `run --batch` 仍可用 |
 | `maxReviewRounds` | number | `2` | 复核失败几轮后 `blocked` |
 | `reviewerModel` | string | 后端默认 | 复核会话单独用的模型；**不设置时用 opencode 自己的默认模型**，不会继承 `model` |
@@ -90,12 +90,12 @@ retries: 0
 | `status` | ✓ | 生命周期：`draft`（等签字）/ `open`（待领取）/ `running`（执行中）/ `review`（复核中）/ `awaiting-human`（等放行）/ `done`（完成）/ `blocked`（需人工介入） |
 | `model` | | 本任务模型（`provider/model`），覆盖配置兜底 |
 | `effort` | | 本任务努力档（如 `high`），覆盖配置兜底 |
-| `acceptance` | | 验收命令（完整 shell 命令行，在 `workdir` 下执行）；退出码 0 且所有权/任务定义/产物一致才进入复核。缺失但有 `criteria` 时跳过命令、由复核判定（记录 `acceptance-skipped`）；两者都缺 → `blocked` |
+| `acceptance` | | 验收命令（完整 shell 命令行，在 `workdir` 下执行）；退出码 0 且所有权/任务定义/产物一致才进入复核。缺失但有 `criteria` 时跳过命令、由复核判定（记录 `acceptance-skipped`）；两者都缺 → `blocked`（`quick` 任务转 `awaiting-human`） |
 | `criteria` | | 验收标准列表，`C1 …` 编号；复核逐条判定，这是复核的唯一判据 |
 | `complexity` | | `simple`（不停下等签字）或 `complex`（默认，出稿等签字）。只决定入口审批，不决定执行策略 |
 | `execution` | | `continuous` 或 `iterative`；缺省时 simple → continuous、complex → iterative。continuous 先用一个 worker 回合完成，失败/变复杂才升级；iterative 在同一工作上下文中进行有界验收与复核返工 |
 | `worker_self_check` | | worker 可选的有界自验/生成命令，只能经 `taskctl check` 执行；与控制器负责的 `acceptance` 分离 |
-| `worker_self_check_timeout_ms` | | `worker_self_check` 的超时，默认 20 分钟且不得超过 `turnTimeoutMs` |
+| `worker_self_check_timeout_ms` | | `worker_self_check` 的超时；未声明时取 min(20 分钟, 回合上限)。声明值不得超过回合上限——以领取时写进 `attempt.json` 的 `turnTimeoutMs` 为准 |
 | `risk` | | `high` 时复核通过也要人工 `accept` |
 | `workdir` | | 本任务的工作目录（相对配置里的 `workdir`）；同一目录同时只跑一个任务 |
 | `keep_at_root` | | 根目录文件名 glob 列表，命中者**豁免回合后清扫**（如 `run.log`）。不进 `definitionDigest`：它决定杂物停哪儿，不决定"做完"是什么 |
@@ -121,7 +121,7 @@ retries: 0
 | 车道 | 怎么进 | 起点 | 代价 |
 | --- | --- | --- | --- |
 | 标准 | `add "<意图>"` | `draft`，澄清会话出 spec + criteria，等人签字 | 一次模型调用 + 一次签字 |
-| 简单 | `add --simple` 或意图里说「简单任务」 | `open`，仍出 spec | 符号少一次签字 |
+| 简单 | `add --simple`（意图里说「简单任务」只是模型未给分类时的缺省，不保证） | `open`，仍出 spec | 符号少一次签字 |
 | 快速 | `add --quick` | `open`，**不出 spec、不跑澄清**，意图原文就是定义 | 没有写下来的判据，所以它不会自己收尾 |
 
 ### 接入分类：这件事该管多细，信息够不够
@@ -157,7 +157,7 @@ taskctl approve --task <id>                      # 修订后的定义要重新�
 - 执行者在自己回合里写下 `ESCALATE: <理由>`；
 - 会话回合用尽或上下文告满需要交接（说明这事一次没干完）。
 
-触发后本次尝试**照样可以继续**，但不再能用自己产出的证据收尾——一律进复核。任务文件里的 `verify` 不改，`definitionDigest` 不变，所以升级本身不会让正在跑的尝试作废；理由记进 journal（`event: escalated`），`board`/`report` 可查。这个方向是刻意的：执行者能要求"多看一道"，不能要求"少看一道"。升级事实也会写入 `execution-state.json`，后续 attempt 不会悄悄降回机械直通。
+触发后本次尝试**照样可以继续**，但不再能用自己产出的证据收尾——一律进复核。任务文件里的 `verify` 不改，`definitionDigest` 不变，所以升级本身不会让正在跑的尝试作废；理由记进 journal（`event: escalated`）；`report` 的日志尾部会显示它，`board` 不显示。这个方向是刻意的：执行者能要求"多看一道"，不能要求"少看一道"。升级事实也会写入 `execution-state.json`，后续 attempt 不会悄悄降回机械直通。
 
 `execution` 与 `complexity`、`verify` 分工如下：
 
@@ -192,7 +192,7 @@ taskctl template --type …   看某类任务的必答/可推/补问模板
 
 要点：
 
-- **复杂度**：意图里明说「简单任务」或加 `--simple` 会跳过签字；其余由接入分类决定（见「接入分类」）。模型没说清、说错或没提，一律按复杂处理。简单任务同样出 spec，只是不等签字。
+- **复杂度**：`--simple` 会跳过签字；意图里明说「简单任务」只在模型没有给出分类时作为缺省，模型判为 `complex` 就仍是 `draft`。其余由接入分类决定（见「接入分类」）。模型没说清、说错或没提，一律按复杂处理。简单任务同样出 spec，只是不等签字。
 - **复核是独立会话**：新会话、不给执行者的对话，只给 spec、验收命令与结果、产物摘要、交接笔记、日志尾部、工作区改动清单（`git status --porcelain` 与 `git diff --stat`，各截断至 200 行、超长标注），以及本次执行的时间窗口。输出必须是 JSON；解析不了按 `unclear` 转人工，不会当成失败去重跑。实际注入的改动清单原文记在 `review.json` 的 `evidence` 字段，复盘复核误判时可以核对 reviewer 当时到底看到了什么；非 git 工作目录会显式标注「不可用」而不是中断复核。
 - **容忍的外部变更**：任务可以声明 `tolerate`，告诉复核"这些差异不是我干的"。声明之外的结构变化（删列、改表头含义等）仍按原规则判 fail；本任务自己该写的内容没写全，**不能**拿外部变更当挡箭牌；涉及交付内容（该写的行、该改对的单元格）时判不出先后的，也按本任务的问题处理。被容忍的差异不做静默处理：写进 `review.json` 的 `externalChanges`、journal 记一条 `verdict external=N`、`report` 里逐条列出，`taskctl accept` 放行前也会打印一遍（人工闸门是最后一道）。为什么需要它：真跑过的表格任务里，运行期间别人加了 1 列、删了 1 行、改了 4 个单元格，复核按"零附带改动"判 fail，白跑 20 分钟一轮。
 - **定义不能被被审对象自己改**：`tolerate`、`criteria`、`risk`、`verify`、`complexity` 等都属于任务定义，进 `definitionDigest`。执行回合里改了它（哪怕是 worker 自己 shell 出去改 frontmatter），本次验收直接作废、任务 `blocked` 等人工重新确认——否则"给自己放宽判定标准"就成了合法动作。判据是领取时写下的 `tasks/<id>/definition.json` 快照，事后改文件不会把旧证据重新判成合格。生命周期字段（`retries`、`sessions`、`status`）不在定义里：降重试数、记会话 id 不会作废正在进行的尝试。复核判决里记录的是**当时那份声明**，事后把 `tolerate` 收窄不会让旧判决看起来像是被允许过更多。
@@ -270,6 +270,8 @@ npx tsx src/main.ts run [--log <file>] [--config taskctl.json]
 
 按文件名顺序处理 `open` 任务：领锁 → 独占工作目录 → 持久化执行身份 → `running` → 会话/交接 → 完成请求 → 验收。全过程打印 `[<id>] <状态> [详情]`。缺少验收时输出 `acceptance-skipped` 并阻塞待审。`running` 孤儿任务只有已确认上一执行结束才能恢复；活跃/不确定记录或缺少执行身份的旧任务会阻塞，不盲目重跑。
 
+**故障隔离**：控制器内部错误只影响所在任务——该尝试结算、工作区释放、任务 `blocked` 并发出 `controller-error` 事件，其余任务照常排空；此时 `run` 仍排空看板，但退出码为 1。预期内的情况不算内部错误：复核超时（已确认停止）只保留待复核的现场（`review-pending.json`，用 `taskctl retry --review-only` 恢复），验收时模型进入冷却不影响已完成的回合。
+
 同一实际工作目录（含路径别名）不可并行执行；共享 Git common directory 的 worktree 暂按串行处理。当前不自动创建/合并 worktree。验收前后对源码产物做摘要；验收命令改变产物会要求复核，不会把旧检查套到新版本。摘要排除 Git 内部、依赖目录及任务运行时目录（另可用 `artifactIgnore` 忽略任务自产物的路径，见下节）；详见 `src/workspace.ts`。
 
 **控制器日志（`--log`）**：`--log <file>` 把每个 `[<id>] …` 事件行连时间戳 tee 进指定文件（stdout 照常输出；文件目录不存在会自动创建）。不指定时，每个任务的事件行缺省写进它自己的 `tasks/<id>/logs/run-<ISO>.log`（ISO 是本次 run 的启动时刻，`:` 换成 `-` 以便 Windows 文件名）。这取代了以前"外部 `Tee-Object` 到仓库根目录"的做法——控制器日志从此落在任务目录里，不再污染工作区。日志写失败只忽略，不会拖垮 run。
@@ -282,7 +284,7 @@ npx tsx src/main.ts run --batch C,B,A [--log <file>] [--config taskctl.json]
 
 批次只是调度策略，不是把多项任务合成一个“大任务”。它严格按命令行给出的 `C,B,A` 顺序执行，先整选校验，再从普通 `run` 队列之外**只领取这些任务**。每项都必须：`execution: continuous`（或从 `simple` 推导）、同一解析后的 workdir、`verify: mechanical` / `render`、普通风险、无 `human_check`、依赖已 `done` 或排在所选顺序的前面，并且没有活跃或未结算的旧执行。高风险、人工门禁、跨 workdir、显式 iterative 会被拒绝，不会静默放宽。
 
-每个任务仍然单独领锁、保存定义快照、跑自己的验收和必要的复核，写自己的 `acceptance.json`、session 与 usage 增量；验收**不会**推迟到批次末尾。每次领取前还会重读看板并比较原定义和 workdir，中途改动在被改任务领取前拒绝。复核把当前任务退回 `open` 时，先把当前任务迭代完；`blocked` / `awaiting-human` / 所有权冲突会停止批次，后续任务不被领取。
+每个任务仍然单独领锁、保存定义快照、跑自己的验收和必要的复核，写自己的 `acceptance.json`、session 与 usage 增量；验收**不会**推迟到批次末尾。每次领取前还会重读看板并比较原定义和 workdir，中途改动在被改任务领取前拒绝。复核 `fail` 在当前领取内返工，不会把任务退回 `open`；批次对 `open` 结果的重试是为将来的调度器结果保留的防御分支，目前只有测试接缝能到达。`blocked` / `awaiting-human` / `skipped`（领取被拒、任务已不在 `open`/`running`、依赖未就绪、所有权丢失）会停止批次，后续任务不被领取。
 
 上一任务干净结算后，只有实际 model 与 canonical workdir 都一致、worker session 标记 clean、后端探测返回 `reusable` 时，下一任务才续用该 session。model 不匹配或探测 `unavailable` 会记 journal 后新开；`active` 会阻塞待 reconcile，不会启动竞争 worker。
 
@@ -300,7 +302,9 @@ watch 用文件事件（250ms 去抖）和 30 秒兜底扫描发现新任务；�
 
 一个看板只有一个 watch 所有者，记录在 `.taskctl/watch.lock`，带完整 owner generation 和 heartbeat。第二个活跃 watcher 会直接拒绝；stale / 损坏记录只诊断，不自动接管，确认旧进程已消失后需人工清理。
 
-`stop` 只写 `.taskctl/stop.requested`，不发送进程树终止信号。watch 不再领取新任务，让当前 worker attempt 安全结算并释放记录后退出；stop 文件保留，因此下次启动必须显式 `watch --resume`。恢复清 stop 的动作发生在取得 watch 锁之后，第二个 watcher 不能清掉正在运行者的停止请求。
+`stop` 只写 `.taskctl/stop.requested`，不发送进程树终止信号。watch 不再领取新任务，让当前 worker attempt 安全结算并释放记录后退出；stop 文件保留，因此下次启动必须显式 `watch --resume`。恢复清 stop 的动作发生在取得 watch 锁之后，第二个 watcher 不能清掉正在运行者的停止请求。停止的粒度是整个 attempt（可能含多个回合），不是单个回合。
+
+watch 严格串行，不读 `parallel`。调度边界出错——某个已注册任务文件写坏、依赖成环、选中的任务被别的控制器先领走——不会让 watch 退出：它报出原因并等下一次事件，看板修好后自动恢复，期间 `stop` 仍然有效。
 
 ### 产物卫生：LOG_DIR 约定与回合后清扫
 
@@ -375,6 +379,8 @@ taskctl check --task <id> [--tasks-dir <dir>]
 
 只允许在任务 `running` 且 attempt 活跃时执行声明过的 `worker_self_check`，以 generate 模式和任务级超时运行，结果写 `self-check.json`。它不会改变任务状态，也不能代替控制器的 `acceptance`。超时且确认停止后，取消前输出也会保留。
 
+它在本次尝试的工作目录里运行，超时上界也取自领取时写下的 `attempt.json`（`workspace` / `turnTimeoutMs`），所以从任务的子目录调用、或控制器用别处的 `--config` 启动，结果都一样。
+
 ### taskctl note — 交接笔记（agent 侧）
 
 ```bash
@@ -427,7 +433,7 @@ taskctl retry --task <id>       # 归档旧证据后重开；仅在 attempt 已 
 
 **回合 / 验收超时** —— 单回合默认 30 分钟、验收 10 分钟。请求停止并确认停止后才允许计失败重试；无法确认则阻塞并保留工作目录预留。OpenCode CLI 被杀不代表其独立后端会话已停，因此 OpenCode 回合被中断按不确定处理，须人工核实。未做真实后端取消验证。
 
-**provider 拒绝（429 / 鉴权 / 5xx）** —— 这类失败说明回合根本没开始干活，adapter 会把它标成 `failure: "provider"`：没有配降级链时 worker 计一次可重试失败并继续（达到 `retryLimit` 才 blocked），复核阶段同样按失败重试而不是转人工。它与"执行停止未确认"是两回事，不会把任务卡进需要人工对账的状态。
+**provider 拒绝（429 / 鉴权 / 5xx）** —— 这类失败说明回合根本没开始干活，adapter 会把它标成 `failure: "provider"`：复核阶段按失败重试而不是转人工。它与"执行停止未确认"是两回事，不会把任务卡进需要人工对账的状态。worker 侧要注意共享冷却（见下文）：这次失败计一次重试，**同时**把该模型记入看板级冷却表（默认 15 分钟），冷却期内不再向它派发——所以没配降级链时，任务通常在这一回合之后就 `blocked`，交接笔记会写明已派发的回合数和下一次可探测时间。
 
 **配额耗尽（weekly limit / usage limit / quota 等）** —— 同属 provider 拒绝，但多了一个事实：窗口过一阵会恢复，任务本身没有任何问题。所以这类拒绝**不花 `retries`**：先退避等待（默认 1s 起翻倍、封顶 30s），再把这一回合交给链上的下一个模型；整条链都拒绝时 `blocked`，交接笔记（`blocked:needs-owner`）逐条列出每个模型和它的拒绝原因，并写明"换有额度的模型或等窗口重置后 `taskctl retry`，不要把它当成任务失败去改判据"。识别靠错误文本里的额度措辞；没有措辞时看形状——回合几秒内返回且 token 数为 0，说明根本没进到模型。这条路径来自 2026-11-17：一个周限额加两个五小时限额，在一天内把几个真任务打成 `blocked` 并花掉了它们的重试额度。
 
@@ -454,11 +460,18 @@ E2E 前置：本机 opencode 已安装并登录；Windows 下测试会自动解�
 整条流水线的真实冒烟（临时项目、自带 taskctl shim、跑完打印 report）：
 
 ```powershell
-.\scripts\smoke.ps1          # 只准备环境，不调模型
+.\scripts\smoke.ps1          # 只准备环境并校验任务已注册，不调模型
 .\scripts\smoke.ps1 -Live    # 真跑一次，通过时打印 SMOKE PASS
 ```
 
-它会验证：agent 在真实会话里干活 → 验收命令 → 独立复核 → `done`。2026-11-16 在本机 opencode 2.3.0 上跑通。
+它会验证：agent 在真实会话里干活 → 验收命令 → 独立复核 → `done`。2026-11-24 在本机 opencode 2.4.1 上跑通。不带 `-Live` 时它仍然检查冒烟任务被 `taskctl` 认作 `open`——任务文件少了 `schema: taskctl/v1` 就会被归入 `ignored`，`-Live` 会对着空看板跑完再报失败。
+
+Phase 2 的有界真实验证（两任务批次共用一个 session、逐任务 usage、watch 发现运行期间新增的任务并经 `stop` 收尾、`watch --resume` 重启；共 3 个 worker 回合，可用 `-Model` 指定模型）：
+
+```powershell
+.\scripts\live-phase2.ps1           # 只准备环境并校验注册，不调模型
+.\scripts\live-phase2.ps1 -Live     # 15 项断言，通过时打印 LIVE PHASE 2 PASS
+```
 
 ## 凭据与隐私
 
@@ -466,7 +479,7 @@ E2E 前置：本机 opencode 已安装并登录；Windows 下测试会自动解�
 - 示例使用相对路径；机器专属可执行文件路径仅保存在本地，不提交到 Git。
 - `.env`、密钥文件、私人记忆和实际任务运行数据默认忽略；`tasks/example.md` 是公开示例，不含真实任务记录。
 - `attempt.json`、`acceptance.json`、交接笔记和模型输出可能含任务内容、运行路径或敏感数据；提交附件或共享日志前另行检查。`.gitignore` 不会清除已经提交的历史。
-- 当前验证为离线测试，不代表真实后端取消、科学有效性或生产部署已经验证；中断恢复见 [ADR-0007](docs/adr/0007-fenced-execution-and-evidence.md)。
+- 2026-11-24 做过有界 Live 验证（`scripts/smoke.ps1 -Live` 与 `scripts/live-phase2.ps1 -Live`）：真实后端上的领取、验收、复核、跨任务 session 复用、usage、watch 发现与 `stop`/`--resume` 均已跑通。真实后端的取消与中断恢复仍未验证（见 [ADR-0007](docs/adr/0007-fenced-execution-and-evidence.md)），其余结论仍以离线测试为据。
 
 ## 设计文档
 

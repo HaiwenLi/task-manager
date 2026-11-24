@@ -243,3 +243,17 @@ Update this plan with test counts, gate results, review verdict and report path.
   - P2 + S1 were closed by `5d8c87a`: `createWorkerDeps` forwards `CliDeps.review` whenever defined, matching `retry --review-only`, and a human-verified task through the real `run` CLI asserts `reviews === 1`. Failing regression confirmed pre-fix (the human task crashed on the default review path with the seam unforwarded); the reversed-guard mutation was killed and the restored control passed.
 - The sixth review's S1 (test scaffolding duplication) was closed by `5dc5b42`: shared `seedTaskFile`, `createStopRequests`, wait aliases, and a `batchMaxTasks`-aware `writeBatchConfig`.
 - Post-seventh-round offline gates at `5d8c87a`: `npm test` 617 passed / 1 skipped across 63 files; `npx tsc --noEmit` clean; `git diff --check` clean. No live backend, provider, or `-Live` verification was run.
+
+### Live validation (2026-11-24, authorized by the owner)
+
+- `scripts/smoke.ps1 -Live`: **PASS** in 61 s on opencode 2.4.1 — claimed → acceptance passed → reviewing → reviewed pass → done, with worker and reviewer usage records. The smoke task had not declared `schema: taskctl/v1` since registration was introduced, so `-Live` would have run an empty board and then failed; fixed by `7be83f2`, which also made the offline mode check registration at no quota cost (removing the schema line exits 1).
+- The first live run exposed that opencode 2.4.1 no longer reports a session's model on `session.get`. The reuse probe compared `undefined` with the expected model and answered `unavailable` for every session, so cross-task reuse and interrupted-session restore had never happened on the real backend, and usage was attributed to `(unknown)`. Fixed by `36c1333`: the model is read from the newest assistant message of `session.message.list` (shape verified live). Four regressions carrying the real payload failed before the fix; the reversed guard was killed.
+- `scripts/live-phase2.ps1 -Live` (`277c60f`, hardened by `d0d5fe3` and `b423feb`): **15/15 checks PASS** in 146 s on opencode 2.4.1 with `opencode-go/hungerg-free`, after `05f9e96` and `dbb9127`. Verified on the real backend:
+  - a two-task batch shares one session, with no `session-reuse-skipped` line;
+  - usage is captured per task in that session (a 77,837 tokens, b 67,694);
+  - `run` writes `tasks/<id>/logs/run-*.log` for both tasks;
+  - `watch` takes the lock, discovers a task added while it is running through the filesystem event (claimed within about half a second), drains it, and exits 0 through `stop` with the lock released and the same per-task log;
+  - the real `watch --resume` restarts a stopped queue, clears the stop request, and drains to exit 0.
+- The same batch evidence was observed on `zhipuai-coding-plan/glm-5.3-flash`: one shared session, a at input 14,472 / cacheRead 27,584 and b at input 771 / cacheRead 44,288.
+- Observed, not asserted: reuse trades input tokens for cache-read tokens, so its saving depends on cache pricing, and the backend reports `cost: 0` for both plan models, so `usage.jsonl` cannot show the saving in currency. A running session reports only `time.busy`; a finished one stamps `time.idle` (probed live at no model cost).
+- Still not verified live: backend cancellation and interrupted-execution recovery, process signals, and a reviewer timeout on a real backend.
