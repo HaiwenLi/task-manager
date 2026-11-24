@@ -376,7 +376,11 @@ async function watchCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
   telemetry.refreshBoard();
   try {
     await watchQueue(cfg, createWorkerDeps({ deps, adapter, store, telemetry, log }),
-      { ...deps.watch, resume: flags.has("resume") });
+      {
+        ...deps.watch,
+        resume: flags.has("resume"),
+        onError: deps.watch?.onError ?? ((message) => (deps.err ?? log)(message)),
+      });
   } finally {
     await telemetry.flush();
   }

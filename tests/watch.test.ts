@@ -4,6 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter } from "../src/adapters/types.js";
+import { BatchValidationError, runBatch } from "../src/batch.js";
 import { runCli } from "../src/cli.js";
 import type { Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
@@ -343,6 +344,61 @@ describe("watchQueue", () => {
       await requestStop();
       await resumed;
     }
+  });
+
+  it("keeps serving the board while one task file cannot be read, and resumes once it is mended", async () => {
+    await seed(task("a"));
+    await writeFile(join(tasks, "broken.md"), [
+      "---", "schema: taskctl/v1", "title: broken", "status: open", "sessions: []", "---", "a required field is missing", "",
+    ].join("\n"), "utf8");
+    const reported: string[] = [];
+    const running = watchQueue(cfg, deps(), {
+      watchFs, fallbackMs: 1_000, debounceMs: 5, onError: (message) => { reported.push(message); },
+    });
+    try {
+      await waitFor(() => reported.length > 0);
+      expect(reported[0]).toContain("broken");
+      expect(turns).toEqual([]);
+
+      await rm(join(tasks, "broken.md"));
+      listeners.get(tasks)?.();
+      await waitFor(() => turns.includes("a"));
+    } finally {
+      await requestStop();
+      await running;
+    }
+    expect((await store.get("a")).status).toBe("done");
+  });
+
+  it("ends only the batch when its selection stops validating mid-flight", async () => {
+    await seed(task("a"));
+    await seed(task("b"));
+    let claimedElsewhere = true;
+    const reported: string[] = [];
+    const running = watchQueue(cfg, deps(), {
+      watchFs, fallbackMs: 1_000, debounceMs: 5,
+      runBatch: async (batchCfg, batchDeps, ids) => {
+        if (claimedElsewhere) {
+          // Another controller claimed a selected task between grouping and the batch's own re-validation.
+          claimedElsewhere = false;
+          throw new BatchValidationError([`task ${ids[0]}: a live lock is held by another execution`]);
+        }
+        return runBatch(batchCfg, batchDeps, ids);
+      },
+      onError: (message) => { reported.push(message); },
+    });
+    try {
+      await waitFor(() => reported.length > 0);
+      expect(reported[0]).toContain("live lock");
+      expect(turns).toEqual([]);
+
+      listeners.get(tasks)?.();
+      await waitFor(() => turns.includes("b"));
+    } finally {
+      await requestStop();
+      await running;
+    }
+    expect((await store.get("b")).status).toBe("done");
   });
 
   it("does not claim ordinarily when stop arrives during the board read", async () => {

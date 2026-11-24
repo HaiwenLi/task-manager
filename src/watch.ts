@@ -20,6 +20,8 @@ export type WatchOptions = {
   runOne?: typeof runTask;
   runBatch?: typeof runBatch;
   watchFs?: WatchFs;
+  /** Sees each scheduling error the queue survives, so the operator learns why it is waiting. */
+  onError?: (message: string) => void;
 };
 
 async function stopRequested(tasksDir: string): Promise<boolean> {
@@ -133,7 +135,21 @@ export async function watchQueue(
     for (;;) {
       if (await stopRequested(cfg.tasksDir)) return;
       if (ownershipError !== undefined) throw ownershipError;
-      const scheduled = await scheduleOnce(cfg, deps, runOne, runSelected, stopOrLost);
+      let scheduled: Awaited<ReturnType<typeof scheduleOnce>>;
+      try {
+        scheduled = await scheduleOnce(cfg, deps, runOne, runSelected, stopOrLost);
+      } catch (error) {
+        if (ownershipError !== undefined) throw ownershipError;
+        // A board that cannot be scheduled right now — a hand-edited file with
+        // a typo, a dependency cycle, a selection another controller claimed
+        // first — is not a reason to abandon a long-lived manager. Say what was
+        // seen and wait for the next change: the fallback scan retries, so the
+        // queue resumes by itself once the board is mended, and `stop` still ends it.
+        const message = error instanceof Error ? error.message : String(error);
+        options.onError?.(`scheduling paused: ${message.replace(/\s+/g, " ").slice(0, 500)}; waiting for the next change`);
+        await waitForWake();
+        continue;
+      }
       if (scheduled === "stopped") {
         if (ownershipError !== undefined) throw ownershipError;
         return;

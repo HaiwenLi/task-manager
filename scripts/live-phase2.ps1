@@ -204,6 +204,25 @@ $stateC = Read-State "c"
 $sessionC = [string]$stateC.latestWorker.sessionId
 Add-Check "c runs in its own fresh session" ($sessionC.Length -gt 0 -and $sessionC -ne $sessionA) "a/b=$sessionA c=$sessionC"
 
+# --- 3. 重启路径（不耗额度）：stop 之后文档写的重启命令是 watch --resume；看板上已无待办，不会触发模型回合 ---
+$stopFile = Join-Path $root ".taskctl\stop.requested"
+$again = Invoke-Taskctl "stop-again" "stop --tasks-dir tasks"
+$restartOut = Join-Path $root "watch-restart.out.log"
+$restartErr = Join-Path $root "watch-restart.err.log"
+$restarted = Start-Process -FilePath "node" -ArgumentList "`"$tsx`" `"$entry`" watch --config taskctl.json --resume" -WorkingDirectory $root -NoNewWindow -PassThru -RedirectStandardOutput $restartOut -RedirectStandardError $restartErr
+$null = $restarted.Handle
+try {
+  $restartDeadline = (Get-Date).AddSeconds(60)
+  while (-not (Test-Path $lock) -and (Get-Date) -lt $restartDeadline -and -not $restarted.HasExited) { Start-Sleep -Milliseconds 500 }
+  Start-Sleep -Milliseconds 300
+  Add-Check "watch --resume restarts a stopped queue and clears the stop request" ((Test-Path $lock) -and -not (Test-Path $stopFile)) "lock: $(Test-Path $lock); stop request still present: $(Test-Path $stopFile); stderr: $((Read-TextFile $restartErr).Trim())"
+} finally {
+  # 同样不能留下常驻进程。
+  $restartStop = Invoke-Taskctl "stop-restart" "stop --tasks-dir tasks"
+  if ($restarted.WaitForExit(240000)) { $restartExit = $restarted.ExitCode } else { Stop-Process -Id $restarted.Id -Force; $restartExit = "killed" }
+}
+Add-Check "the restarted watch drains to exit 0 through stop" ($restartStop.Code -eq 0 -and $restartExit -eq 0) "stop exit $($restartStop.Code); watch exit $restartExit"
+
 Write-Host ""
 $checks | Format-Table -AutoSize -Wrap | Out-String -Width 200 | Write-Host
 Write-Host "watch stdout:"
