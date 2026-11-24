@@ -1,6 +1,6 @@
 # 学习闭环：让记忆到达干活的那一刻
 
-Status: 草案，待所有者确认。2026-11-25 所有者指示"尽可能自动执行，只有完全需要拍板的才问"，因此第一期实现在分支 `feat/learning-loop` 上进行，不合入 `main`。  
+Status: 已实现于分支 feat/learning-loop，待所有者签字；真实后端与真实宫殿未验证。2026-11-25 所有者指示"尽可能自动执行，只有完全需要拍板的才问"，因此第一期实现在分支 `feat/learning-loop` 上进行，不合入 `main`。  
 Date: 2026-11-25  
 Applies to: `main@b587dd9`  
 Related evidence: `docs/superpowers/plans/2026-11-24-handoff.md` §3 第 2、7 项；`docs/reviews/2026-11-24-idtrecon-orchestration-retro.md` P01、P02、P10、P21、P25；`docs/reviews/2026-11-16-real-task-retro.md` §2；`docs/findings/README.md` L0；`docs/superpowers/specs/2026-11-16-review-loop-design.md` §8.9、§11；`docs/backlog.md`「方向（2026-11-17 定）」
@@ -114,7 +114,7 @@ taskctl add ──澄清──► spec.md（已有人签字）
 profile.md / feedback.jsonl ──► 澄清提示词（已有）
         │
         ▼
-runTask ──► 预算护栏（新）──违规──► 发 refused 事件，任务保持 open，不领取
+runTask ──► 预算护栏（新）──违规──► 发 refused 事件，任务保持 open，没有模型会话被启动
         │ 通过
         ▼
 领取 ──► 组装 worker 上下文 ──► worker 会话 ──► 验收 ──► 独立复核 ──► done / 返工 / 等人
@@ -173,7 +173,7 @@ taskctl metrics（新三块） / taskctl models（新） / taskctl recall（新�
 
 - **偏好**：`readProfile` 的全文。超过 2,000 字符时保留最新的条目（文件尾部），并在 journal 记一条 `profile-truncated`。档案只追加、不去重、没有上限，这个上限同时是提醒所有者该整理档案的信号。
 - **纠正**：沿用澄清用的打分和排序，然后只保留和执行有关的条目：`reject --stage worker`、`audit` 判 fail 且归因 worker、带备注的 `accept`。复核误判（`reviewer`）和规格本身错（`clarify`，答案已经进了 spec）不进 worker 提示词。上限 5 条、1,500 字符。
-- 节标题沿用澄清提示词的措辞。偏好是所有者亲口说的话，worker 应当遵守，所以这里不写"不是指令"。
+- 节标题用的是 §6.2 的写法（`## 用户偏好（来自过往确认与纠错，优先遵守）`、`## 同类任务上人工给过的纠正`），不是澄清提示词里的措辞。偏好是所有者亲口说的话，worker 应当遵守，所以这里不写"不是指令"。
 
 ### 6.4 记忆召回（MemPalace）
 
@@ -249,9 +249,11 @@ taskctl metrics（新三块） / taskctl models（新） / taskctl recall（新�
 | `add` 的澄清会话 | 写任何文件之前 | `model`，没配时是后端默认模型 |
 | `split` 的规划会话 | 调规划器之前 | 同上 |
 
-`add --quick` 不调模型，不过护栏。前三条放在 `runTask` 领取锁之前，是因为普通调度、连续批次、常驻看板最终都经过这一个位置，看板运行中新增的任务也会在领取时被查到；没有任务要领就不会触发，所以"空闲的 `run` 零适配器调用"的测试不受影响。目录在一个进程里只取一次。
+`add --quick` 不调模型，不过护栏。前三条放在 `runTask` 领取锁之前，是因为普通调度、连续批次、常驻看板最终都经过这一个位置，看板运行中新增的任务也会在领取时被查到；没有任务要领就不会触发，所以"空闲的 `run` 零适配器调用"的测试不受影响。目录在一个进程里每个目录取一次：目录和默认模型按会话所在的目录读，项目里放一份 `opencode.json` 就会改变两者；读不到或读回空目录的答案不保留。
 
-**拒绝时发生什么。** 发一个 `refused` 事件（控制器日志照常打印并落盘），任务原样保持 `open`，不领取、不 `blocked`、不需要人工恢复，其余任务照常。同一条拒绝理由在一个进程里只报一次。`taskctl run` 有任务被拒时退出码为 1，写法和现有的"控制器出错则退出码为 1"一致。
+领取之后、工作目录预留下来时还会再判一次，对象是领取后重读到的任务：调度器的快照和领取之间被改上 `model:` 的任务不能未经判定就跑。在那条路上被拒时，锁记录和预留都已经写下、又都释放了，同样没有会话启动。
+
+**拒绝时发生什么。** 发一个 `refused` 事件（控制器照常打印这一行；给了 `--log` 就写进那个文件，但不写进任务自己的目录），任务保持 `open`、不 `blocked`、不需要人工恢复，其余任务照常，并且没有模型会话被启动、没有 attempt 记录被写下。领取之前的拒绝什么都不写：不领取，任务目录里不多一个文件。领取之后的那次拒绝（见上）已经写下锁记录和工作目录预留，两者都释放了。同一个任务、同一条拒绝理由在一个进程里只报一次，理由变了会再报。`taskctl run` 有任务被拒时退出码为 1，写法和现有的"控制器出错则退出码为 1"一致。
 
 澄清和规划被拒时，命令打印同一张判定表，以退出码 1 结束，不调模型。`add` 在写任何文件之前被拒，所以什么都不留下；`split` 被拒时任务已经存在，journal 记一条 `split/budget-refused`，不出计划。
 
@@ -267,7 +269,7 @@ taskctl metrics（新三块） / taskctl models（新） / taskctl recall（新�
 
 1. **人工触点。** 每个任务被人工操作了多少次、分别是哪一类。数据来自 journal 里 `human` 阶段的事件（`approved`、`answered`、`accepted`、`rejected`、`retry`）和 `split/applied`。`audit` 现在不写 journal，要补一条 `human/audited`，这只增加可观察性。`learn` 和 `stop` 不属于任何一个任务，这一期不统计。
 2. **等人时长。** 每次人工把一个停住的任务重新推动（`approved`、`answered`、`accepted`、`retry`）时，记下这条事件和它前面一条 journal 事件之间的间隔，按任务求和。它是墙钟时间，包含夜里和周末；输出里要标明这是近似值。`rejected` 和 `audited` 只计数，不计时长。
-3. **按模型的首轮复核通过。** 模型取 `acceptance.json` 里记录的实际使用模型。取 journal 里最后一次 `worker/claimed` 之后的那一段：段里第一条 `review/verdict` 是 pass 记为通过；没有复核事件记为"无复核"。每个模型一行：完成的任务数、首轮复核通过数、无复核数。分母为 0 时显示 `-`。
+3. **按模型的首轮复核通过。** 模型取 `acceptance.json` 里记录的实际使用模型；没有这个文件、或它没记模型的（渲染验收的任务只有 `render.json`），取 `render.json` 的；都没有的记为 `(unknown)`。取 journal 里最后一次 `worker/claimed` 之后的那一段：段里第一条 `review/verdict` 是 pass 记为通过；一条 verdict 紧跟一条 `review/provider-failed` 的不算复核（那是 provider 拒绝的复核回合，判决已降级为 `unclear`），跳过它再看下一条；没有复核事件记为"无复核"。每个模型一行：完成的任务数、首轮复核通过数、无复核数。分母为 0 时显示 `-`。
 
 这一块就是设计稿 P3 写的"人工分钟数下降可测"，也是以后回答"我到底需不需要贵模型"的唯一数据来源。
 
