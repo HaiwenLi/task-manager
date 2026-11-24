@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendAudit, readAudits, summarizeAudits } from "../src/audit.js";
 import { runCli } from "../src/cli.js";
+import { readJournal } from "../src/journal.js";
 import { TaskStore } from "../src/task-store.js";
 import { serializeTaskFile } from "../src/task-file.js";
 import { buildTaskFile } from "./helpers/task-fixture.js";
@@ -72,6 +73,24 @@ describe("taskctl audit", () => {
     ).toBe(0);
     expect((await new TaskStore(tasksDir).get("005-e")).status).toBe("done");
     expect((await readAudits(tasksDir))[0]).toMatchObject({ verdict: "fail", stage: "reviewer", note: "漏了边界条件" });
+  });
+
+  it("leaves one journal line for the spot check, which the human-touch metrics count", async () => {
+    const { tasksDir } = await setup();
+    await seedTask(tasksDir, "007-g", "done");
+    expect(
+      await runCli(["audit", "--task", "007-g", "--verdict", "fail", "--stage", "worker", "--note", "按钮宽度仍写死", "--tasks-dir", tasksDir], silent),
+    ).toBe(0);
+    const journal = await readJournal(tasksDir, "007-g");
+    expect(journal).toHaveLength(1);
+    expect(journal[0]).toMatchObject({ stage: "human", event: "audited", detail: "fail worker: 按钮宽度仍写死" });
+  });
+
+  it("journals the verdict and the stage when the spot check has no note", async () => {
+    const { tasksDir } = await setup();
+    await seedTask(tasksDir, "008-h", "done");
+    expect(await runCli(["audit", "--task", "008-h", "--verdict", "pass", "--stage", "reviewer", "--tasks-dir", tasksDir], silent)).toBe(0);
+    expect((await readJournal(tasksDir, "008-h"))[0]).toMatchObject({ stage: "human", event: "audited", detail: "pass reviewer" });
   });
 
   it("refuses to audit a task that is not done", async () => {

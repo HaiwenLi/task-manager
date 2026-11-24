@@ -81,16 +81,99 @@ export function summarizeFlow(input: FlowInput): string[] {
   ];
 }
 
-/** {@link summarizeFlow} over a board: every task's journal and classification record. */
-export async function readFlow(tasksDir: string, tasks: FlowInput["tasks"]): Promise<string[]> {
+/** What a person had to do with one task: how often, of which kind, and how long the task waited for them. */
+export type HumanTouch = { task: string; byEvent: Record<string, number>; total: number; waitedMs: number };
+
+/** The first review of the tasks one model finished: how many passed it, and how many never had one. */
+export type ModelFirstPass = { model: string; tasks: number; firstReviewPassed: number; noReview: number };
+
+/** The human events that push a stopped task on again. Every other touch is counted, and is not waited for. */
+const PUSHED_ON: ReadonlySet<string> = new Set(["approved", "answered", "accepted", "retry"]);
+
+/**
+ * Where a person had to step in, per task, and how long the task waited for
+ * them: the cost the flow metrics above cannot see, since a task can pass
+ * first time and still have cost a signature, an answer and an acceptance.
+ *
+ * A human touch is a journal line with stage `human` — a draft approved, a
+ * question answered, work accepted or sent back, a spot check (`audited`), a
+ * retry — or a split plan that was `applied`. `total` counts them, and
+ * `byEvent` counts them by event, in the order the journal first has each.
+ *
+ * `waitedMs` is how long a person was waited for: for each touch that pushes
+ * a stopped task on again (`approved`, `answered`, `accepted`, `retry`) the
+ * time since the line before it, when there is one and both times parse. A
+ * rejection or a spot check sends nothing on, so it is counted and adds no
+ * time. It is wall-clock time, nights and weekends included, so it overstates
+ * what a person actually spent: an approximation, which the output says so.
+ *
+ * Tasks come in the order of `journals`, and a task nobody touched is not
+ * listed.
+ */
+export function humanTouches(journals: ReadonlyMap<string, readonly JournalLine[]>): HumanTouch[] {
+  const touches: HumanTouch[] = [];
+  for (const [task, journal] of journals) {
+    const byEvent: Record<string, number> = {};
+    let total = 0;
+    let waitedMs = 0;
+    journal.forEach((line, index) => {
+      if (line.stage !== "human" && !(line.stage === "split" && line.event === "applied")) return;
+      byEvent[line.event] = (byEvent[line.event] ?? 0) + 1;
+      total += 1;
+      const previous = journal[index - 1];
+      if (line.stage !== "human" || !PUSHED_ON.has(line.event) || previous === undefined) return;
+      const waited = Date.parse(line.at) - Date.parse(previous.at);
+      if (Number.isFinite(waited)) waitedMs += waited;
+    });
+    if (total > 0) touches.push({ task, byEvent, total, waitedMs });
+  }
+  return touches;
+}
+
+/**
+ * How often the first review passed, per model: what an owner changes models
+ * by. The caller passes finished tasks only, each with the model its
+ * acceptance ran on (`acceptance.json`), or `null` when no record says; a
+ * null model is reported as `(unknown)`.
+ *
+ * The first review is the first `review`/`verdict` line of the part of the
+ * journal after its last `worker`/`claimed` — the attempt that finished the
+ * task — or of the whole journal when nothing was claimed. A verdict whose
+ * detail begins with `pass` counts as passed (tolerated external changes
+ * follow it: `pass external=2`); any other verdict counts as not passed; no
+ * verdict at all counts as `noReview`, a task that finished on a mechanical
+ * or render check and never saw a reviewer. A model appears once, where it
+ * first appears in `rows`.
+ */
+export function modelFirstPass(rows: readonly { model: string | null; journal: readonly JournalLine[] }[]): ModelFirstPass[] {
+  const byModel = new Map<string, ModelFirstPass>();
+  for (const { model, journal } of rows) {
+    const name = model ?? "(unknown)";
+    const lastClaim = journal.findLastIndex((line) => line.stage === "worker" && line.event === "claimed");
+    const verdict = journal.slice(lastClaim + 1).find((line) => line.stage === "review" && line.event === "verdict");
+    const row = byModel.get(name) ?? { model: name, tasks: 0, firstReviewPassed: 0, noReview: 0 };
+    row.tasks += 1;
+    if (verdict === undefined) row.noReview += 1;
+    else if (verdict.detail.startsWith("pass")) row.firstReviewPassed += 1;
+    byModel.set(name, row);
+  }
+  return [...byModel.values()];
+}
+
+/**
+ * {@link summarizeFlow}'s input, read from a board: every task's journal and
+ * classification record. The journals come back with it, so the other views
+ * that need them ({@link humanTouches}) cost a board no second read.
+ */
+export async function readFlowInput(tasksDir: string, tasks: FlowInput["tasks"]): Promise<FlowInput> {
   const read = async (id: string): Promise<[JournalLine[], ClassificationSummary | null]> =>
     [await readJournal(tasksDir, id), await readClassification(tasksDir, id)];
   const entries = await Promise.all(tasks.map(async (task) => [task.id, ...(await read(task.id))] as const));
-  return summarizeFlow({
+  return {
     tasks,
     journals: new Map(entries.map(([id, journal]) => [id, journal])),
     classifications: new Map(entries.map(([id, , record]) => [id, record])),
-  });
+  };
 }
 
 /**

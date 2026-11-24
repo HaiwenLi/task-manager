@@ -1,11 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter } from "../src/adapters/types.js";
 import type { AcceptanceResult } from "../src/acceptance.js";
-import { type JournalLine, readJournal } from "../src/journal.js";
-import { summarizeFlow } from "../src/metrics.js";
+import { appendJournal, type JournalLine, readJournal } from "../src/journal.js";
+import { humanTouches, modelFirstPass, summarizeFlow } from "../src/metrics.js";
 import type { ReviewResult } from "../src/review.js";
 import { writeRuntime } from "../src/runtime.js";
 import { runCli } from "../src/cli.js";
@@ -31,6 +31,7 @@ afterEach(async () => {
 });
 
 const line = (stage: string, event: string, detail = ""): JournalLine => ({ at: "2026-11-24T00:00:00Z", stage, event, detail });
+const at = (time: string, stage: string, event: string, detail = ""): JournalLine => ({ at: time, stage, event, detail });
 
 describe("summarizeFlow", () => {
   it("separates first-pass user acceptance from automatic and user-requested rework", () => {
@@ -186,5 +187,168 @@ describe("taskctl metrics", () => {
     const text = await metrics();
     expect(text).toMatch(/接入信息\s+needs-information 1 \/ 2（50%）/);
     expect(text).toMatch(/分类升级\s+1 \/ 2/);
+  });
+});
+
+/** 捕获 CLI 输出的注入 seam。 */
+function capture(): {
+  lines: string[];
+  errors: string[];
+  deps: { log: (line: string) => void; err: (line: string) => void };
+} {
+  const lines: string[] = [];
+  const errors: string[] = [];
+  return {
+    lines,
+    errors,
+    deps: {
+      log: (line) => lines.push(line),
+      err: (line) => errors.push(line),
+    },
+  };
+}
+
+describe("humanTouches", () => {
+  it("counts human touches per task and kind", () => {
+    const touches = humanTouches(new Map([["a", [
+      at("2026-01-01T00:00:00Z", "clarify", "spec-drafted"),
+      at("2026-01-01T01:00:00Z", "human", "approved"),
+      at("2026-01-01T02:00:00Z", "review", "verdict", "fail x"),
+      at("2026-01-01T03:00:00Z", "human", "rejected", "worker"),
+      at("2026-01-01T04:00:00Z", "split", "applied"),
+    ]]]));
+    expect(touches).toEqual([{ task: "a", byEvent: { approved: 1, rejected: 1, applied: 1 }, total: 3, waitedMs: 3_600_000 }]);
+  });
+
+  it("skips tasks nobody touched", () => {
+    expect(humanTouches(new Map([["a", [line("worker", "done")]]]))).toEqual([]);
+  });
+
+  it("counts a spot check as a touch, and waits only for a push that has a time and a line before it", () => {
+    const touches = humanTouches(new Map([["a", [
+      at("", "human", "accepted"),                                        // the first line: nothing to wait from
+      at("not a time", "human", "audited", "fail worker: 漏了边界条件"),     // counted, like a rejection; never waited for
+      at("2026-01-01T00:10:00Z", "worker", "claimed"),
+      at("2026-01-01T00:40:00Z", "human", "retry", "archived to x"),      // a retry pushes the task on again: half an hour
+      at("2026-01-01T00:40:30Z", "split", "applied"),                     // a touch, never a wait
+    ]]]));
+    expect(touches).toEqual([{ task: "a", byEvent: { accepted: 1, audited: 1, retry: 1, applied: 1 }, total: 4, waitedMs: 30 * 60_000 }]);
+  });
+});
+
+describe("modelFirstPass", () => {
+  it("counts a first review pass per model", () => {
+    const rows = [
+      { model: "plan/m", journal: [line("worker", "claimed"), line("review", "verdict", "pass"), line("review", "done")] },
+      { model: "plan/m", journal: [line("worker", "claimed"), line("worker", "rework"), line("worker", "claimed"), line("review", "verdict", "pass external=2")] },
+      { model: "zen/p", journal: [line("worker", "claimed"), line("review", "verdict", "fail c1")] },
+      { model: null, journal: [line("worker", "claimed"), line("review", "done")] },
+    ];
+    expect(modelFirstPass(rows)).toEqual([
+      { model: "plan/m", tasks: 2, firstReviewPassed: 2, noReview: 0 },
+      { model: "zen/p", tasks: 1, firstReviewPassed: 0, noReview: 0 },
+      { model: "(unknown)", tasks: 1, firstReviewPassed: 0, noReview: 1 },
+    ]);
+  });
+
+  it("judges the attempt that finished the task: a verdict before its last claim is another attempt's", () => {
+    // Each journal holds a failed review, a rework, a new claim and a second review. Only the second attempt's
+    // first verdict decides, so the one whose last attempt passed is the one first review passed.
+    const rows = [
+      { model: "plan/m", journal: [line("worker", "claimed"), line("review", "verdict", "fail c1"), line("worker", "rework"), line("worker", "claimed"), line("review", "verdict", "pass")] },
+      { model: "zen/p", journal: [line("worker", "claimed"), line("review", "verdict", "pass"), line("review", "rework"), line("worker", "claimed"), line("review", "verdict", "fail c1")] },
+    ];
+    expect(modelFirstPass(rows)).toEqual([
+      { model: "plan/m", tasks: 1, firstReviewPassed: 1, noReview: 0 },
+      { model: "zen/p", tasks: 1, firstReviewPassed: 0, noReview: 0 },
+    ]);
+  });
+
+  it("counts a finished task whose journal holds no verdict as not reviewed", () => {
+    // Before any claim, and after one: neither segment has a review verdict.
+    expect(modelFirstPass([{ model: "plan/m", journal: [] }, { model: "plan/m", journal: [line("worker", "claimed")] }]))
+      .toEqual([{ model: "plan/m", tasks: 2, firstReviewPassed: 0, noReview: 2 }]);
+  });
+});
+
+describe("taskctl metrics: human touches and first review pass by model", () => {
+  /** `taskctl.json` under the temp root, naming the tasks dir. */
+  async function writeConfig(): Promise<string> {
+    const path = join(root, "taskctl.json");
+    await writeFile(path, JSON.stringify({ tasksDir: tasks }), "utf8");
+    return path;
+  }
+
+  /** A finished task: its file, and nothing else. */
+  async function seedDone(id: string): Promise<void> {
+    await writeFile(join(tasks, `${id}.md`), serializeTaskFile(buildTaskFile({ id, status: "done" })), "utf8");
+  }
+
+  /**
+   * The journal, written by `appendJournal`, which stamps each line with the
+   * clock: so the clock is moved to the time of each line before it is
+   * appended. Only `Date` is faked; the writes themselves stay real.
+   */
+  async function journalAt(id: string, ...entries: ReadonlyArray<readonly [time: string, stage: string, event: string, detail?: string]>): Promise<void> {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      for (const [time, stage, event, detail] of entries) {
+        vi.setSystemTime(new Date(time));
+        await appendJournal(tasks, id, { stage, event, ...(detail === undefined ? {} : { detail }) });
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it("the metrics command shows both views", async () => {
+    // a done task "a"; its journal an hour between lines: the spec drafted, a person approving it, the review passing, the person accepting
+    await seedDone("a");
+    await journalAt("a",
+      ["2026-01-01T00:00:00Z", "clarify", "spec-drafted", "criteria=2"],
+      ["2026-01-01T01:00:00Z", "human", "approved", "criteria=2"],
+      ["2026-01-01T02:00:00Z", "review", "verdict", "pass"],
+      ["2026-01-01T03:00:00Z", "human", "accepted"],
+    );
+    // acceptance.json with model "plan/m"
+    await writeRuntime(tasks, "a", "acceptance.json", { command: "check", passed: true, exitCode: 0, output: "ok", model: "plan/m" });
+    const config = await writeConfig();
+    const cap = capture();   // copied from tests/cli.test.ts:65-80
+    expect(await runCli(["metrics", "--config", config], cap.deps)).toBe(0);
+    const text = cap.lines.join("\n");
+    expect(text).toContain("人工触点");
+    expect(text).toMatch(/a\s+共 2 次/);
+    expect(text).toContain("等人 2h0m");
+    expect(text).toContain("等人时长为墙钟时间，包含夜间和周末，是近似值");
+    expect(text).toContain("按模型的首轮复核通过");
+    expect(text).toMatch(/plan\/m\s+任务 1\s+首轮通过 1\s+未复核 0\s+首轮通过率 100%/);
+    // The whole of both lines: each kind of touch by name, in the order the journal has them, and the two hours
+    // a person was waited for, one before the approval and one before the acceptance.
+    expect(text).toContain("a  共 2 次（approved×1, accepted×1）  等人 2h0m");
+  });
+
+  it("names no model for a task whose acceptance record is torn or says none", async () => {
+    await seedDone("a");
+    await seedDone("b");
+    // a was accepted before the model was recorded; b's record was torn by a write that did not finish.
+    for (const id of ["a", "b"]) await mkdir(join(tasks, id), { recursive: true });
+    await writeRuntime(tasks, "a", "acceptance.json", { command: "check", passed: true, exitCode: 0 });
+    await mkdir(join(tasks, "b"), { recursive: true });
+    await writeFile(join(tasks, "b", "acceptance.json"), "{ torn write", "utf8");
+    const cap = capture();
+    expect(await runCli(["metrics", "--config", await writeConfig()], cap.deps)).toBe(0);
+    expect(cap.lines.slice(-2)).toEqual(["按模型的首轮复核通过", "(unknown)  任务 2  首轮通过 0  未复核 2  首轮通过率 -"]);
+  });
+
+  it("says none where nobody touched a task, and shows a dash and an unknown model where nothing was reviewed or recorded", async () => {
+    // An old run: the journal has a claim and no verdict, and there is no acceptance record to say which model ran.
+    await seedDone("a");
+    await appendJournal(tasks, "a", { stage: "worker", event: "claimed" });
+    const cap = capture();
+    expect(await runCli(["metrics", "--config", await writeConfig()], cap.deps)).toBe(0);
+    const touches = cap.lines.indexOf("人工触点");
+    expect(touches).toBeGreaterThanOrEqual(0);
+    expect(cap.lines.slice(touches, touches + 3)).toEqual(["人工触点", "等人时长为墙钟时间，包含夜间和周末，是近似值", "（无）"]);
+    expect(cap.lines.slice(-2)).toEqual(["按模型的首轮复核通过", "(unknown)  任务 1  首轮通过 0  未复核 1  首轮通过率 -"]);
   });
 });

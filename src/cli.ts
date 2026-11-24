@@ -18,7 +18,7 @@ import { createCoalescedRefresh, renderBoardMarkdown, renderBoardTable, writeBoa
 import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
 import { readRelevantFeedback, recordTaskFeedback, type FeedbackEvent } from "./feedback.js";
-import { readFlow } from "./metrics.js";
+import { humanTouches, modelFirstPass, readFlowInput, summarizeFlow, type HumanTouch, type ModelFirstPass } from "./metrics.js";
 import { clearQuestions, questionsPath, readQuestions, writeQuestions } from "./questions.js";
 import { waitReason } from "./eligibility.js";
 import {
@@ -1322,6 +1322,14 @@ async function auditCommand(flags: Map<string, string>, log: (line: string) => v
     ...(note === undefined ? {} : { note }),
     ...(verdict === "pass" ? { highlight: true } : {}),
   });
+  // A spot check is time a person spent on the task. The audit log keeps the
+  // verdict; this line lets the metrics count the touch (`humanTouches` in
+  // `./metrics.ts`). It is all the journal gains: the status does not move.
+  await appendJournal(tasksDir, id, {
+    stage: "human",
+    event: "audited",
+    detail: note === undefined ? `${verdict} ${stage}` : `${verdict} ${stage}: ${note}`,
+  });
   if (note !== undefined) {
     await recordHumanFeedback(tasksDir, task, log, { action: "audit", verdict, stage, note });
   }
@@ -1329,14 +1337,78 @@ async function auditCommand(flags: Map<string, string>, log: (line: string) => v
   return 0;
 }
 
-/** `taskctl metrics` — which stage a human keeps failing, and how often work comes back, and whose doing it was. */
+/** `taskctl metrics` — which stage a human keeps failing, how often work comes back and whose doing it was, where a person had to step in, and how each model's first review fares. */
 async function metricsCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
   const tasksDir = await tasksDirFor(flags);
   const tasks = await new TaskStore(tasksDir).list();
-  for (const line of [...summarizeAudits(await readAudits(tasksDir)), ...await readFlow(tasksDir, tasks)]) {
+  // The journals are read once: the flow and the two views under it are all computed from them.
+  const input = await readFlowInput(tasksDir, tasks);
+  // Only a finished task says anything about how its model's first review went.
+  const firstPass = modelFirstPass(await Promise.all(
+    tasks.filter((task) => task.status === "done").map(async (task) => ({
+      model: await acceptanceModel(tasksDir, task.id),
+      journal: input.journals.get(task.id) ?? [],
+    })),
+  ));
+  for (const line of [
+    ...summarizeAudits(await readAudits(tasksDir)),
+    ...summarizeFlow(input),
+    ...humanTouchSection(humanTouches(input.journals)),
+    ...firstPassSection(firstPass),
+  ]) {
     log(line);
   }
   return 0;
+}
+
+/**
+ * The model a finished task's acceptance ran on, from its `acceptance.json`;
+ * `null` when the file or the field is absent. A record too torn to read is
+ * one that says nothing (as `readClassification` in `./metrics.ts` reads its
+ * own): the task is credited to no model, and the metrics still print.
+ */
+async function acceptanceModel(tasksDir: string, id: string): Promise<string | null> {
+  let record: { model?: unknown } | null;
+  try {
+    record = await readRuntime<{ model?: unknown }>(tasksDir, id, "acceptance.json");
+  } catch (err) {
+    if (err instanceof SyntaxError) return null;
+    throw err;
+  }
+  return typeof record?.model === "string" ? record.model : null;
+}
+
+/**
+ * The section `人工触点`: what the waiting time is — an approximation, said
+ * every time — then one line per task a person touched, its touches by kind
+ * and how long it waited for them; `（无）` when there is no such task.
+ */
+function humanTouchSection(touches: readonly HumanTouch[]): string[] {
+  const byKind = (byEvent: Record<string, number>): string =>
+    Object.entries(byEvent).map(([event, count]) => `${event}×${count}`).join(", ");
+  return [
+    "人工触点",
+    "等人时长为墙钟时间，包含夜间和周末，是近似值",
+    ...(touches.length === 0 ? ["（无）"] : touches.map(({ task, byEvent, total, waitedMs }) => {
+      const minutes = Math.floor(waitedMs / 60_000);
+      return `${task}  共 ${total} 次（${byKind(byEvent)}）  等人 ${Math.floor(minutes / 60)}h${minutes % 60}m`;
+    })),
+  ];
+}
+
+/**
+ * The section `按模型的首轮复核通过`: one line per model. The rate is taken
+ * over the tasks that had a review at all, and is `-` when there are none.
+ */
+function firstPassSection(rows: readonly ModelFirstPass[]): string[] {
+  return [
+    "按模型的首轮复核通过",
+    ...rows.map(({ model, tasks, firstReviewPassed, noReview }) => {
+      const reviewed = tasks - noReview;
+      const rate = reviewed === 0 ? "-" : `${Math.round((100 * firstReviewPassed) / reviewed)}%`;
+      return `${model}  任务 ${tasks}  首轮通过 ${firstReviewPassed}  未复核 ${noReview}  首轮通过率 ${rate}`;
+    }),
+  ];
 }
 
 function parseStage(value: string): AuditStage {
