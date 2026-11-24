@@ -23,9 +23,7 @@ export function batchEligibility(
   task: Task,
   board: Task[],
   earlier: ReadonlySet<string>,
-  baseWorkdir: string,
 ): string | null {
-  void baseWorkdir;
   if (task.status !== "open") return `task ${task.id}: status ${task.status} is not open`;
   const execution = task.execution ?? (task.complexity === "simple" ? "continuous" : "iterative");
   if (execution !== "continuous") return `task ${task.id}: execution is not continuous`;
@@ -83,7 +81,7 @@ export async function validateBatchSelection(
       continue;
     }
     selected.push(task);
-    const ineligible = batchEligibility(task, board, earlier, cfg.workdir);
+    const ineligible = batchEligibility(task, board, earlier);
     if (ineligible !== null) issues.push(ineligible);
     earlier.add(id);
 
@@ -129,7 +127,7 @@ export async function selectAutomaticBatch(
 
   for (const task of candidates) {
     if (selected.length >= maximum) break;
-    if (batchEligibility(task, board, earlier, cfg.workdir) !== null) break;
+    if (batchEligibility(task, board, earlier) !== null) break;
     const workdir = taskWorkdir(cfg.workdir, task);
     if (expectedWorkdir !== undefined && workdir !== expectedWorkdir) break;
     if (await lockLive(cfg.tasksDir, task.id, cfg.lockTtlMs)) break;

@@ -9,7 +9,7 @@ import { writeRuntime, type AttemptRecord } from "../src/runtime.js";
 import { serializeTaskFile, type Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
 import { stopRequestPath, watchQueue, type WatchFs } from "../src/watch.js";
-import type { WorkerConfig, WorkerDeps } from "../src/worker.js";
+import type { WorkerConfig, WorkerDeps, WorkerEvent } from "../src/worker.js";
 import { buildTaskFile } from "./helpers/task-fixture.js";
 
 let root: string;
@@ -21,6 +21,7 @@ let cfg: WorkerConfig;
 let turns: Array<{ id: string; sessionId?: string; text: string }>;
 let probeCalls: string[];
 let reviewed: string[];
+let events: WorkerEvent[];
 let listeners: Map<string, () => void>;
 let onTurn: ((id: string) => Promise<void>) | undefined;
 
@@ -77,6 +78,7 @@ function deps(): WorkerDeps {
         summary: "ok",
       };
     },
+    onEvent: (event) => { events.push(event); },
   };
 }
 
@@ -96,6 +98,10 @@ async function waitForAsync(check: () => Promise<boolean>, timeoutMs = 2_000): P
 async function requestStop(): Promise<void> {
   await writeFile(stopRequestPath(tasks), new Date().toISOString(), "utf8");
   listeners.get(control)?.();
+}
+
+function finished(...ids: string[]): boolean {
+  return ids.every((id) => events.some((event) => event.taskId === id && event.type === "done"));
 }
 
 beforeEach(async () => {
@@ -119,6 +125,7 @@ beforeEach(async () => {
   turns = [];
   probeCalls = [];
   reviewed = [];
+  events = [];
   listeners = new Map();
   onTurn = undefined;
 });
@@ -156,7 +163,7 @@ describe("watch automatic batches", () => {
     await seed(task("b"));
     const running = watchQueue(cfg, deps(), { watchFs, fallbackMs: 1_000 });
     try {
-      await waitForAsync(async () => (await store.get("a")).status === "done" && (await store.get("b")).status === "done");
+      await waitForAsync(async () => finished("a", "b"));
     } finally {
       await requestStop();
       await running;
@@ -172,7 +179,7 @@ describe("watch automatic batches", () => {
     await seed(task("b"));
     const running = watchQueue(cfg, deps(), { watchFs, fallbackMs: 1_000 });
     try {
-      await waitForAsync(async () => (await store.get("a")).status === "done" && (await store.get("b")).status === "done");
+      await waitForAsync(async () => finished("a", "b"));
     } finally {
       await requestStop();
       await running;
@@ -188,7 +195,7 @@ describe("watch automatic batches", () => {
     await seed(task("c"));
     const running = watchQueue(cfg, deps(), { watchFs, fallbackMs: 1_000 });
     try {
-      await waitForAsync(async () => (await store.get("b")).status === "done" && (await store.get("c")).status === "done");
+      await waitForAsync(async () => finished("b", "c"));
     } finally {
       await requestStop();
       await running;
@@ -215,8 +222,7 @@ describe("watch automatic batches", () => {
     await seed(task("c"));
     const running = watchQueue(cfg, deps(), { watchFs, fallbackMs: 1_000 });
     try {
-      await waitForAsync(async () => (await store.get("a")).status === "done"
-        && (await store.get("b")).status === "done" && (await store.get("c")).status === "done");
+      await waitForAsync(async () => finished("a", "b", "c"));
     } finally {
       await requestStop();
       await running;

@@ -48,6 +48,7 @@ npx tsx src/main.ts <子命令> [参数]
 | `maxSessionsPerTask` | number | `20` | 一个任务全会话链的长度上限（含交接与重试） |
 | `maxTurnsPerSession` | number | `40` | 单会话内工作回合数上限 |
 | `parallel` | number | `2` | 同时执行的任务数；同一工作目录仍只跑一个 |
+| `batchMaxTasks` | number | `5` | watch 自动连续批次的任务数上限；`1` = 关闭自动成批，手动 `run --batch` 仍可用 |
 | `maxReviewRounds` | number | `2` | 复核失败几轮后 `blocked` |
 | `reviewerModel` | string | 后端默认 | 复核会话单独用的模型；**不设置时用 opencode 自己的默认模型**，不会继承 `model` |
 | `reviewerEffort` | string | 同 `effort` | 复核会话的努力档 |
@@ -176,6 +177,9 @@ taskctl split --task <id> [--apply]   把 draft 的复杂任务拆成子任务�
 taskctl answer --task <id> --file <answers.md>   回答 questions.md（needs-information 时）
 taskctl approve --task <id> 签字 → open
 taskctl run                 并发执行 → 验收命令 → 独立复核 → done / 返工 / 等放行
+taskctl run --batch C,B,A   严格按给定顺序跑连续批次；每项仍独立领取、验收、留证
+taskctl watch --config taskctl.json [--resume]   常驻看板；新任务自动调度，合格任务自动成批
+taskctl stop --tasks-dir tasks   请求优雅收尾；当前 attempt 结算后退出，不强杀 worker
 taskctl board               总台账（同时重写 .taskctl/board.md，可用浏览器打开）
 taskctl report --task <id>  单任务证据页
 taskctl accept [--note "…"] 人工放行，可附一条给下次的备注
@@ -269,6 +273,34 @@ npx tsx src/main.ts run [--log <file>] [--config taskctl.json]
 同一实际工作目录（含路径别名）不可并行执行；共享 Git common directory 的 worktree 暂按串行处理。当前不自动创建/合并 worktree。验收前后对源码产物做摘要；验收命令改变产物会要求复核，不会把旧检查套到新版本。摘要排除 Git 内部、依赖目录及任务运行时目录（另可用 `artifactIgnore` 忽略任务自产物的路径，见下节）；详见 `src/workspace.ts`。
 
 **控制器日志（`--log`）**：`--log <file>` 把每个 `[<id>] …` 事件行连时间戳 tee 进指定文件（stdout 照常输出；文件目录不存在会自动创建）。不指定时，每个任务的事件行缺省写进它自己的 `tasks/<id>/logs/run-<ISO>.log`（ISO 是本次 run 的启动时刻，`:` 换成 `-` 以便 Windows 文件名）。这取代了以前"外部 `Tee-Object` 到仓库根目录"的做法——控制器日志从此落在任务目录里，不再污染工作区。日志写失败只忽略，不会拖垮 run。
+
+### taskctl run --batch — 连续批次
+
+```bash
+npx tsx src/main.ts run --batch C,B,A [--log <file>] [--config taskctl.json]
+```
+
+批次只是调度策略，不是把多项任务合成一个“大任务”。它严格按命令行给出的 `C,B,A` 顺序执行，先整选校验，再从普通 `run` 队列之外**只领取这些任务**。每项都必须：`execution: continuous`（或从 `simple` 推导）、同一解析后的 workdir、`verify: mechanical` / `render`、普通风险、无 `human_check`、依赖已 `done` 或排在所选顺序的前面，并且没有活跃或未结算的旧执行。高风险、人工门禁、跨 workdir、显式 iterative 会被拒绝，不会静默放宽。
+
+每个任务仍然单独领锁、保存定义快照、跑自己的验收和必要的复核，写自己的 `acceptance.json`、session 与 usage 增量；验收**不会**推迟到批次末尾。每次领取前还会重读看板并比较原定义和 workdir，中途改动在被改任务领取前拒绝。复核把当前任务退回 `open` 时，先把当前任务迭代完；`blocked` / `awaiting-human` / 所有权冲突会停止批次，后续任务不被领取。
+
+上一任务干净结算后，只有实际 model 与 canonical workdir 都一致、worker session 标记 clean、后端探测返回 `reusable` 时，下一任务才续用该 session。model 不匹配或探测 `unavailable` 会记 journal 后新开；`active` 会阻塞待 reconcile，不会启动竞争 worker。
+
+### taskctl watch / stop — 常驻队列与优雅停止
+
+```bash
+npx tsx src/main.ts watch --config taskctl.json          # 常驻调度
+npx tsx src/main.ts watch --config taskctl.json --resume # 明确清除上次 stop 请求后启动
+npx tsx src/main.ts stop --tasks-dir tasks              # 另一个终端：请求优雅收尾
+```
+
+watch 用文件事件（250ms 去抖）和 30 秒兜底扫描发现新任务；空转不做模型调用、完整产物摘要或看板重写。未完成的非活跃 `running` 任务优先，随后按看板顺序处理就绪任务；`draft`、`awaiting-human`、`blocked` 仍留在看板上，但不会绕过门禁执行。
+
+至少两个连续合格任务时自动成批，上限是 `batchMaxTasks`（默认 5）。自动成批只取 `ready()` 队首的**连续合格前缀**，不会让后面的任务越过更早的高风险、人工门禁或其它不合格任务；单个任务直接普通执行，`batchMaxTasks: 1` 关闭自动成批。批次进行中新到的任务等下一个调度边界，不会插进当前选择。
+
+一个看板只有一个 watch 所有者，记录在 `.taskctl/watch.lock`，带完整 owner generation 和 heartbeat。第二个活跃 watcher 会直接拒绝；stale / 损坏记录只诊断，不自动接管，确认旧进程已消失后需人工清理。
+
+`stop` 只写 `.taskctl/stop.requested`，不发送进程树终止信号。watch 不再领取新任务，让当前 worker attempt 安全结算并释放记录后退出；stop 文件保留，因此下次启动必须显式 `watch --resume`。恢复清 stop 的动作发生在取得 watch 锁之后，第二个 watcher 不能清掉正在运行者的停止请求。
 
 ### 产物卫生：LOG_DIR 约定与回合后清扫
 

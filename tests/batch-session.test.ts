@@ -192,6 +192,24 @@ describe("cross-task batch sessions", () => {
     expect(await readRuntime(tasks, "b", "acceptance.json")).toBeNull();
   });
 
+  it("stops on a real awaiting-human outcome and leaves later tasks unclaimed", async () => {
+    await seed(
+      task("a"),
+      task("b", { quick: true, acceptance: undefined, criteria: [] }),
+      task("c"),
+    );
+
+    const result = await runBatch(cfg, deps(), ["a", "b", "c"]);
+
+    expect(result.done).toEqual(["a"]);
+    expect(result.stoppedAt).toBe("b");
+    expect(result.outcome).toBe("awaiting-human");
+    expect(result.pending).toEqual(["c"]);
+    expect(turns.map((turn) => turn.id)).toEqual(["a", "b"]);
+    expect((await store.get("b")).status).toBe("awaiting-human");
+    expect((await store.get("c")).status).toBe("open");
+  });
+
   it("does not offer a dirty previous worker fact to the probe", async () => {
     await seed(task("a"), task("b"));
     const run: BatchRunOptions["run"] = async (runCfg, runDeps, current, workerId, options) => {

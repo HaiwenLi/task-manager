@@ -16,8 +16,6 @@ import type { Task } from "../src/task-file.js";
 import type { WorkerConfig, WorkerDeps } from "../src/worker.js";
 import { buildTaskFile } from "./helpers/task-fixture.js";
 
-const base = join(tmpdir(), "taskctl-batch-base");
-
 function eligible(id: string, overrides: Partial<Task> = {}): Task {
   return buildTaskFile({
     id,
@@ -35,8 +33,8 @@ describe("batchEligibility", () => {
     const a = eligible("a", { model: "w/one" });
     const b = eligible("b", { model: "w/two", dependsOn: ["a"] });
     const board = [b, a];
-    expect(batchEligibility(a, board, new Set(), base)).toBeNull();
-    expect(batchEligibility(b, board, new Set(["a"]), base)).toBeNull();
+    expect(batchEligibility(a, board, new Set())).toBeNull();
+    expect(batchEligibility(b, board, new Set(["a"]))).toBeNull();
   });
 
   it.each([
@@ -47,21 +45,21 @@ describe("batchEligibility", () => {
     ["a human gate", { humanCheck: true }, "human_check"],
   ] as Array<[string, Partial<Task>, string]>)("rejects %s", (_name, overrides, reason) => {
     const task = eligible("a", overrides);
-    expect(batchEligibility(task, [task], new Set(), base)).toContain(reason);
+    expect(batchEligibility(task, [task], new Set())).toContain(reason);
   });
 
   it("rejects a task below a draft ancestor", () => {
     const parent = eligible("parent", { status: "draft" });
     const child = eligible("child", { parentId: parent.id });
-    expect(batchEligibility(child, [child, parent], new Set(), base)).toContain("draft ancestor parent");
+    expect(batchEligibility(child, [child, parent], new Set())).toContain("draft ancestor parent");
   });
 
   it("requires every dependency to be done or earlier in the selection", () => {
     const a = eligible("a");
     const b = eligible("b", { dependsOn: ["a"] });
-    expect(batchEligibility(b, [a, b], new Set(), base)).toContain("dependency a");
-    expect(batchEligibility(b, [a, b], new Set(["a"]), base)).toBeNull();
-    expect(batchEligibility(b, [{ ...a, status: "done" }, b], new Set(), base)).toBeNull();
+    expect(batchEligibility(b, [a, b], new Set())).toContain("dependency a");
+    expect(batchEligibility(b, [a, b], new Set(["a"]))).toBeNull();
+    expect(batchEligibility(b, [{ ...a, status: "done" }, b], new Set())).toBeNull();
   });
 });
 

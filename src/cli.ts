@@ -31,7 +31,7 @@ import { taskWorkdir } from "./scheduler.js";
 import { resolveArtifacts } from "./artifacts.js";
 import { runSelfCheck } from "./self-check.js";
 import { runBatch } from "./batch.js";
-import { stopRequestPath, watchQueue } from "./watch.js";
+import { stopRequestPath, watchQueue, type WatchOptions } from "./watch.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
 export type CliDeps = {
@@ -39,6 +39,8 @@ export type CliDeps = {
   acceptance?: (command: string, cwd: string) => Promise<AcceptanceResult>;
   /** Test seam for review-only recovery without starting a reviewer agent. */
   review?: WorkerDeps["review"];
+  /** Test seam for watch filesystem events and timing; production leaves it absent. */
+  watch?: WatchOptions;
   now?: () => Date;
   log?: (line: string) => void;
   err?: (line: string) => void;
@@ -337,7 +339,7 @@ async function watchCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
         log(`[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`);
         refreshBoard();
       },
-    }, { resume: flags.has("resume") });
+    }, { ...deps.watch, resume: flags.has("resume") });
   } finally {
     refreshBoard();
     await boardRefresh.flush();

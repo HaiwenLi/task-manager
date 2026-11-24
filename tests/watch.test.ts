@@ -326,4 +326,32 @@ describe("watch and stop CLI parsing", () => {
   it("watch requires --config", async () => {
     expect(await runCli(["watch"], { log: () => {}, err: () => {} })).toBe(2);
   });
+
+  it("discovers work through the real watch CLI and drains through the real stop CLI", async () => {
+    const configPath = join(root, "taskctl.json");
+    await writeFile(configPath, JSON.stringify({
+      tasksDir: tasks,
+      workdir: work,
+      model: "w/one",
+      lockTtlMs: 5_000,
+      heartbeatMs: 20,
+    }), "utf8");
+    const errors: string[] = [];
+    const running = runCli(["watch", "--config", configPath], {
+      adapter: adapter(),
+      acceptance: async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" }),
+      log: () => {},
+      err: (line) => { errors.push(line); },
+      watch: { watchFs, fallbackMs: 1_000, debounceMs: 5 },
+    });
+    await waitFor(() => listeners.has(tasks));
+    await seed(task("a"));
+    listeners.get(tasks)?.();
+    await waitForAsync(async () => (await store.get("a")).status === "done");
+
+    expect(await runCli(["stop", "--tasks-dir", tasks], { log: () => {}, err: () => {} })).toBe(0);
+    await expect(running).resolves.toBe(0);
+    expect(errors).toEqual([]);
+    expect(turns).toEqual(["a"]);
+  });
 });
