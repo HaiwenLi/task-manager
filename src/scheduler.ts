@@ -114,22 +114,32 @@ export type SchedulerOptions = {
  *
  * `pending` lists ready tasks that were left unstarted because the pass budget
  * ran out. It is normally empty: the run ends because nothing is left to do.
+ *
+ * A task the budget guard refused (`src/budget.ts`) is offered once and is
+ * not progress: it stays `open`, nothing was claimed for it, and the guard's
+ * answer will not change while this run lasts. It is not offered again in a
+ * later pass, not listed in `pending` (another `run` will not start it), and
+ * named once in `refused`, which is present only when something was refused.
  */
 export async function runScheduler(
   cfg: WorkerConfig,
   deps: WorkerDeps,
   options: SchedulerOptions = {},
-): Promise<{ done: string[]; blocked: string[]; pending: string[] }> {
+): Promise<{ done: string[]; blocked: string[]; pending: string[]; refused?: string[] }> {
   const limit = Math.max(1, cfg.parallel ?? 2);
   const runOne = options.run ?? runTask;
-  const result = { done: [] as string[], blocked: [] as string[], pending: [] as string[] };
+  const result: { done: string[]; blocked: string[]; pending: string[]; refused?: string[] }
+    = { done: [], blocked: [], pending: [] };
+  const refused = new Set<string>();
 
   for (let pass = 0; ; pass++) {
     const snapshot = await deps.store.list();
     assertAcyclic(snapshot);
 
     const doneIds = new Set(snapshot.filter((task) => task.status === "done").map((task) => task.id));
-    const pending = new Map(ready(snapshot, doneIds).map((task) => [task.id, task]));
+    const pending = new Map(
+      ready(snapshot, doneIds).filter((task) => !refused.has(task.id)).map((task) => [task.id, task]),
+    );
     const busy = new Set<string>();
     const inflight = new Map<string, Promise<void>>();
     let ranThisPass = 0;
@@ -146,10 +156,13 @@ export async function runScheduler(
           try {
             const outcome = await runOne({ ...cfg, workdir }, deps, task, `worker-${process.pid}-${id}`);
             // A refused claim ran nothing: counting it as progress would offer
-            // the same held task again until a pass count ran out.
-            if (outcome !== "skipped") ranThisPass += 1;
+            // the same held task again until a pass count ran out. A task the
+            // budget guard refused ran nothing either, so it is not progress
+            // either; and it is not offered again in this run.
+            if (outcome !== "skipped" && outcome !== "refused") ranThisPass += 1;
             if (outcome === "done" && !result.done.includes(id)) result.done.push(id);
             if (outcome === "blocked" && !result.blocked.includes(id)) result.blocked.push(id);
+            if (outcome === "refused") refused.add(id);
           } finally {
             busy.delete(key);
             inflight.delete(id);
@@ -175,10 +188,13 @@ export async function runScheduler(
     if (pass + 1 >= (options.maxPasses ?? passBudget(snapshot.length, cfg))) {
       const after = await deps.store.list();
       const doneNow = new Set(after.filter((task) => task.status === "done").map((task) => task.id));
-      result.pending = ready(after, doneNow).map((task) => task.id);
+      // A refused task is not work left for another `run`: that run would refuse it too.
+      result.pending = ready(after, doneNow).filter((task) => !refused.has(task.id)).map((task) => task.id);
       break;
     }
   }
+  // Present only when something was refused, so a caller that compares the whole object sees what it always did.
+  if (refused.size > 0) result.refused = [...refused];
   return result;
 }
 

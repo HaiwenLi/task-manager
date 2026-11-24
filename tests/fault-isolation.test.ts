@@ -134,7 +134,12 @@ describe("a failure confined to one task", () => {
   it("blocks a task whose backend cannot be spawned, without false uncertainty or a leaked reservation", async () => {
     await seedTaskFile(tasks, task("a"));
 
-    const outcome = await runTask(cfg, deps(new OpenCodeAdapter({ bin: "taskctl-no-such-binary" })), await store.get("a"), "w1");
+    const backend = Object.assign(new OpenCodeAdapter({ bin: "taskctl-no-such-binary" }), {
+      modelCatalog: async () => [{ ref: "w/one", providerID: "w", id: "one", modelID: "one", variants: [], cost: [{ input: 0, output: 0 }], enabled: true }],
+      defaultModelRef: async () => "w/one",
+    });
+
+    const outcome = await runTask(cfg, deps(backend), await store.get("a"), "w1");
 
     expect(outcome).toBe("blocked");
     expect((await store.get("a")).status).toBe("blocked");

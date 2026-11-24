@@ -31,6 +31,7 @@ import { taskWorkdir } from "./scheduler.js";
 import { resolveArtifacts } from "./artifacts.js";
 import { runSelfCheck } from "./self-check.js";
 import { runBatch } from "./batch.js";
+import { judgeRefs, policyOf, renderVerdicts, type ModelVerdict } from "./budget.js";
 import { stopRequestPath, watchQueue, type WatchOptions } from "./watch.js";
 import { createMempalaceBackend, runRecall, type MemoryBackend, type RecallInput, type RecallRecord } from "./memory.js";
 
@@ -62,6 +63,12 @@ type ResolvedConfig = WorkerConfig & { opencodeBin?: string };
 type ControllerTelemetry = {
   refreshBoard: () => void;
   writeLogLine: (taskId: string, line: string) => void;
+  /**
+   * The line of a task that was never claimed, because the budget guard
+   * refused it: it goes to the operator's `--log` file when there is one, and
+   * never into the task's own directory.
+   */
+  writeUnclaimedLine: (line: string) => void;
   /** Settle the trailing board refresh and queued log writes. */
   flush: () => Promise<void>;
 };
@@ -78,16 +85,21 @@ async function createControllerTelemetry(cfg: ResolvedConfig, teeTarget?: string
   }
   const boardRefresh = createCoalescedRefresh(() => refreshBoardFile(cfg.tasksDir));
   let logJob: Promise<unknown> = Promise.resolve();
+  const appendLine = (target: string, line: string): void => {
+    logJob = logJob.then(async () => {
+      await mkdir(dirname(target), { recursive: true });
+      await appendFile(target, `${new Date().toISOString()}  ${line}\n`, "utf8");
+    }).catch(() => {
+      // A log write that cannot happen must not take the controller down.
+    });
+  };
   return {
     refreshBoard: boardRefresh.request,
     writeLogLine: (taskId, line) => {
-      const target = teeTarget ?? join(cfg.tasksDir, taskId, "logs", `run-${runStamp}.log`);
-      logJob = logJob.then(async () => {
-        await mkdir(dirname(target), { recursive: true });
-        await appendFile(target, `${new Date().toISOString()}  ${line}\n`, "utf8");
-      }).catch(() => {
-        // A log write that cannot happen must not take the controller down.
-      });
+      appendLine(teeTarget ?? join(cfg.tasksDir, taskId, "logs", `run-${runStamp}.log`), line);
+    },
+    writeUnclaimedLine: (line) => {
+      if (teeTarget !== undefined) appendLine(teeTarget, line);
     },
     flush: async () => {
       boardRefresh.request();
@@ -114,8 +126,15 @@ function createWorkerDeps({
     onEvent: (evt) => {
       const line = workerEventLine(evt);
       log(line);
-      telemetry.writeLogLine(evt.taskId, line);
-      telemetry.refreshBoard();
+      if (evt.type === "refused") {
+        // The budget guard said no before anything was claimed, so the task's
+        // directory is not this controller's to write: not even a log line.
+        // The verdicts in the line are what the operator reads.
+        telemetry.writeUnclaimedLine(line);
+      } else {
+        telemetry.writeLogLine(evt.taskId, line);
+        telemetry.refreshBoard();
+      }
       observe?.(evt);
     },
   };
@@ -243,7 +262,7 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
   switch (command) {
     case "add":
       checkFlags(command, flags, ["type", "simple", "quick", "verify", "execution", "target", "id", "config", "risk", "workdir", "tasks-dir", "acceptance"], []);
-      return addCommand(positionals, flags, deps, log);
+      return addCommand(positionals, flags, deps, log, err);
     case "spec":
       checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return specCommand(flags, log);
@@ -255,7 +274,7 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
       return answerCommand(flags, log);
     case "split":
       checkFlags(command, flags, ["task", "apply", "tasks-dir", "config"], ["task"]);
-      return splitCommand(flags, deps, log);
+      return splitCommand(flags, deps, log, err);
     case "run":
       checkFlags(command, flags, ["config", "log", "batch"], []);
       return runCommand(flags, deps, log);
@@ -370,6 +389,22 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
     // A task blocked by a controller bug is not an ordinary outcome. The board
     // was still drained, but the run must not read as clean to a script.
     log(`[scheduler] ${controllerErrors} task(s) blocked by a controller error; see the controller-error line(s) above`);
+    return 1;
+  }
+  // What was refused is read off the result, never off the events: those are
+  // reported once per process per task, and an exit code must not depend on
+  // what happened earlier in this process.
+  const refused = batch === undefined
+    // `runScheduler` names every task it refused.
+    ? ("refused" in result ? result.refused ?? [] : [])
+    // A batch stops on the first task that was refused.
+    : "stoppedAt" in result && result.stoppedAt !== undefined && result.outcome === "refused"
+      ? [result.stoppedAt]
+      : [];
+  if (refused.length > 0) {
+    // The guard's verdicts are in the `refused` line(s) above. The board was
+    // still drained, but a task that did not run must not read as clean to a script.
+    log(`[scheduler] ${refused.length} task(s) refused by the budget guard; nothing was claimed for them`);
     return 1;
   }
   return 0;
@@ -527,12 +562,24 @@ async function refreshBoardFile(tasksDir: string): Promise<void> {  const tasks 
   await writeBoard(tasksDir, renderBoardMarkdown(tasks, { all: false, notes, highlighted, now: new Date() }));
 }
 
+/**
+ * The budget guard for a session that runs on one model, the configured one
+ * or else the backend's default: the clarify session of `add`, the planner
+ * session of `split`. The verdicts that were not allowed; empty when the
+ * session may start. An adapter that cannot list models is not guarded.
+ */
+async function sessionRefusals(cfg: ResolvedConfig, adapter: AgentAdapter): Promise<ModelVerdict[]> {
+  const verdicts = await judgeRefs(cfg.model ? [cfg.model] : [], policyOf(cfg), adapter);
+  return verdicts.filter((verdict) => !verdict.allowed);
+}
+
 /** `taskctl add "<intent>"` — capture the intent, draft the spec, gate the state. */
 async function addCommand(
   positionals: string[],
   flags: Map<string, string>,
   deps: CliDeps,
   log: (line: string) => void,
+  err: (line: string) => void,
 ): Promise<number> {
   const intent = positionals.join(" ").trim();
   if (intent.length === 0) {
@@ -594,6 +641,17 @@ async function addCommand(
     sessions: [],
     retries: 0,
   };
+
+  const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+  // Before anything is written: a clarify session the budget guard refuses
+  // leaves no task file behind. A quick task has no session, so it is not asked.
+  if (!quick) {
+    const disallowed = await sessionRefusals(cfg, adapter);
+    if (disallowed.length > 0) {
+      err(renderVerdicts(disallowed));
+      throw new Error(`budget guard refused: ${disallowed.map((verdict) => verdict.ref).join(", ")}`);
+    }
+  }
   await writeFile(join(tasksDir, `${id}.md`), serializeTaskFile(task), { encoding: "utf8", flag: "wx" });
 
   if (quick) {
@@ -611,7 +669,6 @@ async function addCommand(
     return 0;
   }
 
-  const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
   const profile = await readProfile(tasksDir);
   const feedback = await relevantFeedback(tasksDir, { type, intent }, log);
   const prompt = buildClarifyPrompt({ task, type, profile, ...(feedback === null ? {} : { feedback }) });
@@ -821,8 +878,17 @@ function answerBlock(questions: string[], answers: string, at: string): string {
  * never replaced by a fresh model call just because the command ran again,
  * and an edited plan file is applied exactly as edited. To plan again, the
  * plan file is deleted on purpose; the command says so.
+ *
+ * Before a planner session starts, the budget guard judges the model it would
+ * run on (see `src/budget.ts`). A refusal is journaled as `budget-refused`,
+ * printed, and exits 1, and no plan is written.
  */
-async function splitCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
+async function splitCommand(
+  flags: Map<string, string>,
+  deps: CliDeps,
+  log: (line: string) => void,
+  err: (line: string) => void,
+): Promise<number> {
   const tasksDir = await tasksDirFor(flags);
   const id = flags.get("task")!;
   const apply = flags.has("apply");
@@ -848,6 +914,19 @@ async function splitCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
   if (plan === null) {
     const cfg = await configFor(flags);
     const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+    // The planner session runs on one model, judged before it starts. A
+    // refusal is this command's own doing, so it is said in the journal, on
+    // stderr, and in the exit code; and no plan is written.
+    const disallowed = await sessionRefusals(cfg, adapter);
+    if (disallowed.length > 0) {
+      await appendJournal(tasksDir, id, {
+        stage: "split",
+        event: "budget-refused",
+        detail: disallowed.map((verdict) => verdict.ref).join(","),
+      });
+      err(renderVerdicts(disallowed));
+      return 1;
+    }
     const spec = (await readSpec(tasksDir, id)) ?? "";
     const result = await adapter.prompt({
       text: buildSplitPrompt({ parent, spec }),
@@ -1454,6 +1533,10 @@ export const CONFIG_KEYS = new Set([
   "renderViewports",
   "workerContext",
   "memory",
+  "allowedProviders",
+  "allowedModels",
+  "allowPaidModels",
+  "maxCostPerMillion",
 ]);
 
 /** Merge config file over the defaults; every present field is validated. */
@@ -1499,6 +1582,11 @@ export function resolveConfig(raw: Record<string, unknown>, path: string): Resol
     renderViewports: stringArray(raw, "renderViewports", path),
     workerContext: workerContextSwitches(raw.workerContext, path),
     memory: memorySettings(raw.memory, path),
+    // The budget guard's policy. Each is absent by default; what each one allows is in `src/budget.ts`.
+    allowedProviders: stringArray(raw, "allowedProviders", path),
+    allowedModels: stringArray(raw, "allowedModels", path),
+    allowPaidModels: boolean(raw, "allowPaidModels", path),
+    maxCostPerMillion: nonNegativeNumber(raw, "maxCostPerMillion", path),
   };
 }
 
@@ -1642,6 +1730,30 @@ function nonNegativeInteger(raw: Record<string, unknown>, key: string, path: str
   if (value === undefined) return undefined;
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
     throw new Error(`config ${path}: field "${key}" must be a non-negative integer`);
+  }
+  return value;
+}
+
+/** A switch: `true` or `false`, and nothing else. Absent stays absent, so the default applies. */
+function boolean(raw: Record<string, unknown>, key: string, path: string): boolean | undefined {
+  const value = raw[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new Error(`config ${path}: field "${key}" must be a boolean`);
+  }
+  return value;
+}
+
+/**
+ * A price cap whose zero is a setting (nothing may cost anything) rather than
+ * an omission, such as `maxCostPerMillion`. `number` insists on a positive
+ * value, so zero is read here before that rule applies.
+ */
+function nonNegativeNumber(raw: Record<string, unknown>, key: string, path: string): number | undefined {
+  const value = raw[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(`config ${path}: field "${key}" must be a non-negative finite number`);
   }
   return value;
 }

@@ -10,6 +10,13 @@ import { controlDir, acquireWatchLock, heartbeatWatchLock, releaseWatchLock } fr
 
 export const stopRequestPath = (tasksDir: string): string => join(controlDir(tasksDir), "stop.requested");
 
+/**
+ * How long the queue leaves a task the budget guard refused out of its
+ * candidates before it offers the task again. The catalogue or the policy
+ * may have changed by then; offering it at every wake would not.
+ */
+export const REFUSED_RETRY_MS = 300_000;
+
 /** Minimal filesystem seam: production uses `fs.watch`; tests fire listeners. */
 export type WatchFs = (path: string, listener: () => void) => { close(): void };
 
@@ -22,6 +29,8 @@ export type WatchOptions = {
   watchFs?: WatchFs;
   /** Sees each scheduling error the queue survives, so the operator learns why it is waiting. */
   onError?: (message: string) => void;
+  /** Test seam; production uses {@link REFUSED_RETRY_MS}. */
+  refusedRetryMs?: number;
 };
 
 async function stopRequested(tasksDir: string): Promise<boolean> {
@@ -50,6 +59,10 @@ export function watchDirectory(path: string, listener: () => void): { close(): v
  * Own and drain one board until `.taskctl/stop.requested` appears. The loop is
  * sequential on purpose: new arrivals are considered only between operations,
  * and a stop never becomes a process-tree kill or an uncertain replay.
+ *
+ * A task the budget guard refused is left out of the candidates for a while
+ * and judged again after that (see {@link scheduleOnce}), so the task behind
+ * it is run instead of the refused one being offered at every wake.
  */
 export async function watchQueue(
   cfg: WorkerConfig,
@@ -76,6 +89,9 @@ export async function watchQueue(
   let stopping = false;
   let ownershipError: Error | undefined;
   let heartbeatFailureReported = false;
+  // When each task was last refused by the budget guard: this queue's own memory, for as long as the queue lives.
+  const refusedAt = new Map<string, number>();
+  const refusedRetryMs = options.refusedRetryMs ?? REFUSED_RETRY_MS;
 
   const wake = (): void => {
     wakeRequested = true;
@@ -145,7 +161,7 @@ export async function watchQueue(
       if (ownershipError !== undefined) throw ownershipError;
       let scheduled: Awaited<ReturnType<typeof scheduleOnce>>;
       try {
-        scheduled = await scheduleOnce(cfg, deps, runOne, runSelected, stopOrLost);
+        scheduled = await scheduleOnce(cfg, deps, runOne, runSelected, stopOrLost, refusedAt, refusedRetryMs);
       } catch (error) {
         if (ownershipError !== undefined) throw ownershipError;
         // A board that cannot be scheduled right now — a hand-edited file with
@@ -183,10 +199,20 @@ async function scheduleOnce(
   runOne: typeof runTask,
   runSelected: typeof runBatch,
   shouldStop: () => Promise<boolean>,
+  /** When each task was last refused by the budget guard; the queue's own memory. */
+  refusedAt: Map<string, number>,
+  retryMs: number,
 ): Promise<"worked" | "wait" | "stopped"> {
+  // A task refused lately is *cooling*: to offer it again now would only ask
+  // the guard the same question and get the same answer.
+  const cooling = (id: string): boolean => {
+    const at = refusedAt.get(id);
+    return at !== undefined && Date.now() - at < retryMs;
+  };
   const board = await deps.store.list();
   assertAcyclic(board);
   let candidate = undefined as (typeof board)[number] | undefined;
+  // Never filtered by `cooling`: a dead lock must still be taken over, whatever the guard says about the task.
   for (const task of board) {
     if (task.status === "running" && !await lockLive(cfg.tasksDir, task.id, cfg.lockTtlMs)) {
       candidate = task;
@@ -194,11 +220,19 @@ async function scheduleOnce(
     }
   }
   if (candidate === undefined) {
-    const selected = await selectAutomaticBatch(cfg, board);
+    // The selection still sees the whole board, because dependencies have to
+    // resolve; a cooling task is only taken out of what it selected.
+    const selected = (await selectAutomaticBatch(cfg, board)).filter((id) => !cooling(id));
     if (selected.length >= 2) {
       // The selection is fixed at this boundary. Arrivals during it are picked
       // up by a later board scan, never appended to the active batch.
       const result = await runSelected(cfg, deps, selected, { shouldStop });
+      // A refusal ran nothing, so it is no reason for an immediate fresh
+      // snapshot: the queue waits, and the next pass leaves the task out.
+      if (result.stoppedAt !== undefined && result.outcome === "refused") {
+        refusedAt.set(result.stoppedAt, Date.now());
+        return "wait";
+      }
       // A batch that exhausted its open budget did no terminal work: wait for
       // the next event/fallback exactly like the ordinary open outcome.
       return result.done.length > 0 || (result.stoppedAt !== undefined && result.outcome !== "open")
@@ -207,7 +241,7 @@ async function scheduleOnce(
     }
     candidate = selected.length === 1
       ? board.find((task) => task.id === selected[0])
-      : readyTasks(board)[0];
+      : readyTasks(board).find((task) => !cooling(task.id));
   }
   if (candidate === undefined) return "wait";
   // Selection has several await boundaries. Stop and heartbeat loss must be
@@ -219,5 +253,6 @@ async function scheduleOnce(
     candidate,
     `watch-${process.pid}-${candidate.id}`,
   );
-  return outcome === "open" || outcome === "skipped" ? "wait" : "worked";
+  if (outcome === "refused") refusedAt.set(candidate.id, Date.now());
+  return outcome === "open" || outcome === "skipped" || outcome === "refused" ? "wait" : "worked";
 }

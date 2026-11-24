@@ -213,4 +213,28 @@ describe("resolveConfig", () => {
     expect(bad({ timeoutMs: -1 })).toThrow(/memory\.timeoutMs/);
     expect(bad({ other: true })).toThrow(/unknown memory field "other"/);
   });
+
+  it("parses the budget keys and accepts a zero price cap", () => {
+    const cfg = resolveConfig({ allowedProviders: ["plan"], allowedModels: ["zen/p"], allowPaidModels: true, maxCostPerMillion: 0 }, "taskctl.json");
+    expect([cfg.allowedProviders, cfg.allowedModels, cfg.allowPaidModels, cfg.maxCostPerMillion]).toEqual([["plan"], ["zen/p"], true, 0]);
+    const off = resolveConfig({}, "taskctl.json");
+    expect([off.allowedProviders, off.allowedModels, off.allowPaidModels, off.maxCostPerMillion]).toEqual([undefined, undefined, undefined, undefined]);
+  });
+  it("rejects a bad price cap and a bad switch", () => {
+    expect(() => resolveConfig({ maxCostPerMillion: -1 }, "taskctl.json")).toThrow(/maxCostPerMillion/);
+    expect(() => resolveConfig({ maxCostPerMillion: "3" }, "taskctl.json")).toThrow(/maxCostPerMillion/);
+    expect(() => resolveConfig({ allowPaidModels: "yes" }, "taskctl.json")).toThrow(/allowPaidModels/);
+  });
+  it("names each budget key a config gets wrong", () => {
+    // Each message names its key: a config that is refused must say which setting was refused.
+    expect(() => resolveConfig({ allowedProviders: "plan" }, "taskctl.json")).toThrow(/allowedProviders.*array of non-empty strings/);
+    expect(() => resolveConfig({ allowedModels: ["zen/p", ""] }, "taskctl.json")).toThrow(/allowedModels.*array of non-empty strings/);
+    expect(() => resolveConfig({ allowPaidModels: 1 }, "taskctl.json")).toThrow(/allowPaidModels.*boolean/);
+    // `null` is a value, and is refused like any other wrong one.
+    expect(() => resolveConfig({ allowPaidModels: null }, "taskctl.json")).toThrow(/allowPaidModels.*boolean/);
+    // A price need not be a whole number of dollars; it must be a number.
+    expect(resolveConfig({ maxCostPerMillion: 1.5 }, "taskctl.json").maxCostPerMillion).toBe(1.5);
+    expect(() => resolveConfig({ maxCostPerMillion: Number.NaN }, "taskctl.json")).toThrow(/maxCostPerMillion.*non-negative/);
+    expect(() => resolveConfig({ maxCostPerMillion: Number.POSITIVE_INFINITY }, "taskctl.json")).toThrow(/maxCostPerMillion.*non-negative/);
+  });
 });

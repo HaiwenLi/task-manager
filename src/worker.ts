@@ -22,6 +22,7 @@ import { definitionDigest, readAttempt, readDefinitionSnapshot, readRuntime, wri
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
 import { chainPosition, modelChain, readModelRotation, resetChainCycles, rotateModel, taskChain, type Handover, type ModelRole } from "./models.js";
+import { checkModels, noteReported, renderVerdicts, reviewerModels, workerModels } from "./budget.js";
 import { classifyDispatchFailure, quotaBackoffMs } from "./dispatch.js";
 import { failureFingerprint } from "./fingerprint.js";
 import { startReview, type CriterionResult, type ReviewEvidence, type ReviewResult } from "./review.js";
@@ -140,9 +141,16 @@ export type WorkerDeps = {
   memory?: MemoryBackend;
   onEvent?: (evt: WorkerEvent) => void;
 };
-export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error";
+/** `refused` is reported before the claim, once per process for a task and the models it was refused for; its detail is the guard's verdicts. */
+export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error" | "refused";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
-export type TaskOutcome = "done" | "blocked" | "skipped" | "open" | "awaiting-human";
+/**
+ * `refused`: the budget guard said no before anything was claimed. The task
+ * stays `open` and unclaimed, nothing was written into its directory, and no
+ * model session started, so it is neither progress nor a reason to wait for a
+ * human; it needs no recovery.
+ */
+export type TaskOutcome = "done" | "blocked" | "skipped" | "open" | "awaiting-human" | "refused";
 export type RunTaskOptions = {
   reviewOnly?: boolean;
   /** Batch-only input; ordinary runs keep the task-local restore behavior. */
@@ -229,6 +237,21 @@ export async function runTask(
 ): Promise<TaskOutcome> {
   // Even callers reusing a worker label get a distinct fencing generation.
   const owner = `${workerId}:${randomUUID()}`;
+  // The budget guard, before anything is claimed: every model this attempt
+  // may run on is judged first, and a refusal leaves the task `open`, with
+  // nothing written into its directory and no session started. A review-only
+  // recovery runs the reviewer alone, so the worker's models are not judged.
+  const refused = await checkModels(cfg, deps.adapter, options.reviewOnly
+    ? { reviewer: reviewerModels(cfg) }
+    : { worker: workerModels(cfg, task), reviewer: reviewerModels(cfg) });
+  if (refused.length > 0) {
+    // Reported once per process for a task and the models it was refused for:
+    // a queue that offers the task again gets the same answer and says nothing new.
+    if (noteReported(task.id, refused.map((verdict) => verdict.ref))) {
+      deps.onEvent?.({ type: "refused", taskId: task.id, detail: renderVerdicts(refused) });
+    }
+    return "refused";
+  }
   if (!await claim(cfg.tasksDir, task.id, owner, cfg.lockTtlMs)) return "skipped";
   let notifyLost!: () => void;
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
