@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter } from "../src/adapters/types.js";
 import type { AcceptanceResult } from "../src/acceptance.js";
+import { SPEC_MAX_CHARS } from "../src/context.js";
 import { recordFeedback, type FeedbackRecord } from "../src/feedback.js";
 import { readJournal } from "../src/journal.js";
 import { buildWorkerPrompt, SPEC_NOTE } from "../src/protocol.js";
@@ -223,10 +224,16 @@ describe("runTask — worker context", () => {
   });
 
   it("carries the fixed spec note once", async () => {
+    // A spec about 20,000 characters long, far past the limit the prompt may carry.
     await writeContext();
+    await writeSpec(tasksDir, "a", "## 目标\n" + "SPEC DETAIL LINE\n".repeat(1_100));
     const { text } = await attempt(cfg(tasksDir));
     // The prompt writes the note that closes the spec section; the section read from disk leaves it to the prompt.
     expect(text.split(SPEC_NOTE)).toHaveLength(2);
+    // What it carries is the clipped spec: the marker stands where the middle was left out, and the whole
+    // prompt is that limit plus the fixed copy and the absolute paths (about 1,130 characters), not the 20,000 on disk.
+    expect(text).toContain("中段已省略");
+    expect(text.length).toBeLessThan(SPEC_MAX_CHARS + 1_500);
   });
 
   it("leaves the prompt unchanged when both switches are off", async () => {

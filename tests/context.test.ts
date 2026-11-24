@@ -8,13 +8,12 @@ import {
   WORKER_FEEDBACK_LIMIT,
   WORKER_FEEDBACK_MAX_CHARS,
   clipHeadTail,
+  clippedSpec,
   isWorkerRelevant,
   profileSection,
   readContextSections,
-  specSection,
 } from "../src/context.js";
 import { recordFeedback, type FeedbackRecord } from "../src/feedback.js";
-import { SPEC_NOTE } from "../src/protocol.js";
 import { writeSpec } from "../src/spec.js";
 import type { Task } from "../src/task-file.js";
 import { buildTaskFile } from "./helpers/task-fixture.js";
@@ -57,12 +56,12 @@ describe("context sections", () => {
     expect(clipHeadTail("short", 1_000, "<CUT>")).toBe("short");
   });
 
-  it("ends the spec section with the fixed note", () => {
-    expect(specSection("# Spec\nbody")).toBe(`# Spec\nbody\n\n${SPEC_NOTE}`);
-    const long = specSection("x".repeat(9_000));
-    expect(long.length).toBeLessThan(SPEC_MAX_CHARS + SPEC_NOTE.length + 80);
-    expect(long.startsWith("xxxx")).toBe(true);
-    expect(long.endsWith(SPEC_NOTE)).toBe(true);
+  it("clips a long spec to the limit and leaves a short one whole", () => {
+    expect(clippedSpec("  # Spec\nbody  ")).toBe("# Spec\nbody");
+    const long = clippedSpec("a".repeat(5_000) + "b".repeat(5_000));
+    expect(long).toHaveLength(SPEC_MAX_CHARS);
+    expect(long.startsWith("aaaa")).toBe(true);
+    expect(long.endsWith("bbbb")).toBe(true);
     expect(long).toContain("中段已省略");
   });
 

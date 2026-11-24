@@ -1,6 +1,5 @@
 import type { Task } from "./task-file.js";
 import { pickFeedback, readFeedback, renderEntry, type FeedbackRecord } from "./feedback.js";
-import { SPEC_NOTE } from "./protocol.js";
 import { readProfile } from "./profile.js";
 import { readSpec } from "./spec.js";
 
@@ -35,16 +34,8 @@ export function clipHeadTail(text: string, max: number, marker: string): string 
  * `buildWorkerPrompt` (`./protocol.ts`) writes that itself right after, so
  * the prompt carries it once.
  */
-function clippedSpec(specMarkdown: string): string {
+export function clippedSpec(specMarkdown: string): string {
   return clipHeadTail(specMarkdown.trim(), SPEC_MAX_CHARS, SPEC_CUT_MARKER);
-}
-
-/**
- * The spec section as one text: the spec, clipped to {@link SPEC_MAX_CHARS} when
- * it is longer, ending with the fixed note from {@link SPEC_NOTE}.
- */
-export function specSection(specMarkdown: string): string {
-  return `${clippedSpec(specMarkdown)}\n\n${SPEC_NOTE}`;
 }
 
 /**
