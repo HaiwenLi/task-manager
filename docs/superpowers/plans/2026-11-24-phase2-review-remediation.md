@@ -1,0 +1,210 @@
+# Phase 2 Review Remediation Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Close X-Goldfish findings A1–A7 without adding features, then repeat offline gates and the complete independent review from FixedPoint `6906383`.
+
+**Architecture:** Keep the existing batch/watch/worker boundaries. Make batch preamble lifetime independent of cross-task resume candidates, make watch scheduling explicitly distinguish progress, waiting and stopping, and journal missing resume-probe capability before fresh-session fallback. Prove the enumerated acceptance clauses through `runCli`; retain direct API tests only where they provide focused race or guard coverage.
+
+**Tech Stack:** TypeScript, Node.js 22+, Vitest, existing `runCli`/`watchQueue` test seams.
+
+**Spec:** `docs/superpowers/specs/2026-11-24-adaptive-execution-design.md` §13 and §15.1 items 11/15; `docs/superpowers/plans/2026-11-24-watch-batch.md`; X-Goldfish report `~/.xg-reviews\task-manager\20261124T071920Z\code_review_report.md`.
+
+## Global Constraints
+
+- Do not run `scripts/smoke.ps1 -Live` or any real-backend verification without explicit user authorization.
+- Do not commit `.codegraph/` or `docs/superpowers/plans/2026-11-24-handoff.md`.
+- Automatic batches retain the contiguous eligible prefix of `ready()` and never skip an earlier ineligible task.
+- Each A1–A4 test must fail on `d288964` for the stated reason before its production fix.
+- Mutation checks use a clean control, one reversed guard at a time, and a private JSON report outside the repository. A surviving mutation requires a stronger direct assertion and a rerun.
+- Offline evidence is not live-backend proof.
+
+## Review Focus
+
+- An `open` retry must retain the current-task/completed-task preamble while restoring only the current task's own session (Task 1).
+- Stop or heartbeat loss during an awaited board read must produce zero ordinary claims (Task 3).
+- An adapter without `canResumeSession` must still produce a durable skip reason before a fresh turn (Task 4).
+- Idle CLI watches must make no prompt, execution, model-resolution, context, usage or resume-probe calls (Task 5).
+- Real-CLI proof must include both eligible grouping and an ineligible head that is not skipped (Task 5).
+
+---
+
+### Task 1: A1 — retain batch preambles on retries
+
+**Files:**
+- Modify: `src/batch.ts`
+- Test: `tests/batch-session.test.ts`
+
+**Interfaces:**
+- Consumes: `RunTaskOptions.batch.preamble` and optional `resumeFrom`.
+- Produces: `preamble` on every batch attempt; `resumeFrom` only on a task's first attempt.
+
+- [ ] **Step 1: Extend the open-retry regression test**
+
+In `uses the current task's own session on an open retry, not the batch candidate`, assert both `b` prompts contain `当前任务：b`, `前面已完成：a`, and `不要重做`; retain the existing session assertions `[undefined, undefined, "fresh-b"]`.
+
+- [ ] **Step 2: Verify the test fails before the fix**
+
+Run: `npx vitest run tests/batch-session.test.ts`
+Expected: FAIL because the second `b` prompt lacks the batch preamble.
+
+- [ ] **Step 3: Separate option lifetimes**
+
+In `runBatch`, always pass `{ batch: { preamble } }`; add `resumeFrom: previousWorker` only when `attempt === 1` and a candidate exists. Do not change ordinary same-task restoration.
+
+- [ ] **Step 4: Verify and mutation-check**
+
+Run the focused test, then temporarily restore first-attempt-only preamble behavior. Expected: the new assertion fails; restore the fix and rerun for a clean control. Record the mutation in the private JSON report.
+
+- [ ] **Step 5: Commit**
+
+Commit only the plan, `src/batch.ts`, and `tests/batch-session.test.ts` with a `fix(batch)` message.
+
+### Task 2: A2 — wait after an `open` watch outcome
+
+**Files:**
+- Modify: `src/watch.ts`
+- Test: `tests/watch.test.ts`
+
+**Interfaces:**
+- Produces: `scheduleOnce(): Promise<"worked" | "wait" | "stopped">`; `open` and `skipped` map to `wait`, not `worked`.
+
+- [ ] **Step 1: Write the failing scheduling test**
+
+Inject `runOne` returning `open`. After the first call, prove no second call occurs before an explicit filesystem wake; wake once, let the second call request stop, and assert exactly two bounded calls.
+
+- [ ] **Step 2: Verify the test fails before the fix**
+
+Run: `npx vitest run tests/watch.test.ts`
+Expected: FAIL because the second call happens without the explicit wake.
+
+- [ ] **Step 3: Implement explicit scheduling results**
+
+Change the boolean result to the union above. Only `worked` immediately refreshes the snapshot; `wait` awaits an event/fallback. Task 3 owns the `stopped` branch.
+
+- [ ] **Step 4: Verify and mutation-check**
+
+Run the focused test. Reverse only the `open` mapping to `worked`; expect the new test to fail, then restore and rerun.
+
+- [ ] **Step 5: Commit**
+
+Commit `src/watch.ts` and `tests/watch.test.ts` with a `fix(watch)` message.
+
+### Task 3: A3 — recheck stop/ownership before ordinary claims
+
+**Files:**
+- Modify: `src/watch.ts`
+- Test: `tests/watch.test.ts`
+
+**Interfaces:**
+- Consumes: `stopOrLost()` and Task 2's `scheduleOnce` union.
+- Produces: a `stopped` result before ordinary `runOne` when stop/ownership loss appears during selection.
+
+- [ ] **Step 1: Write two failing race tests**
+
+Block the first `store.list()` with a deferred. Inject stop in one test and watch-lock loss/heartbeat diagnosis in the other, then release the board read. Assert the injected ordinary `runOne` call count is zero; stop exits gracefully and ownership loss rejects with `ownership`.
+
+- [ ] **Step 2: Verify both tests fail before the fix**
+
+Run: `npx vitest run tests/watch.test.ts`
+Expected: FAIL because each race reaches the ordinary runner once.
+
+- [ ] **Step 3: Add the immediate pre-claim check**
+
+Immediately before ordinary `runOne`, await `shouldStop()` and return `stopped` when true. In the outer loop, return gracefully for stop and throw the saved ownership error for loss; do not cancel an active attempt.
+
+- [ ] **Step 4: Verify and mutation-check**
+
+Run the focused tests. Remove only the immediate pre-claim check; expect both race tests to fail, then restore and rerun.
+
+- [ ] **Step 5: Commit**
+
+Commit `src/watch.ts` and `tests/watch.test.ts` with a `fix(watch)` message.
+
+### Task 4: A4 — journal unavailable resume probes
+
+**Files:**
+- Modify: `src/worker.ts`
+- Test: `tests/batch-session.test.ts`
+
+**Interfaces:**
+- Consumes: a clean, model-bearing persisted or `batch.resumeFrom` candidate.
+- Produces: `session-reuse-skipped` with an unavailable-probe reason before fresh dispatch when `canResumeSession` is absent.
+
+- [ ] **Step 1: Write the missing-capability regression**
+
+Run a two-task batch with an adapter that omits `canResumeSession`. Assert both turns start without a session, no probe is possible, and task `b` has one `session-reuse-skipped` journal entry naming `ses-shared` and the unavailable capability.
+
+- [ ] **Step 2: Verify the test fails before the fix**
+
+Run: `npx vitest run tests/batch-session.test.ts`
+Expected: FAIL because the journal entry is absent.
+
+- [ ] **Step 3: Reorder candidate validation and capability handling**
+
+Keep dirty/model-less and non-settled ordinary candidates ineligible. Preserve known cross-task model-mismatch journaling, then journal missing probe capability as unavailable before returning `undefined`; leave `active` and `reusable` handling unchanged.
+
+- [ ] **Step 4: Verify and mutation-check**
+
+Run the focused tests. Restore the early return only for missing probe capability; expect the journal assertion to fail, then restore and rerun.
+
+- [ ] **Step 5: Commit**
+
+Commit `src/worker.ts` and `tests/batch-session.test.ts` with a `fix(worker)` message.
+
+### Task 5: A5/A6/A7 — complete CLI evidence and deduplicate fixtures
+
+**Files:**
+- Modify: `src/cli.ts` only if a watch-store observation seam is needed for real-CLI scan counts
+- Test: `tests/batch-session.test.ts`, `tests/batch-flow.test.ts`, `tests/watch.test.ts`, `tests/watch-batch.test.ts`
+- Modify: `tests/helpers/task-fixture.ts`
+
+**Interfaces:**
+- Produces: `buildContinuousTask(id: string, overrides?: Partial<Task>): Task` from the existing fixture helper.
+- Real-CLI watch tests may inject a `TaskStore` through `CliDeps` solely to count scheduling scans; production still constructs `TaskStore` when absent.
+
+- [ ] **Step 1: Route item 11 clauses through `runCli`**
+
+Use `run --batch a,b,... --config <file>` for safe shared session, independent acceptance, blocked/awaiting-human stop, and model-mismatch tests. Retain direct `runBatch` only for run-seam-specific retry/dirty-fact tests. Existing `batch-flow` tests must continue proving initial and mid-batch workdir rejection before claim.
+
+- [ ] **Step 2: Route item 15 clauses through `runCli`**
+
+Cover the matrix with `watch --config` plus deterministic `CliDeps.watch`: discovery, idle, burst, second watcher, active-turn graceful drain, eligible grouping, ineligible-head ordering, and arrival at a boundary. Use real `stop --tasks-dir` where the clause is graceful drain.
+
+- [ ] **Step 3: Assert complete idle adapter silence**
+
+For the real-CLI idle test, instrument `prompt`, `start`, `resolveModel`, `contextUsage`, `contextLimit`, `sessionUsage`, and `canResumeSession`. Observe at least two scans/fallback wakeups and assert the complete call log is empty before and after stop.
+
+- [ ] **Step 4: Extract the continuous-task fixture**
+
+Replace all four local identical `task` factories with `buildContinuousTask`; leave test-specific overrides unchanged.
+
+- [ ] **Step 5: Verify the evidence suites**
+
+Run: `npx vitest run tests/batch-session.test.ts tests/batch-flow.test.ts tests/watch.test.ts tests/watch-batch.test.ts`
+Expected: PASS with no direct-API-only gaps in the item 11/15 matrix and an empty full idle adapter log.
+
+- [ ] **Step 6: Commit**
+
+Commit the evidence/fixture changes with a `test(phase2)` message. Include the clause-to-test matrix in the commit evidence, not as a claim of live verification.
+
+### Task 6: Final offline gates and independent re-review
+
+**Files:**
+- Modify: this plan with exact evidence and any remaining limitations
+
+- [ ] **Step 1: Run all offline gates**
+
+Run `npm test`, `npx tsc --noEmit`, `git diff --check`, and `scripts/smoke.ps1` without `-Live`. Confirm `.codegraph/` and the handoff remain uncommitted.
+
+- [ ] **Step 2: Run the complete X-Goldfish workflow**
+
+Use FixedPoint `6906383`, the new HEAD, the same spec sources, and `README.md + docs/adr/*.md` as standards. Run fresh standards and spec reviewers, then drop-only falsification; write all reports under a new `~/.xg-reviews/task-manager/<utc>/` directory.
+
+- [ ] **Step 3: Close or report findings**
+
+Any surviving runtime/evidence finding returns to the owning task. Only an offline-clean review may be called offline acceptance; real OpenCode reuse/probe/usage remains explicitly unverified until separately authorized.
+
+- [ ] **Step 4: Record the verified outcome**
+
+Update this plan with test counts, gate results, review verdict and report path. File the durable outcome in MemPalace and read it back. Ask separately before any bounded Live run, push, handoff commit or `.gitignore` decision.

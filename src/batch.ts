@@ -218,9 +218,12 @@ export async function runBatch(
         deps,
         current!,
         `batch-${process.pid}-${selectedTask.id}`,
-        attempt === 1
-          ? { batch: { preamble, ...(previousWorker === undefined ? {} : { resumeFrom: previousWorker }) } }
-          : {},
+        {
+          batch: {
+            preamble,
+            ...(attempt === 1 && previousWorker !== undefined ? { resumeFrom: previousWorker } : {}),
+          },
+        },
       );
       if (outcome === "done") {
         done.push(selectedTask.id);

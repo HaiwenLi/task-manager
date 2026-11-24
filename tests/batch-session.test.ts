@@ -262,6 +262,13 @@ describe("cross-task batch sessions", () => {
 
     expect(result.done).toEqual(["a", "b"]);
     expect(turns.map((turn) => turn.sessionId)).toEqual([undefined, undefined, "fresh-b"]);
+    const reopenedTurns = turns.filter((turn) => turn.id === "b");
+    expect(reopenedTurns).toHaveLength(2);
+    for (const turn of reopenedTurns) {
+      expect(turn.text).toContain("当前任务：b");
+      expect(turn.text).toContain("前面已完成：a");
+      expect(turn.text).toContain("不要重做");
+    }
     expect(probeCalls).toEqual([
       { sessionId: "fresh-b", expected: { model: "w/two", cwd: await realpath(work) } },
     ]);
