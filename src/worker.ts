@@ -7,6 +7,7 @@ import { dependencySummary } from "./dependencies.js";
 import { latestNote, writeNote, type HandoffNote } from "./handoff.js";
 import { startAcceptance, type AcceptanceResult } from "./acceptance.js";
 import { readContextSections, type ContextSections } from "./context.js";
+import { createMempalaceBackend, runRecall, type MemoryBackend, type MemorySettings } from "./memory.js";
 import { buildWorkerPrompt } from "./protocol.js";
 import type { TaskStore } from "./task-store.js";
 import type { Task, TaskExecution } from "./task-file.js";
@@ -111,6 +112,13 @@ export type WorkerConfig = {
    * means both. Resolved from the `workerContext` block of `taskctl.json`.
    */
   workerContext?: { spec: boolean; preferences: boolean };
+  /**
+   * Memory recall for an attempt: the settings with the backend switch.
+   * Absent, or a backend of `none`, means off — no recall, no record, no
+   * journal line, no child process. Resolved from the `memory` block of
+   * `taskctl.json`.
+   */
+  memory?: MemorySettings;
 };
 export type WorkerStore = Pick<TaskStore, "list" | "setStatus" | "appendSession" | "incRetries" | "readDoneMarker" | "clearDoneMarker" | "incReviewRounds">;
 export type WorkerDeps = {
@@ -118,6 +126,8 @@ export type WorkerDeps = {
   acceptance?: (command: string, cwd: string) => Promise<AcceptanceResult>;
   /** Test seam: judge the evidence without starting an agent session. */
   review?: (evidence: ReviewEvidence) => Promise<ReviewResult>;
+  /** Test seam: what answers instead of the MemPalace server; production leaves it absent. */
+  memory?: MemoryBackend;
   onEvent?: (evt: WorkerEvent) => void;
 };
 export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error";
@@ -863,13 +873,18 @@ async function dependenciesOf(r: Run): Promise<string | null> {
   return r.dependencies;
 }
 
-/** The context sections one attempt was given; see `readContextSections`. */
-export type WorkerContext = ContextSections;
+/**
+ * The context sections one attempt was given: what `readContextSections`
+ * reads from disk, and — when memory is on — what recall found, as the lines
+ * the prompt shows. An absent `memory` is no memory section.
+ */
+export type WorkerContext = ContextSections & { memory?: string };
 
 /**
  * The context sections of this attempt, read once for the whole attempt: a
- * session of many turns does not read three files on every one of them, and
- * the journal says `profile-truncated` once, not once per turn.
+ * session of many turns does not read three files, or ask the memory backend,
+ * on every one of them, and the journal says `profile-truncated` once, not
+ * once per turn.
  */
 async function contextOf(r: Run): Promise<WorkerContext> {
   if (r.context === undefined) r.context = await readSections(r);
@@ -885,6 +900,12 @@ async function contextOf(r: Run): Promise<WorkerContext> {
  * read — none, when the read throws as a whole. Without the guard the error
  * lands in the attempt's error handling and the task is `blocked` over a file
  * that is only context.
+ *
+ * Memory recall is the last of these steps, and only when a backend is named.
+ * It is not a `controlled` step: `runRecall` bounds itself by its own
+ * deadline, ends its own child and never throws, so nothing here can park the
+ * task. A memory that cannot be reached costs the attempt its memory section
+ * — never `blocked` — and leaves its reason in the record and the journal.
  */
 async function readSections(r: Run): Promise<WorkerContext> {
   const flags = r.cfg.workerContext ?? { spec: true, preferences: true };
@@ -897,6 +918,29 @@ async function readSections(r: Run): Promise<WorkerContext> {
       // The section is the line that says it was cut, then the part that was kept.
       const kept = sections.profile!.length - sections.profile!.indexOf("\n") - 1;
       await noteContext(r, "profile-truncated", `profile cut; kept the newest ${kept} characters`);
+    }
+    // Recall is off until a backend is named. What it finds is the last
+    // section, and what was read before it is already in hand: the step sits
+    // inside this guard like the reads above it.
+    if (r.cfg.memory?.backend === "mempalace") {
+      const memory = await runRecall(
+        r.cfg.memory,
+        r.deps.memory ?? createMempalaceBackend(r.cfg.memory),
+        {
+          title: r.task.title, description: r.task.description,
+          // Read again, and whole: the query wants the spec's goal, which the
+          // clipped section may have lost with the middle.
+          spec: (await readSpec(r.cfg.tasksDir, r.task.id)) ?? null,
+          at: new Date().toISOString(),
+        },
+        {
+          // Through the ownership guard, like every other write of the attempt.
+          write: (record) => owned(r, () => writeRuntime(r.cfg.tasksDir, r.task.id, "recall.json", record)),
+          journal: (event, detail) => owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, { stage: "worker", event, detail })),
+        },
+      );
+      // `null` is every other outcome: nothing kept, or the backend could not answer.
+      if (memory !== null) sections.memory = memory;
     }
   } catch (err) {
     if (err instanceof OwnershipLostError) throw err;
@@ -946,6 +990,7 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       ...(context.spec === undefined ? {} : { spec: context.spec }),
       ...(context.profile === undefined ? {} : { profile: context.profile }),
       ...(context.feedback === undefined ? {} : { feedback: context.feedback }),
+      ...(context.memory === undefined ? {} : { memory: context.memory }),
     });
     const prompt = r.batch === undefined ? protocol : `${r.batch.preamble}${protocol}`;
     let model: string | undefined;

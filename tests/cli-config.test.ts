@@ -147,4 +147,68 @@ describe("resolveConfig", () => {
     expect(() => resolveConfig({ workerContext: { spec: null } }, "taskctl.json")).toThrow(/workerContext/);
     expect(() => resolveConfig({ workerContext: { other: true } }, "taskctl.json")).toThrow(/workerContext/);
   });
+
+  it("memory is off until a backend is named, and the settings have defaults", () => {
+    // Absent stays absent: no memory block, nothing to resolve.
+    expect(resolveConfig({}, "taskctl.json").memory).toBeUndefined();
+    // A block that names no backend is off, and still has every setting.
+    expect(resolveConfig({ memory: {} }, "taskctl.json").memory).toMatchObject({ backend: "none" });
+    expect(resolveConfig({ memory: {} }, "taskctl.json").memory).toEqual({
+      backend: "none", command: ["mempalace-mcp"], excludeWings: [], rooms: ["pitfall", "pattern", "decision"],
+      minSimilarity: 0.55, maxItems: 5, maxChars: 2000, itemChars: 400, timeoutMs: 20000,
+    });
+    expect(resolveConfig({ memory: { backend: "mempalace" } }, "taskctl.json").memory).toEqual({
+      backend: "mempalace", command: ["mempalace-mcp"], excludeWings: [], rooms: ["pitfall", "pattern", "decision"],
+      minSimilarity: 0.55, maxItems: 5, maxChars: 2000, itemChars: 400, timeoutMs: 20000,
+    });
+    expect(resolveConfig({ memory: { minSimilarity: 0, wing: "IDT" } }, "taskctl.json").memory).toMatchObject({ minSimilarity: 0, wing: "IDT" });
+  });
+
+  it("keeps each memory setting as written, and a wing only when one is named", () => {
+    // 0 and 1 are both ends of the similarity range, so both are settings rather than omissions.
+    expect(resolveConfig({ memory: { backend: "mempalace", minSimilarity: 1 } }, "taskctl.json").memory).toMatchObject({ minSimilarity: 1 });
+    expect(resolveConfig({ memory: { minSimilarity: 0 } }, "taskctl.json").memory).not.toHaveProperty("wing");
+    expect(resolveConfig({
+      memory: {
+        backend: "mempalace", command: ["node", "server.mjs"], wing: "IDT", excludeWings: ["dify_deploy"], rooms: ["pitfall"],
+        minSimilarity: 0.6, maxItems: 3, maxChars: 1500, itemChars: 200, timeoutMs: 5000,
+      },
+    }, "taskctl.json").memory).toEqual({
+      backend: "mempalace", command: ["node", "server.mjs"], wing: "IDT", excludeWings: ["dify_deploy"], rooms: ["pitfall"],
+      minSimilarity: 0.6, maxItems: 3, maxChars: 1500, itemChars: 200, timeoutMs: 5000,
+    });
+  });
+
+  it("rejects a memory block it cannot honour", () => {
+    expect(() => resolveConfig({ memory: { backend: "not-a-backend" } }, "taskctl.json")).toThrow(/memory/);
+    expect(() => resolveConfig({ memory: { other: true } }, "taskctl.json")).toThrow(/memory/);
+    expect(() => resolveConfig({ memory: { minSimilarity: 1.5 } }, "taskctl.json")).toThrow(/memory/);
+    expect(() => resolveConfig({ memory: { maxItems: 0 } }, "taskctl.json")).toThrow(/memory/);
+    expect(() => resolveConfig({ memory: { command: [] } }, "taskctl.json")).toThrow(/memory/);
+  });
+
+  it("rejects every other malformed memory block, naming the setting each time", () => {
+    const bad = (memory: unknown) => () => resolveConfig({ memory }, "taskctl.json");
+    expect(bad("no")).toThrow(/field "memory" must be an object/);
+    expect(bad(null)).toThrow(/field "memory" must be an object/);
+    expect(bad([])).toThrow(/field "memory" must be an object/);
+    expect(bad({ backend: 1 })).toThrow(/memory\.backend/);
+    expect(bad({ command: "mempalace-mcp" })).toThrow(/memory\.command/);
+    expect(bad({ command: [""] })).toThrow(/memory\.command/);
+    expect(bad({ command: [1] })).toThrow(/memory\.command/);
+    expect(bad({ wing: "" })).toThrow(/memory\.wing/);
+    expect(bad({ wing: 7 })).toThrow(/memory\.wing/);
+    expect(bad({ excludeWings: "dify_deploy" })).toThrow(/memory\.excludeWings/);
+    expect(bad({ excludeWings: [""] })).toThrow(/memory\.excludeWings/);
+    expect(bad({ rooms: "pitfall" })).toThrow(/memory\.rooms/);
+    expect(bad({ rooms: ["pitfall", ""] })).toThrow(/memory\.rooms/);
+    expect(bad({ minSimilarity: -0.1 })).toThrow(/memory\.minSimilarity/);
+    expect(bad({ minSimilarity: "0.6" })).toThrow(/memory\.minSimilarity/);
+    expect(bad({ maxItems: 2.5 })).toThrow(/memory\.maxItems/);
+    expect(bad({ maxChars: 0 })).toThrow(/memory\.maxChars/);
+    expect(bad({ itemChars: 0 })).toThrow(/memory\.itemChars/);
+    expect(bad({ timeoutMs: 0 })).toThrow(/memory\.timeoutMs/);
+    expect(bad({ timeoutMs: -1 })).toThrow(/memory\.timeoutMs/);
+    expect(bad({ other: true })).toThrow(/unknown memory field "other"/);
+  });
 });

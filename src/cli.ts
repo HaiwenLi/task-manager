@@ -32,6 +32,7 @@ import { resolveArtifacts } from "./artifacts.js";
 import { runSelfCheck } from "./self-check.js";
 import { runBatch } from "./batch.js";
 import { stopRequestPath, watchQueue, type WatchOptions } from "./watch.js";
+import { createMempalaceBackend, runRecall, type MemoryBackend, type RecallInput, type RecallRecord } from "./memory.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
 export type CliDeps = {
@@ -39,6 +40,8 @@ export type CliDeps = {
   acceptance?: (command: string, cwd: string) => Promise<AcceptanceResult>;
   /** Test seam for review-only recovery without starting a reviewer agent. */
   review?: WorkerDeps["review"];
+  /** Test seam: what answers instead of the MemPalace server, for run, watch and recall; production leaves it absent. */
+  memory?: MemoryBackend;
   /** Test seam for watch filesystem events and timing; production leaves it absent. */
   watch?: WatchOptions;
   /** Test seam for observing watch scheduling; production leaves it absent. */
@@ -107,6 +110,7 @@ function createWorkerDeps({
     adapter,
     ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
     ...(deps.review === undefined ? {} : { review: deps.review }),
+    ...(deps.memory === undefined ? {} : { memory: deps.memory }),
     onEvent: (evt) => {
       const line = workerEventLine(evt);
       log(line);
@@ -141,6 +145,7 @@ const USAGE = [
   "  taskctl reject --task <id> --reason \"…\" [--stage clarify|worker|reviewer] [--tasks-dir <dir>]",
   "  taskctl audit --task <id> --verdict pass|fail [--stage …] [--note \"…\"] [--tasks-dir <dir>]",
   "  taskctl metrics [--tasks-dir <dir>]",
+  "  taskctl recall (--task <id> | --query <text>) [--config taskctl.json]",
   "  taskctl reconcile --task <id> [--tasks-dir <dir>]",
   "  taskctl retry --task <id> [--review-only] [--tasks-dir <dir>]",
   "  taskctl findings --task <id> [--out <file>] [--tasks-dir <dir>]",
@@ -215,7 +220,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
   const log = deps.log ?? ((line: string) => console.log(line));
   const err = deps.err ?? ((line: string) => console.error(line));
   try {
-    return await dispatch(argv, deps, log);
+    return await dispatch(argv, deps, log, err);
   } catch (e) {
     if (e instanceof UsageError) {
       err(`taskctl: ${e.message}`);
@@ -227,7 +232,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
   }
 }
 
-async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => void): Promise<number> {
+async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => void, err: (line: string) => void): Promise<number> {
   const { command, positionals, flags } = parseArgs(argv);
   if (command === undefined) {
     throw new UsageError("missing command");
@@ -299,6 +304,9 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "metrics":
       checkFlags(command, flags, ["tasks-dir", "config"], []);
       return metricsCommand(flags, log);
+    case "recall":
+      checkFlags(command, flags, ["config", "task", "query"], []);
+      return recallCommand(flags, deps, log, err);
     case "learn":
       checkFlags(command, flags, ["note", "tasks-dir", "config"], ["note"]);
       return learnCommand(flags, log);
@@ -385,6 +393,73 @@ async function watchCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
     await telemetry.flush();
   }
   return 0;
+}
+
+/** What a recall is asked for a task: its own words, and its spec whole. */
+async function taskRecallInput(tasksDir: string, id: string): Promise<Omit<RecallInput, "at">> {
+  const task = await new TaskStore(tasksDir).get(id);
+  return { title: task.title, description: task.description, spec: await readSpec(tasksDir, id) };
+}
+
+/**
+ * `taskctl recall (--task <id> | --query <text>)` — show what a recall
+ * finds, and write nothing: no `recall.json`, no journal line.
+ *
+ * A read-only preview of the step a worker attempt takes when it starts
+ * (`readSections` in `./worker.ts`), through the same `runRecall`, so what is
+ * printed here is what the prompt would carry. `--task` asks with a task's
+ * own words and its spec's goal; `--query` asks with a query written by hand,
+ * to tune the cut-off or to reproduce an earlier recall. Either way the query
+ * is normalised as every recall query is: whitespace collapsed, 250
+ * characters at most.
+ *
+ * Exit code 0 when something was kept and when nothing was — an empty memory
+ * is an answer — and 1 when the backend could not answer in time or at all.
+ * With memory off there is nothing to ask; that is said, and is no failure.
+ */
+async function recallCommand(
+  flags: Map<string, string>, deps: CliDeps, log: (line: string) => void, err: (line: string) => void,
+): Promise<number> {
+  const id = flags.get("task");
+  const query = flags.get("query");
+  // Said before anything is read or asked.
+  if ((id === undefined) === (query === undefined)) {
+    throw new UsageError("recall needs exactly one of --task <id> and --query <text>");
+  }
+  if (query !== undefined && query.trim().length === 0) {
+    throw new UsageError("recall needs text after --query");
+  }
+  const cfg = await configFor(flags);
+  if (cfg.memory === undefined || cfg.memory.backend === "none") {
+    log('memory backend is "none"; nothing to recall');
+    return 0;
+  }
+  const at = new Date().toISOString();
+  const input: RecallInput = id === undefined
+    // A query written by hand is the whole of the input: nothing is added to it.
+    ? { title: query!, description: "", spec: null, at }
+    : { ...(await taskRecallInput(cfg.tasksDir, id)), at };
+  // The record is kept for the lines below; neither it nor a journal line is written anywhere.
+  let record: RecallRecord | undefined;
+  const text = await runRecall(cfg.memory, deps.memory ?? createMempalaceBackend(cfg.memory), input, {
+    write: async (written) => { record = written; },
+    journal: async () => {
+      // A preview leaves no journal line.
+    },
+  });
+  if (record === undefined) throw new Error("recall left no record of itself");
+  log(`query: ${record.query}`);
+  log(
+    `backend: ${record.backend}, outcome: ${record.outcome}, hits: ${record.hits.length}, `
+    + `below=${record.filtered.belowThreshold} room=${record.filtered.room} wing=${record.filtered.wing}`
+    + (record.truncated ? ", truncated" : ""),
+  );
+  // One line per hit, as the worker prompt shows them; nothing when none was kept.
+  for (const line of text === null ? [] : text.split("\n")) log(line);
+  if (record.outcome === "timeout" || record.outcome === "error") {
+    err(`recall unavailable: ${record.outcome}${record.detail === undefined ? "" : `: ${record.detail}`}`);
+  }
+  return record.outcome === "ok" || record.outcome === "no-hits" ? 0 : 1;
 }
 
 /** `taskctl stop` — request a graceful drain; never signals a worker process. */
@@ -1378,6 +1453,7 @@ export const CONFIG_KEYS = new Set([
   "chromeBin",
   "renderViewports",
   "workerContext",
+  "memory",
 ]);
 
 /** Merge config file over the defaults; every present field is validated. */
@@ -1422,6 +1498,7 @@ export function resolveConfig(raw: Record<string, unknown>, path: string): Resol
     chromeBin: string(raw, "chromeBin", path),
     renderViewports: stringArray(raw, "renderViewports", path),
     workerContext: workerContextSwitches(raw.workerContext, path),
+    memory: memorySettings(raw.memory, path),
   };
 }
 
@@ -1451,6 +1528,65 @@ function workerContextSwitches(raw: unknown, path: string): WorkerConfig["worker
     throw new Error(`config ${path}: workerContext.preferences must be a boolean`);
   }
   return { spec, preferences };
+}
+
+/** The settings a `memory` block of `taskctl.json` may carry. */
+const MEMORY_KEYS = new Set(["backend", "command", "wing", "excludeWings", "rooms", "minSimilarity", "maxItems", "maxChars", "itemChars", "timeoutMs"]);
+
+/**
+ * The `memory` block of `taskctl.json`. Absent stays `undefined`, so memory
+ * is off; an object fills each setting it leaves out with its default, the
+ * backend included — `none`, so memory stays off until a backend is named.
+ * Anything else is a config error, never a silent default, and every message
+ * names the block: `memory` is optional, and a typo in it must not quietly
+ * turn recall off or change what it keeps.
+ */
+function memorySettings(raw: unknown, path: string): WorkerConfig["memory"] {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`config ${path}: field "memory" must be an object`);
+  }
+  const record = raw as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (!MEMORY_KEYS.has(key)) {
+      throw new Error(`config ${path}: unknown memory field "${key}"`);
+    }
+  }
+  /** Refuse a setting that is not what it must be; the message names it. */
+  function refuse(key: string, must: string): never {
+    throw new Error(`config ${path}: memory.${key} must be ${must}`);
+  }
+  const stringList = (value: unknown): value is string[] =>
+    Array.isArray(value) && value.every((item) => typeof item === "string" && item.trim().length > 0);
+  const positive = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value > 0;
+
+  // A setting left out is its default. `null` is a value, and is refused like any other wrong one.
+  const backend = record.backend === undefined ? "none" : record.backend;
+  if (backend !== "none" && backend !== "mempalace") refuse("backend", '"none" or "mempalace"');
+  const command = record.command === undefined ? ["mempalace-mcp"] : record.command;
+  if (!stringList(command) || command.length === 0) refuse("command", "a non-empty array of non-empty strings");
+  const wing = record.wing;
+  if (wing !== undefined && (typeof wing !== "string" || wing.length === 0)) refuse("wing", "a non-empty string");
+  const excludeWings = record.excludeWings === undefined ? [] : record.excludeWings;
+  if (!stringList(excludeWings)) refuse("excludeWings", "an array of non-empty strings");
+  const rooms = record.rooms === undefined ? ["pitfall", "pattern", "decision"] : record.rooms;
+  if (!stringList(rooms)) refuse("rooms", "an array of non-empty strings");
+  // Its own check: `number` insists on a positive value, and 0 is a setting here — keep everything.
+  const minSimilarity = record.minSimilarity === undefined ? 0.55 : record.minSimilarity;
+  if (typeof minSimilarity !== "number" || !(minSimilarity >= 0 && minSimilarity <= 1)) refuse("minSimilarity", "a number from 0 to 1");
+  const maxItems = record.maxItems === undefined ? 5 : record.maxItems;
+  if (!positive(maxItems) || !Number.isInteger(maxItems)) refuse("maxItems", "a positive integer");
+  const maxChars = record.maxChars === undefined ? 2_000 : record.maxChars;
+  if (!positive(maxChars) || !Number.isInteger(maxChars)) refuse("maxChars", "a positive integer");
+  const itemChars = record.itemChars === undefined ? 400 : record.itemChars;
+  if (!positive(itemChars) || !Number.isInteger(itemChars)) refuse("itemChars", "a positive integer");
+  const timeoutMs = record.timeoutMs === undefined ? 20_000 : record.timeoutMs;
+  if (!positive(timeoutMs)) refuse("timeoutMs", "a positive finite number");
+  return {
+    backend, command: [...command], ...(wing === undefined ? {} : { wing }),
+    excludeWings: [...excludeWings], rooms: [...rooms],
+    minSimilarity, maxItems, maxChars, itemChars, timeoutMs,
+  };
 }
 
 function string(raw: Record<string, unknown>, key: string, path: string): string | undefined {
