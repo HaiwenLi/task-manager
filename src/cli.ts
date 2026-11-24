@@ -64,9 +64,13 @@ type ControllerTelemetry = {
   refreshBoard: () => void;
   writeLogLine: (taskId: string, line: string) => void;
   /**
-   * The line of a task that was never claimed, because the budget guard
-   * refused it: it goes to the operator's `--log` file when there is one, and
-   * never into the task's own directory.
+   * The line of a task the budget guard refused: no model session was started
+   * for it and no attempt was recorded, so the line goes to the operator's
+   * `--log` file when there is one, and never into the task's own directory.
+   * "Unclaimed" describes the task once the refusal has returned, on both of
+   * its paths: normally nothing was claimed; after the second judgement
+   * (`runTask` in `./worker.ts`) the claim's lock record and the workspace
+   * reservation had been written, and both were released again.
    */
   writeUnclaimedLine: (line: string) => void;
   /** Settle the trailing board refresh and queued log writes. */
@@ -127,9 +131,12 @@ function createWorkerDeps({
       const line = workerEventLine(evt);
       log(line);
       if (evt.type === "refused") {
-        // The budget guard said no before anything was claimed, so the task's
-        // directory is not this controller's to write: not even a log line.
-        // The verdicts in the line are what the operator reads.
+        // The budget guard said no, so no attempt of the task started: none of
+        // its lines go into its directory, this one included. Normally nothing
+        // was claimed at all; after the second judgement the claim's lock
+        // record and the reservation had been written, and both were released
+        // again (`writeUnclaimedLine`). The verdicts in the line are what the
+        // operator reads.
         telemetry.writeUnclaimedLine(line);
       } else {
         telemetry.writeLogLine(evt.taskId, line);
@@ -411,7 +418,7 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   if (refused.length > 0) {
     // The guard's verdicts are in the `refused` line(s) above. The board was
     // still drained, but a task that did not run must not read as clean to a script.
-    log(`[scheduler] ${refused.length} task(s) refused by the budget guard; nothing was claimed for them`);
+    log(`[scheduler] ${refused.length} task(s) refused by the budget guard; no model session was started for them`);
     failed = true;
   }
   return failed ? 1 : 0;

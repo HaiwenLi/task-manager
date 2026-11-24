@@ -752,7 +752,7 @@ describe("run, add and split through the CLI", () => {
     // a is open with no model of its own, so it runs on the configured one: "zen/p".
     await seedTaskFile(tasks, buildTaskFile({ id: "a", title: "a" }));
     expect(await runCli(["run", "--config", config], cli())).toBe(1);
-    expect(lines.join("\n")).toContain("[scheduler] 1 task(s) refused by the budget guard; nothing was claimed for them");
+    expect(lines.join("\n")).toContain("[scheduler] 1 task(s) refused by the budget guard; no model session was started for them");
   });
 
   it("run counts the refusals off the result, never off the events", async () => {
@@ -761,12 +761,12 @@ describe("run, add and split through the CLI", () => {
     expect(await runCli(["run", "--config", config], cli())).toBe(1);
     expect(lines.filter((line) => line === `[a] refused ${PAID_LINE}`)).toHaveLength(1);
     expect(lines.filter((line) => line === `[b] refused ${PAID_LINE}`)).toHaveLength(1);
-    expect(lines.join("\n")).toContain("[scheduler] 2 task(s) refused by the budget guard; nothing was claimed for them");
+    expect(lines.join("\n")).toContain("[scheduler] 2 task(s) refused by the budget guard; no model session was started for them");
     // The events were reported already in this process, so this run says nothing new about them, and still exits 1.
     lines.length = 0;
     expect(await runCli(["run", "--config", config], cli())).toBe(1);
     expect(lines.filter((line) => line.includes("] refused"))).toHaveLength(0);
-    expect(lines.join("\n")).toContain("[scheduler] 2 task(s) refused by the budget guard; nothing was claimed for them");
+    expect(lines.join("\n")).toContain("[scheduler] 2 task(s) refused by the budget guard; no model session was started for them");
   });
 
   it("a refused run writes nothing into the task's directory, not even its log line", async () => {
@@ -781,7 +781,7 @@ describe("run, add and split through the CLI", () => {
     expect(await runCli(["run", "--batch", "a,b", "--config", config], cli())).toBe(1);
     const text = lines.join("\n");
     expect(text).toContain("[batch] stopped at a (refused); unclaimed: b");
-    expect(text).toContain("[scheduler] 1 task(s) refused by the budget guard; nothing was claimed for them");
+    expect(text).toContain("[scheduler] 1 task(s) refused by the budget guard; no model session was started for them");
     expect(promptCalls).toBe(0);
   });
 
@@ -807,7 +807,7 @@ describe("run, add and split through the CLI", () => {
     }))).toBe(1);
 
     const controller = lines.indexOf("[scheduler] 1 task(s) blocked by a controller error; see the controller-error line(s) above");
-    const refusal = lines.indexOf("[scheduler] 1 task(s) refused by the budget guard; nothing was claimed for them");
+    const refusal = lines.indexOf("[scheduler] 1 task(s) refused by the budget guard; no model session was started for them");
     // Each line for its own count, the controller errors first: neither hides the other.
     expect(controller).toBeGreaterThanOrEqual(0);
     expect(refusal).toBeGreaterThanOrEqual(0);

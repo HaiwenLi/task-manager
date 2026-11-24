@@ -11,8 +11,9 @@ import type { WorkerConfig } from "./worker.js";
  * of models, and nothing said what those models cost. On 2026-11-25 a chain
  * copied from an older project ran six tasks on pay-per-token models while
  * the same machine's subscription models cost nothing. So every model a task
- * may run on is judged before anything is claimed, and what was not allowed
- * explicitly is refused:
+ * may run on is judged before anything is claimed — and once more after the
+ * claim, before any session starts, on the task as the board then holds it —
+ * and what was not allowed explicitly is refused:
  *
  * - `free` (every reported price is 0) runs unless `allowedProviders` is set
  *   and leaves the provider out;

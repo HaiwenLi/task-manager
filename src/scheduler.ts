@@ -116,10 +116,11 @@ export type SchedulerOptions = {
  * ran out. It is normally empty: the run ends because nothing is left to do.
  *
  * A task the budget guard refused (`src/budget.ts`) is offered once and is
- * not progress: it stays `open`, nothing was claimed for it, and the guard's
- * answer will not change while this run lasts. It is not offered again in a
- * later pass, not listed in `pending` (another `run` will not start it), and
- * named once in `refused`, which is present only when something was refused.
+ * not progress: it stays `open`, no model session was started for it, it is
+ * unclaimed once the offer has returned, and the guard's answer will not
+ * change while this run lasts. It is not offered again in a later pass, not
+ * listed in `pending` (another `run` will not start it), and named once in
+ * `refused`, which is present only when something was refused.
  */
 export async function runScheduler(
   cfg: WorkerConfig,

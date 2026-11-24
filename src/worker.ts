@@ -149,12 +149,18 @@ export type WorkerDeps = {
 export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error" | "refused";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
 /**
- * `refused`: the budget guard said no before anything ran. The task stays as
- * the board has it (`open`, and unclaimed once the attempt has returned), no
- * model session started, and nothing of an attempt was written into its
- * directory, so it is neither progress nor a reason to wait for a human; it
- * needs no recovery. `runTask` judges twice: before the claim, and right
- * after the workspace is reserved, on the task as the board then holds it.
+ * `refused`: the budget guard said no, so no model session started and no
+ * attempt record was written — that is what a refusal guarantees, whichever
+ * of its two paths refused. The task stays as the board has it (`open`, and
+ * unclaimed once the attempt has returned), so it is neither progress nor a
+ * reason to wait for a human; it needs no recovery.
+ *
+ * `runTask` judges twice, and only the first refusal writes nothing at all.
+ * Before the claim, on the snapshot the caller passed: nothing is claimed
+ * and nothing written. Right after the workspace is reserved, on the task as
+ * the board then holds it: the claim's lock record and the reservation were
+ * written and are released again — and the `execution-state-invalid` line
+ * stays, on the rare task whose execution state could not be read.
  */
 export type TaskOutcome = "done" | "blocked" | "skipped" | "open" | "awaiting-human" | "refused";
 export type RunTaskOptions = {
@@ -257,11 +263,12 @@ export async function runTask(
   // Even callers reusing a worker label get a distinct fencing generation.
   const owner = `${workerId}:${randomUUID()}`;
   // The budget guard, before anything is claimed: every model this attempt
-  // may run on is judged first, and a refusal leaves the task `open`, with
-  // nothing written into its directory and no session started. A review-only
-  // recovery runs the reviewer alone, so the worker's models are not judged.
-  // This is the snapshot the caller passed; the task is judged again below, as
-  // the board holds it once the claim has been made.
+  // may run on is judged first, and a refusal here leaves the task `open`,
+  // with nothing written into its directory and no session started. A
+  // review-only recovery runs the reviewer alone, so the worker's models are
+  // not judged. This is the snapshot the caller passed; the task is judged
+  // again below, as the board holds it once the claim has been made, where a
+  // refusal comes after the claim was written and releases it.
   const refused = await checkModels(cfg, deps.adapter, options.reviewOnly
     ? { reviewer: reviewerModels(cfg) }
     : { worker: workerModels(cfg, task), reviewer: reviewerModels(cfg) });
@@ -350,8 +357,10 @@ export async function runTask(
     // (`r.task`): a `model:` edited onto it in between must not run unjudged.
     // The catalogue is remembered, so wherever the first guard could read it
     // this is a second judgement, not a second call; and it is read in the
-    // directory the session starts in. Nothing has been emitted or written for
-    // the attempt yet.
+    // directory the session starts in. No session has started and no attempt
+    // record exists yet: so far this attempt has written the claim's lock
+    // record and the workspace reservation, and nothing more unless the
+    // execution state could not be read above.
     const refusedHere = await checkModels(r.cfg, deps.adapter, r.reviewOnly
       ? { reviewer: reviewerModels(r.cfg) }
       : { worker: workerModels(r.cfg, r.task), reviewer: reviewerModels(r.cfg) });
@@ -361,7 +370,10 @@ export async function runTask(
       // is released again by the `finally`. The workspace reservation is given
       // back here: the `finally` releases only the reservation of a record
       // that settled, and no record was written for this attempt. The task is
-      // left exactly as the board holds it.
+      // left exactly as the board holds it. Unlike a refusal before the claim,
+      // this one is not "nothing was written": the two above were written and
+      // released again, and the `execution-state-invalid` line stays when the
+      // execution state could not be read. No session started.
       await reservation.release();
       return "refused";
     }
