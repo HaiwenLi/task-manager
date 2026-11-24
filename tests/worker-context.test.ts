@@ -230,10 +230,13 @@ describe("runTask — worker context", () => {
     const { text } = await attempt(cfg(tasksDir));
     // The prompt writes the note that closes the spec section; the section read from disk leaves it to the prompt.
     expect(text.split(SPEC_NOTE)).toHaveLength(2);
-    // What it carries is the clipped spec: the marker stands where the middle was left out, and the whole
-    // prompt is that limit plus the fixed copy and the absolute paths (about 1,130 characters), not the 20,000 on disk.
+    // What it carries is the clipped spec and no more: the marker stands where the middle was left out, and
+    // the spec body is exactly the limit long. Measured on the body alone, so the count does not move with
+    // the length of the absolute paths in the prompt; the body is the spec, then the blank line before the note.
     expect(text).toContain("中段已省略");
-    expect(text.length).toBeLessThan(SPEC_MAX_CHARS + 1_500);
+    const heading = "## 已批准的规格\n";
+    const body = text.slice(text.indexOf(heading) + heading.length, text.lastIndexOf(SPEC_NOTE));
+    expect(body).toHaveLength(SPEC_MAX_CHARS + 2);
   });
 
   it("leaves the prompt unchanged when both switches are off", async () => {
