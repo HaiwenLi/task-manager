@@ -269,6 +269,20 @@ describe("modelFirstPass", () => {
     expect(modelFirstPass([{ model: "plan/m", journal: [] }, { model: "plan/m", journal: [line("worker", "claimed")] }]))
       .toEqual([{ model: "plan/m", tasks: 2, firstReviewPassed: 0, noReview: 2 }]);
   });
+
+  it("does not count a reviewer turn the provider refused as a missed first review", () => {
+    // The worker journals a refused reviewer turn as a verdict degraded to `unclear`, then `provider-failed` right after it.
+    const refused = [line("review", "started", "criteria=1"), line("review", "verdict", "unclear"), line("review", "provider-failed", "review turn failed with exit 1")];
+    // With nothing after the pair no reviewer judged the work, so the task had no review. With the next model's real
+    // verdict after it, that verdict is the first review, and it passed.
+    expect(modelFirstPass([
+      { model: "plan/m", journal: [line("worker", "claimed"), ...refused] },
+      { model: "zen/p", journal: [line("worker", "claimed"), ...refused, line("review", "model-fallback", "r/one -> r/two (review rejected by r/one)"), line("review", "verdict", "pass")] },
+    ])).toEqual([
+      { model: "plan/m", tasks: 1, firstReviewPassed: 0, noReview: 1 },
+      { model: "zen/p", tasks: 1, firstReviewPassed: 1, noReview: 0 },
+    ]);
+  });
 });
 
 describe("taskctl metrics: human touches and first review pass by model", () => {
@@ -350,5 +364,18 @@ describe("taskctl metrics: human touches and first review pass by model", () => 
     expect(touches).toBeGreaterThanOrEqual(0);
     expect(cap.lines.slice(touches, touches + 3)).toEqual(["人工触点", "等人时长为墙钟时间，包含夜间和周末，是近似值", "（无）"]);
     expect(cap.lines.slice(-2)).toEqual(["按模型的首轮复核通过", "(unknown)  任务 1  首轮通过 0  未复核 1  首轮通过率 -"]);
+  });
+
+  it("reports a finished render task under the model of its render.json, the only record it has", async () => {
+    // A task with verify: render is accepted by the render check, which writes render.json with the model that
+    // produced the work, and never an acceptance.json.
+    await writeFile(join(tasks, "a.md"), serializeTaskFile(buildTaskFile({ id: "a", status: "done", verify: "render", renderTargets: ["index.html"] })), "utf8");
+    await mkdir(join(tasks, "a"), { recursive: true });
+    await writeRuntime(tasks, "a", "render.json", {
+      ok: true, browser: "Chrome/142.0.0.0", at: "2026-11-25T00:00:00Z", views: [], model: "plan/m", definitionDigest: "0".repeat(64), escalated: false,
+    });
+    const cap = capture();
+    expect(await runCli(["metrics", "--config", await writeConfig()], cap.deps)).toBe(0);
+    expect(cap.lines.slice(-2)).toEqual(["按模型的首轮复核通过", "plan/m  任务 1  首轮通过 0  未复核 1  首轮通过率 -"]);
   });
 });

@@ -133,8 +133,9 @@ export function humanTouches(journals: ReadonlyMap<string, readonly JournalLine[
 /**
  * How often the first review passed, per model: what an owner changes models
  * by. The caller passes finished tasks only, each with the model its
- * acceptance ran on (`acceptance.json`), or `null` when no record says; a
- * null model is reported as `(unknown)`.
+ * acceptance ran on (`acceptance.json`; `render.json` for a task the render
+ * check accepted, which writes no `acceptance.json`), or `null` when no
+ * record says; a null model is reported as `(unknown)`.
  *
  * The first review is the first `review`/`verdict` line of the part of the
  * journal after its last `worker`/`claimed` — the attempt that finished the
@@ -142,15 +143,27 @@ export function humanTouches(journals: ReadonlyMap<string, readonly JournalLine[
  * detail begins with `pass` counts as passed (tolerated external changes
  * follow it: `pass external=2`); any other verdict counts as not passed; no
  * verdict at all counts as `noReview`, a task that finished on a mechanical
- * or render check and never saw a reviewer. A model appears once, where it
- * first appears in `rows`.
+ * or render check and never saw a reviewer.
+ *
+ * A reviewer turn the provider refused is no review, and counts as none: the
+ * worker journals it as a verdict degraded to `unclear` with
+ * `review`/`provider-failed` right after it, and that pair is passed over.
+ * The next verdict line of the segment decides; with none, the task is
+ * `noReview`, since no reviewer judged the work. A verdict with no such line
+ * after it is a review, a real `unclear` included: not passed.
+ *
+ * A model appears once, where it first appears in `rows`.
  */
 export function modelFirstPass(rows: readonly { model: string | null; journal: readonly JournalLine[] }[]): ModelFirstPass[] {
   const byModel = new Map<string, ModelFirstPass>();
   for (const { model, journal } of rows) {
     const name = model ?? "(unknown)";
     const lastClaim = journal.findLastIndex((line) => line.stage === "worker" && line.event === "claimed");
-    const verdict = journal.slice(lastClaim + 1).find((line) => line.stage === "review" && line.event === "verdict");
+    const segment = journal.slice(lastClaim + 1);
+    // The verdict that decides is the first one that is a review. A verdict with `provider-failed` right after
+    // it is the degraded one of a turn the provider refused, which is no review.
+    const verdict = segment.find((line, index) =>
+      line.stage === "review" && line.event === "verdict" && !providerFailedFollows(segment[index + 1]));
     const row = byModel.get(name) ?? { model: name, tasks: 0, firstReviewPassed: 0, noReview: 0 };
     row.tasks += 1;
     if (verdict === undefined) row.noReview += 1;
@@ -158,6 +171,15 @@ export function modelFirstPass(rows: readonly { model: string | null; journal: r
     byModel.set(name, row);
   }
   return [...byModel.values()];
+}
+
+/**
+ * Whether `next`, the journal line right after a `review`/`verdict` line,
+ * says that verdict was the degraded one of a turn the provider refused: the
+ * worker journals the two together, the verdict first.
+ */
+function providerFailedFollows(next: JournalLine | undefined): boolean {
+  return next !== undefined && next.stage === "review" && next.event === "provider-failed";
 }
 
 /**

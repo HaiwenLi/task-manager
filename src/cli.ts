@@ -1364,15 +1364,24 @@ async function metricsCommand(flags: Map<string, string>, log: (line: string) =>
 }
 
 /**
- * The model a finished task's acceptance ran on, from its `acceptance.json`;
- * `null` when the file or the field is absent. A record too torn to read is
- * one that says nothing (as `readClassification` in `./metrics.ts` reads its
- * own): the task is credited to no model, and the metrics still print.
+ * The model a finished task's acceptance ran on, from its `acceptance.json`.
+ * A task with `verify: render` has no `acceptance.json`: the render check is
+ * what accepted it, and it writes `render.json` instead. So when the record
+ * is absent or names no model, the `model` of `render.json` is read. `null`
+ * when neither says. A record too torn to read is one that says nothing (as
+ * `readClassification` in `./metrics.ts` reads its own): the task is
+ * credited to no model, and the metrics still print.
  */
 async function acceptanceModel(tasksDir: string, id: string): Promise<string | null> {
+  return await recordedModel(tasksDir, id, "acceptance.json")
+    ?? await recordedModel(tasksDir, id, "render.json");
+}
+
+/** The `model` of one runtime record: `null` when the file is absent, cannot be parsed, or has none. */
+async function recordedModel(tasksDir: string, id: string, name: string): Promise<string | null> {
   let record: { model?: unknown } | null;
   try {
-    record = await readRuntime<{ model?: unknown }>(tasksDir, id, "acceptance.json");
+    record = await readRuntime<{ model?: unknown }>(tasksDir, id, name);
   } catch (err) {
     if (err instanceof SyntaxError) return null;
     throw err;
