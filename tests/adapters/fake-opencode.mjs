@@ -39,6 +39,9 @@ const argv = process.argv.slice(2);
 if (process.env.FAKE_ARGV_FILE) {
   writeFileSync(process.env.FAKE_ARGV_FILE, JSON.stringify(argv), "utf8");
 }
+if (process.env.FAKE_API_LOG && argv[0] === "api") {
+  appendFileSync(process.env.FAKE_API_LOG, `${argv.slice(0, 2).join(" ")}\n`, "utf8");
+}
 
 if (process.env.FAKE_STDERR_TEXT) {
   process.stderr.write(process.env.FAKE_STDERR_TEXT.repeat(Number(process.env.FAKE_STDERR_REPEAT ?? 1)));
@@ -102,7 +105,16 @@ if (subcommand === "run") {
   process.stdout.write(
     `${JSON.stringify({
       location: `/session/${sessionID}`,
-      data: { tokens: { input: 1000, output: 200, reasoning: 100, cache: { read: 50, write: 25 } } },
+      data: process.env.FAKE_SESSION_STATUS === "missing" ? null : {
+        tokens: { input: 1000, output: 200, reasoning: 100, cache: { read: 50, write: 25 } },
+        cost: 0.25,
+        model: { providerID: process.env.FAKE_SESSION_PROVIDER ?? "anthropic", id: process.env.FAKE_SESSION_MODEL ?? "sonnet", variant: "default" },
+        location: { directory: process.env.FAKE_SESSION_CWD ?? process.cwd() },
+        time: process.env.FAKE_SESSION_STATUS === "active"
+          ? { busy: Date.now() }
+          : process.env.FAKE_SESSION_STATUS === "idle" ? { idle: Date.now() } : {},
+        ...(process.env.FAKE_SESSION_STATUS === "idle" ? { outcome: "completed" } : {}),
+      },
     })}\n`,
   );
   process.exitCode = 0;

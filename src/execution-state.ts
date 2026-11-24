@@ -5,7 +5,7 @@ const EXECUTION_STATE_FILE = "execution-state.json";
 const MAX_REASONS = 50;
 const MAX_REASON_LENGTH = 500;
 
-export type WorkerSessionFact = { sessionId: string; model?: string };
+export type WorkerSessionFact = { sessionId: string; model?: string; clean?: boolean };
 
 export type ExecutionState = {
   requiresReview: boolean;
@@ -103,6 +103,7 @@ function validState(value: unknown): value is ExecutionState {
     const worker = record.latestWorker as Record<string, unknown>;
     if (typeof worker.sessionId !== "string" || worker.sessionId.length === 0) return false;
     if (worker.model !== undefined && typeof worker.model !== "string") return false;
+    if (worker.clean !== undefined && typeof worker.clean !== "boolean") return false;
   }
   return true;
 }

@@ -187,17 +187,38 @@ describe("worker model fallback", () => {
     const models: string[] = [];
     const dead = { turns: { "w/one": rejected("w/one"), "w/two": rejected("w/two") } };
     // The first attempt spends the whole chain and blocks.
-    await run(adapter(dead, models), [], { modelFallbacks: ["w/two"] });
+    // This test targets per-task rotation, not the newer board-level cooldown.
+    await run(adapter(dead, models), [], { modelFallbacks: ["w/two"], modelCooldownMs: 0 });
     await store.updateFields("a", { retries: 0 });
     await store.setStatus("a", "open");
     const healthy = { turns: { "w/one": "done", "w/two": "done" }, reviews: { "(default)": PASS_VERDICT } };
-    await run(adapter(healthy, models), [], { modelFallbacks: ["w/two"] });
+    await run(adapter(healthy, models), [], { modelFallbacks: ["w/two"], modelCooldownMs: 0 });
 
     expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one", "w/two", "w/two"]);
   });
 });
 
 describe("reviewer model fallback", () => {
+  it("resolves reviewer variants before dispatch instead of appending effort blindly", async () => {
+    await seed();
+    const agent = adapter({ turns: { "w/one": "done" }, reviews: { "r/one": PASS_VERDICT } });
+    const resolutions: string[] = [];
+    const reviewEfforts: (string | undefined)[] = [];
+    agent.resolveModel = async (model, effort) => {
+      resolutions.push(`${model ?? "(default)"}#${effort ?? "(none)"}`);
+      return model;
+    };
+    const start = agent.start!.bind(agent);
+    agent.start = (args) => {
+      if (args.title?.startsWith("review:")) reviewEfforts.push(args.effort);
+      return start(args);
+    };
+
+    expect(await run(agent, [], { reviewerModel: "r/one", reviewerEffort: "high" })).toBe("done");
+    expect(resolutions).toContain("r/one#high");
+    expect(reviewEfforts).toEqual([undefined]);
+  });
+
   it("re-reviews with the next model instead of re-running the work", async () => {
     await seed();
     const models: string[] = [];

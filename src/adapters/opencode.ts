@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import type { AgentAdapter } from "./types.js";
+import { resolve } from "node:path";
+import type { AgentAdapter, SessionReuseStatus, SessionUsageSnapshot } from "./types.js";
 import { processExecution, type Execution } from "../execution.js";
 
 /** One prompt() turn — the execution-plane call and its result. */
@@ -52,8 +53,8 @@ type JsonObject = Record<string, unknown>;
 export class OpenCodeAdapter implements AgentAdapter {
   private readonly bin: string;
   private readonly binArgsPrefix: string[];
-  /** Model metadata for the variant lookup; fetched once per adapter. */
-  private modelList?: Promise<Map<string, Set<string>>>;
+  /** Model metadata for variant/context lookups; fetched once per adapter. */
+  private modelList?: Promise<Map<string, { variants: Set<string>; context?: number }>>;
 
   constructor(opts: { bin?: string; binArgsPrefix?: string[] } = {}) {
     this.bin = opts.bin ?? "opencode";
@@ -86,20 +87,20 @@ export class OpenCodeAdapter implements AgentAdapter {
   private async variantsOf(model: string): Promise<Set<string> | undefined> {
     const catalogue = await this.modelCatalogue();
     const bare = model.includes("/") ? model.slice(model.indexOf("/") + 1) : model;
-    for (const [key, variants] of catalogue) {
+    for (const [key, entry] of catalogue) {
       const provider = key.includes("/") ? key.slice(0, key.indexOf("/")) : "";
       const id = key.includes("/") ? key.slice(key.indexOf("/") + 1) : key;
       if (`${provider}/${id}`.toLowerCase() === model.toLowerCase() || id.toLowerCase() === bare.toLowerCase()) {
-        return variants;
+        return entry.variants;
       }
     }
     return undefined;
   }
 
   /** `opencode api model.list`, fetched once and kept for the process life. */
-  private modelCatalogue(): Promise<Map<string, Set<string>>> {
+  private modelCatalogue(): Promise<Map<string, { variants: Set<string>; context?: number }>> {
     this.modelList ??= this.api("model.list").then((envelope) => {
-      const catalogue = new Map<string, Set<string>>();
+      const catalogue = new Map<string, { variants: Set<string>; context?: number }>();
       if (Array.isArray(envelope.data)) {
         for (const entry of envelope.data) {
           const object = asObject(entry);
@@ -112,15 +113,17 @@ export class OpenCodeAdapter implements AgentAdapter {
                 return typeof name === "string" ? [name] : [];
               })
             : [];
+          const rawContext = asObject(object?.limit)?.context;
+          const context = typeof rawContext === "number" && Number.isFinite(rawContext) ? rawContext : undefined;
           const names = [id, modelID].filter((name): name is string => typeof name === "string");
           for (const name of names) {
             const key = typeof providerID === "string" ? `${providerID}/${name}` : name;
-            if (!catalogue.has(key)) catalogue.set(key, new Set(variants));
+            if (!catalogue.has(key)) catalogue.set(key, { variants: new Set(variants), ...(context === undefined ? {} : { context }) });
           }
         }
       }
       return catalogue;
-    }).catch(() => new Map<string, Set<string>>());
+    }).catch(() => new Map<string, { variants: Set<string>; context?: number }>());
     return this.modelList;
   }
 
@@ -313,6 +316,53 @@ export class OpenCodeAdapter implements AgentAdapter {
     );
   }
 
+  async sessionUsage(sessionId: string): Promise<SessionUsageSnapshot> {
+    const data = asObject((await this.api("session.get", [`sessionID=${sessionId}`])).data);
+    const tokens = asObject(data?.tokens);
+    const cache = asObject(tokens?.cache);
+    const model = asObject(data?.model);
+    const providerID = typeof model?.providerID === "string" ? model.providerID : "";
+    const id = typeof model?.id === "string" ? model.id : "";
+    return {
+      input: count(tokens?.input),
+      output: count(tokens?.output),
+      reasoning: count(tokens?.reasoning),
+      cacheRead: count(cache?.read),
+      cacheWrite: count(cache?.write),
+      ...(typeof data?.cost === "number" && Number.isFinite(data.cost) ? { cost: data.cost } : {}),
+      ...(providerID && id ? { model: `${providerID}/${id}` } : {}),
+    };
+  }
+
+  async canResumeSession(
+    sessionId: string,
+    expected: { model: string; cwd: string },
+  ): Promise<SessionReuseStatus> {
+    try {
+      const envelope = await within(this.api("session.get", [`sessionID=${sessionId}`]), 4_000);
+      const data = asObject(envelope.data);
+      if (!data) return "unavailable";
+      const time = asObject(data.time);
+      if (typeof time?.busy === "number" && time.idle === undefined && (data.outcome === undefined || data.outcome === null)) return "active";
+      const model = asObject(data.model);
+      const actualModel = typeof model?.providerID === "string" && typeof model.id === "string"
+        ? `${model.providerID}/${model.id}`
+        : undefined;
+      const directory = asObject(data.location)?.directory;
+      const expectedModel = expected.model.replace(/#.*$/, "");
+      const normalize = (path: string) => {
+        const value = resolve(path);
+        return process.platform === "win32" ? value.toLowerCase() : value;
+      };
+      if (actualModel !== expectedModel || typeof directory !== "string" || normalize(directory) !== normalize(expected.cwd)) {
+        return "unavailable";
+      }
+      return "reusable";
+    } catch {
+      return "unavailable";
+    }
+  }
+
   /**
    * `limit.context` of a model from `api model.list`: an entry matches when
    * `${providerID}/${id}` equals the model, or — falling back — when its
@@ -321,24 +371,16 @@ export class OpenCodeAdapter implements AgentAdapter {
    * that would silently disable the Context Budget check.
    */
   async contextLimit(model: string): Promise<number> {
-    const envelope = await this.api("model.list");
-    if (!Array.isArray(envelope.data)) {
-      throw new Error("opencode api model.list returned no model list");
-    }
+    const catalogue = await this.modelCatalogue();
     const bare = model.includes("/") ? model.slice(model.indexOf("/") + 1) : model;
-    const entries = envelope.data.flatMap((entry) => {
-      const object = asObject(entry);
-      const id = object?.id;
-      return typeof id === "string" ? [{ id, providerID: object?.providerID, limit: object?.limit }] : [];
-    });
-    const matched =
-      entries.find((entry) => typeof entry.providerID === "string" && `${entry.providerID}/${entry.id}` === model) ??
-      entries.find((entry) => entry.id === bare);
-    const context = asObject(matched?.limit)?.context;
-    if (typeof context !== "number" || !Number.isFinite(context)) {
+    const matched = catalogue.get(model) ?? [...catalogue.entries()].find(([key]) => {
+      const id = key.includes("/") ? key.slice(key.indexOf("/") + 1) : key;
+      return id === bare;
+    })?.[1];
+    if (matched?.context === undefined) {
       throw new Error(`unknown model "${model}" — no matching entry in opencode api model.list`);
     }
-    return context;
+    return matched.context;
   }
 
   /**

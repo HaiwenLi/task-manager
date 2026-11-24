@@ -25,6 +25,11 @@ afterEach(async () => {
   delete process.env.FAKE_CWD_MARKER;
   delete process.env.FAKE_STDERR_TEXT;
   delete process.env.FAKE_STDERR_REPEAT;
+  delete process.env.FAKE_API_LOG;
+  delete process.env.FAKE_SESSION_STATUS;
+  delete process.env.FAKE_SESSION_PROVIDER;
+  delete process.env.FAKE_SESSION_MODEL;
+  delete process.env.FAKE_SESSION_CWD;
   await rm(cwd, { recursive: true, force: true });
 });
 
@@ -207,5 +212,42 @@ describe("OpenCodeAdapter.contextLimit", () => {
   it("rejects when no listed model matches", async () => {
     // 找不到模型是配置错误：宁可失败也不要悄悄返回 0 让预算检查失效
     await expect(makeAdapter().contextLimit("nope/unknown")).rejects.toThrow(/unknown/i);
+  });
+
+  it("shares one model.list catalogue across variants and context limits", async () => {
+    const log = join(cwd, "api-calls.log");
+    process.env.FAKE_API_LOG = log;
+    const adapter = makeAdapter();
+
+    await adapter.resolveModel("openai/gpt", "high");
+    await expect(adapter.contextLimit("openai/gpt")).resolves.toBe(128000);
+    await adapter.resolveModel("anthropic/sonnet", "high");
+    await expect(adapter.contextLimit("anthropic/sonnet")).resolves.toBe(200000);
+
+    const calls = (await readFile(log, "utf8")).trim().split(/\r?\n/);
+    expect(calls.filter((line) => line === "api model.list")).toHaveLength(1);
+  });
+});
+
+describe("OpenCodeAdapter session status and usage", () => {
+  it("maps idle, active and unavailable sessions to reuse decisions", async () => {
+    const adapter = makeAdapter();
+    process.env.FAKE_SESSION_STATUS = "idle";
+    process.env.FAKE_SESSION_CWD = cwd;
+    await expect(adapter.canResumeSession("ses_fake123", { model: "anthropic/sonnet", cwd })).resolves.toBe("reusable");
+
+    process.env.FAKE_SESSION_STATUS = "active";
+    await expect(adapter.canResumeSession("ses_fake123", { model: "anthropic/sonnet", cwd })).resolves.toBe("active");
+
+    process.env.FAKE_SESSION_STATUS = "missing";
+    await expect(adapter.canResumeSession("ses_fake123", { model: "anthropic/sonnet", cwd })).resolves.toBe("unavailable");
+  });
+
+  it("returns a structured usage snapshot rather than only a token sum", async () => {
+    await expect(makeAdapter().sessionUsage("ses_fake123")).resolves.toMatchObject({
+      input: 1000, output: 200, reasoning: 100,
+      cacheRead: 50, cacheWrite: 25, cost: 0.25,
+      model: "anthropic/sonnet",
+    });
   });
 });

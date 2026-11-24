@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -155,6 +155,17 @@ describe("dispatch on a quota refusal", () => {
     expect((await readModelRotation(tasks, "a")).worker).toMatchObject({ index: 2, model: "q/three" });
   });
 
+  it("does not sleep after selecting a different healthy model", async () => {
+    const { adapter: agent } = adapter({ "q/one": quotaRefusal(), "q/two": "done" });
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    try {
+      await expect(run(agent, [], { model: "q/one", modelChain: ["q/one", "q/two"], quotaBackoffMs: [200] })).resolves.toBe("done");
+      expect(timers.mock.calls.map((call) => call[1])).not.toContain(200);
+    } finally {
+      timers.mockRestore();
+    }
+  });
+
   it("blocks with a note naming every refused model when the chain is spent", async () => {
     const events: WorkerEvent[] = [];
     const { adapter: agent, seen } = adapter({
@@ -282,7 +293,7 @@ describe("cyclic chain (chainCycles)", () => {
       "q/two": [quotaRefusal(), quotaRefusal()],
       "q/three": [quotaRefusal(), quotaRefusal()],
     });
-    await run(allDown.adapter, [], { model: "q/one", modelChain: chain, chainCycles: 1 });
+    await run(allDown.adapter, [], { model: "q/one", modelChain: chain, chainCycles: 1, modelCooldownMs: 0 });
     await store.updateFields("a", { retries: 0 });
     await store.setStatus("a", "open");
 
@@ -294,7 +305,7 @@ describe("cyclic chain (chainCycles)", () => {
       "q/one": ["done"],
       "q/two": [quotaRefusal()],
     });
-    const outcome = await run(recovered.adapter, [], { model: "q/one", modelChain: chain, chainCycles: 1 });
+    const outcome = await run(recovered.adapter, [], { model: "q/one", modelChain: chain, chainCycles: 1, modelCooldownMs: 0 });
 
     expect(outcome).toBe("done");
     expect(recovered.seen).toEqual(["q/three", "q/one"]);

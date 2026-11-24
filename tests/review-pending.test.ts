@@ -84,7 +84,7 @@ describe("review-pending recovery", () => {
     expect(await readRuntime(tasks, "a", "review-pending.json")).toMatchObject({ definitionDigest: expect.any(String) });
 
     const configPath = join(root, "taskctl.json");
-    await writeFile(configPath, JSON.stringify({ tasksDir: tasks, workdir: work, reviewerModel: "r/one" }), "utf8");
+    await writeFile(configPath, JSON.stringify({ tasksDir: tasks, workdir: work, reviewerModel: "r/two" }), "utf8");
     const review = vi.fn(async () => passVerdict);
     const code = await runCli(["retry", "--task", "a", "--review-only", "--config", configPath], {
       adapter: workerAdapter(calls), acceptance, review, log: () => {},
@@ -137,7 +137,7 @@ describe("review-pending recovery", () => {
       externalChanges: [], defects: ["fix the artifact"], summary: "not good",
     };
 
-    const outcome = await runTask(config(), {
+    const outcome = await runTask({ ...config(), reviewerModel: "r/two" }, {
       store, adapter: workerAdapter(calls), acceptance: pass, review: async () => failVerdict,
     }, await store.get("a"), "review-only", { reviewOnly: true });
 

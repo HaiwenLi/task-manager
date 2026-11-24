@@ -24,6 +24,7 @@ import { startReview, type CriterionResult, type ReviewEvidence, type ReviewResu
 import { collectChangeEvidence } from "./changes.js";
 import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck } from "./render.js";
 import { readExecutionState, recordEscalation, recordWorkerSession, type ExecutionState } from "./execution-state.js";
+import { clearModelCooldown, modelCooldown, nextModelCooldown, noteModelRefusal } from "./model-cooldown.js";
 
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
 export const ACCEPTANCE_TIMEOUT_MS_DEFAULT = 10 * 60_000;
@@ -123,6 +124,9 @@ export class WorkerTimeoutError extends Error {
 }
 class UncertainExecutionError extends Error {}
 class ReviewRequiredError extends Error {}
+class ModelsCoolingError extends Error {
+  constructor(readonly retryAfter: string) { super(`every model is cooling until at least ${retryAfter}`); }
+}
 
 type Run = {
   cfg: WorkerConfig; deps: WorkerDeps; task: Task; owner: string;
@@ -138,6 +142,8 @@ type Run = {
   /** Durable execution policy and same-model session facts for this task. */
   executionState?: ExecutionState;
   reviewOnly: boolean;
+  /** The attempt replaced by this claim had already settled cleanly. */
+  previousSettled: boolean;
   /**
    * The inert-sweep reason (e.g. non-Git workdir) is journaled once per
    * attempt, not once per turn — every turn would only repeat the same line.
@@ -172,7 +178,7 @@ export async function runTask(
   let notifyLost!: () => void;
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
   const now = new Date().toISOString();
-  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, sweepSkipNoted: false,
+  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, previousSettled: false, sweepSkipNoted: false,
     dispatchFailures: new Map(),
     record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing" } };
   let reservation: WorkspaceReservation | null = null;
@@ -213,6 +219,7 @@ export async function runTask(
       }));
     }
     const previous = await readAttempt(cfg.tasksDir, task.id);
+    r.previousSettled = previous?.phase === "settled";
     if (r.reviewOnly) {
       if (!previous || previous.phase !== "settled") {
         return await block(r, "review-only recovery requires a settled previous attempt");
@@ -408,7 +415,16 @@ const reviewerChain = (r: Run): string[] => modelChain(r.cfg.reviewerModel, r.cf
 async function modelFor(r: Run, role: ModelRole): Promise<string | undefined> {
   const chain = role === "worker" ? workerChain(r) : reviewerChain(r);
   const rotation = await readModelRotation(r.cfg.tasksDir, r.task.id);
-  return modelAt(chain, chainPosition(chain, rotation[role]));
+  const explicitCycleProbe = (rotation.cycles?.[role] ?? 0) > 0;
+  const available: string[] = [];
+  for (const model of chain) {
+    if (explicitCycleProbe || await modelCooldown(r.cfg.tasksDir, model) === null) available.push(model);
+  }
+  if (chain.length > 0 && available.length === 0) {
+    const next = await nextModelCooldown(r.cfg.tasksDir, chain);
+    throw new ModelsCoolingError(next?.retryAfter ?? new Date(Date.now() + (r.cfg.modelCooldownMs ?? 900_000)).toISOString());
+  }
+  return modelAt(available, chainPosition(available, rotation[role]));
 }
 
 /**
@@ -427,9 +443,21 @@ async function modelFor(r: Run, role: ModelRole): Promise<string | undefined> {
  */
 async function fallBack(r: Run, role: ModelRole, reason: string): Promise<boolean> {
   const chain = role === "worker" ? workerChain(r) : reviewerChain(r);
-  let handover: Handover | null;
+  let handover: Handover | null = null;
   try {
-    handover = await owned(r, () => rotateModel(r.cfg.tasksDir, r.task.id, role, chain, reason, r.cfg.chainCycles ?? 0));
+    const maxRotations = Math.max(1, chain.length * (1 + (r.cfg.chainCycles ?? 0)));
+    for (let step = 0; step < maxRotations; step++) {
+      const candidate = await owned(r, () => rotateModel(r.cfg.tasksDir, r.task.id, role, chain, reason, r.cfg.chainCycles ?? 0));
+      if (candidate === null) break;
+      const rotated = await readModelRotation(r.cfg.tasksDir, r.task.id);
+      const explicitCycleProbe = (rotated.cycles?.[role] ?? 0) > 0;
+      if (explicitCycleProbe || await modelCooldown(r.cfg.tasksDir, candidate.to) === null) {
+        handover = candidate;
+        break;
+      }
+      // Another task already proved this candidate unavailable. Rotation is
+      // advisory, so advance past it without spawning another provider turn.
+    }
   } catch (error) {
     // A lost lease is not a rotation problem: let the run skip, and do not
     // report a write failure for a task this controller no longer owns.
@@ -559,6 +587,42 @@ async function quotaPause(r: Run, step: number): Promise<void> {
   if (ms > 0) await new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
+async function noteRefusal(
+  r: Run, model: string | undefined, result: PromptResult & { durationMs?: number }, category: "quota" | "provider",
+): Promise<void> {
+  if (model === undefined) return;
+  await noteModelRefusal(r.cfg.tasksDir, model, {
+    reason: (result.text ?? "provider rejected the turn").slice(0, 1_000),
+    category,
+    cooldownMs: r.cfg.modelCooldownMs ?? 900_000,
+  });
+}
+
+async function blockForCooldown(r: Run, role: ModelRole, retryAfter: string): Promise<"blocked"> {
+  if (role === "reviewer") {
+    return await parkReviewPending(r, undefined, {
+      verdict: "unclear", criteria: [], externalChanges: [], defects: [],
+      summary: `every reviewer model is cooling until ${retryAfter}`, failure: "provider",
+    });
+  }
+  await owned(r, async () => {
+    const seq = ((await latestNote(r.cfg.tasksDir, r.task.id))?.seq ?? 0) + 1;
+    await writeNote(r.cfg.tasksDir, {
+      task: r.task.id, seq, status: "blocked:needs-owner",
+      done: "所有候选模型都处于共享冷却窗口；本任务未派发，也未消耗 retries。",
+      found: `下一次可探测时间：${retryAfter}`,
+      next: "等待窗口结束、调整模型链，或由所有者明确恢复；不要反复启动 run 撞同一批失效模型。",
+      files: [],
+    });
+    await r.deps.store.setStatus(r.task.id, "blocked");
+    await appendJournal(r.cfg.tasksDir, r.task.id, {
+      stage: "worker", event: "model-cooldown", detail: `every model cooling; next probe ${retryAfter}`,
+    });
+  });
+  emit(r, "blocked", `every model is cooling; next probe ${retryAfter}; retries untouched`);
+  return "blocked";
+}
+
 /** One line saying why a model refused the turn, for the blocked note. */
 function refusalLine(model: string, result: PromptResult & { durationMs: number }): string {
   const first = (result.text ?? "").split(/\r?\n/).map((line) => line.trim()).find((line) => line.length > 0) ?? "no output";
@@ -596,6 +660,22 @@ async function blockForQuota(r: Run, current: string, result: PromptResult & { d
   return "blocked";
 }
 
+async function restoreWorkerSession(r: Run, model: string | undefined): Promise<string | undefined> {
+  const previous = r.executionState?.latestWorker;
+  if (!previous?.clean || !previous.model || previous.model !== model || !r.deps.adapter.canResumeSession) return undefined;
+  if (!r.previousSettled) return undefined;
+  const status = await r.deps.adapter.canResumeSession(previous.sessionId, { model, cwd: r.cfg.workdir });
+  if (status === "active") {
+    throw new UncertainExecutionError(`recorded worker session ${previous.sessionId} is still active; reconcile before starting another worker`);
+  }
+  if (status === "reusable") return previous.sessionId;
+  await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
+    stage: "worker", event: "session-reuse-skipped",
+    detail: `${previous.sessionId}: backend did not confirm an idle matching session; starting fresh`,
+  }));
+  return undefined;
+}
+
 async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
   let sessionId: string | undefined;
   let recordedSession = "", sessionsUsed = r.task.sessions.length, turns = 0;
@@ -610,13 +690,25 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
   // A new attempt gets a fresh wrap budget: the position still points past the
   // models that refused, but the chain may wrap around to them again.
   await resetChainCycles(r.cfg.tasksDir, r.task.id, "worker");
+  let restoreSession = true;
   for (;;) {
     const note = await latestNote(r.cfg.tasksDir, r.task.id);
     const prompt = buildWorkerPrompt(r.task, {
       handoff: note?.markdown, workdir: r.cfg.workdir, tasksDir: r.cfg.tasksDir,
       taskDir: taskDirOf(r.cfg.tasksDir, r.task.id), logDir: logDirOf(r.cfg.tasksDir, r.task.id),
     });
-    const model = await modelFor(r, "worker");
+    let model: string | undefined;
+    try {
+      model = await modelFor(r, "worker");
+    } catch (error) {
+      if (error instanceof ModelsCoolingError) return await blockForCooldown(r, "worker", error.retryAfter);
+      throw error;
+    }
+    if (restoreSession) {
+      sessionId = await restoreWorkerSession(r, model);
+      recordedSession = sessionId ?? "";
+      restoreSession = false;
+    }
     const result = await workedTurn(r, prompt, model, sessionId);
     await owned(r, async () => {
       // A rejected turn did no work, and its session belongs to the backend that
@@ -629,10 +721,11 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
         }
         sessionId = result.sessionId;
         r.executionState = await recordWorkerSession(r.cfg.tasksDir, r.task.id, {
-          sessionId: result.sessionId, ...(model === undefined ? {} : { model }),
+          sessionId: result.sessionId, clean: result.exitCode === 0, ...(model === undefined ? {} : { model }),
         }, declaredExecution(r.task));
       }
     });
+    if (result.exitCode === 0 && model !== undefined) await clearModelCooldown(r.cfg.tasksDir, model);
     turns++;
     // The worker is allowed to report that the work is bigger than the task it
     // was given. That claim is not taken on trust for anything except the bar it
@@ -649,6 +742,7 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       const kind = classifyDispatchFailure({ failure: result.failure, exitCode: result.exitCode,
         durationMs: result.durationMs, tokens: result.tokens, output: result.text ?? "" });
       const modelName = model ?? "(default)";
+      if (result.failure === "provider") await noteRefusal(r, model, result, kind === "quota" ? "quota" : "provider");
       if (kind === "quota") {
         r.dispatchFailures.set(modelName, refusalLine(modelName, result));
         emit(r, "model-fallback", `quota on ${modelName}; not spending a retry`);
@@ -656,7 +750,9 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
           && await fallBack(r, "worker", `quota exhausted on ${modelName}`);
         if (advanced) {
           handovers++;
-          await quotaPause(r, handovers - 1);
+          // Waiting after choosing a *different* healthy provider cools down
+          // nothing. Pause only for a same-model cyclic re-probe.
+          if (await modelFor(r, "worker") === modelName) await quotaPause(r, handovers - 1);
           // The next model must not continue a session the refusing backend owns.
           fresh = true;
         } else {
@@ -1072,15 +1168,22 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "retry" | "open
   // A fresh review round gets a fresh wrap budget, like a fresh attempt.
   await resetChainCycles(r.cfg.tasksDir, id, "reviewer");
   for (;;) {
-    const reviewerModel = await modelFor(r, "reviewer");
+    let reviewerModel: string | undefined;
+    try {
+      reviewerModel = await modelFor(r, "reviewer");
+    } catch (error) {
+      if (error instanceof ModelsCoolingError) return await blockForCooldown(r, "reviewer", error.retryAfter);
+      throw error;
+    }
+    const resolvedReviewer = await r.deps.adapter.resolveModel?.(reviewerModel, r.cfg.reviewerEffort);
     const result = await controlled(r, "review", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT, () =>
       r.deps.review
         ? legacyExecution(() => r.deps.review!(evidence))
         : startReview({
             adapter: r.deps.adapter,
             cwd: r.cfg.workdir,
-            model: reviewerModel,
-            effort: r.cfg.reviewerEffort,
+            model: resolvedReviewer ?? reviewerModel,
+            effort: resolvedReviewer === undefined ? r.cfg.reviewerEffort : undefined,
             title: r.task.title,
           }, evidence),
       (review) => review.failure === "provider",
@@ -1117,12 +1220,19 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "retry" | "open
       : result.verdict);
 
     if (result.failure !== "provider") {
+      if (reviewerModel !== undefined) await clearModelCooldown(r.cfg.tasksDir, reviewerModel);
       // Checked again here: the pre-review check ran before this turn, and a task
       // file edited while the reviewer was reading would otherwise be completed —
       // or reopened for rework — under a definition the reviewer never saw.
       await requireUnchangedDefinition(r, ["review"], "the task definition changed during the review; refusing to act on the verdict");
       await rm(join(r.cfg.tasksDir, id, "review-pending.json"), { force: true });
       return await judge(r, result, prevCriteria);
+    }
+    if (reviewerModel !== undefined) {
+      await noteModelRefusal(r.cfg.tasksDir, reviewerModel, {
+        reason: result.summary || "review provider rejected the turn",
+        category: "provider", cooldownMs: r.cfg.modelCooldownMs ?? 900_000,
+      });
     }
     await owned(r, () => appendJournal(r.cfg.tasksDir, id, {
       stage: "review",
@@ -1306,8 +1416,10 @@ async function overBudget(r: Run, sessionId: string | undefined, model: string |
   // Telemetry is not allowed to hang indefinitely outside the lease/cancel boundary.
   try {
     const usage = await controlled(r, "context telemetry", 10_000, () => legacyExecution(async () => {
-      const used = await r.deps.adapter.contextUsage(sessionId);
-      const limit = await r.deps.adapter.contextLimit(model);
+      const [used, limit] = await Promise.all([
+        r.deps.adapter.contextUsage(sessionId),
+        r.deps.adapter.contextLimit(model),
+      ]);
       return limit > 0 && used / limit >= r.cfg.contextThreshold;
     }));
     return usage;

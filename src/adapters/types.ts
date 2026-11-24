@@ -23,6 +23,18 @@ export type PromptResult = {
  * execution plane is `start` (or legacy `prompt`) — one full agent turn; the control plane is
  * the context telemetry the Context Budget check (ADR-0003) consumes.
  */
+export type SessionUsageSnapshot = {
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost?: number;
+  model?: string;
+};
+
+export type SessionReuseStatus = "reusable" | "active" | "unavailable";
+
 export interface AgentAdapter {
   prompt(args: {
     sessionId?: string;
@@ -54,4 +66,8 @@ export interface AgentAdapter {
   contextUsage(sessionId: string): Promise<number>;
   /** limit.context */
   contextLimit(model: string): Promise<number>;
+  /** Structured cumulative usage for reports; absent means unmeasured. */
+  sessionUsage?(sessionId: string): Promise<SessionUsageSnapshot>;
+  /** Best-effort proof that a persisted session is idle and safe to continue. */
+  canResumeSession?(sessionId: string, expected: { model: string; cwd: string }): Promise<SessionReuseStatus>;
 }
