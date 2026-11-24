@@ -239,7 +239,10 @@ describe("records that a later decision depends on", () => {
     expect((await store.get("a")).retries).toBe(1);
     const note = await latestNote(tasks, "a");
     expect(note?.markdown).not.toContain("未派发");
-    expect(note?.markdown).toContain("第 1 个回合");
+    // One turn was dispatched. The retry budget was not exhausted (1 of 2), so
+    // the note must not say it was; the retries consumed are in the task file.
+    expect(note?.markdown).toContain("已派发 1 个回合");
+    expect(note?.markdown).not.toMatch(/耗尽了重试预算/);
   });
 });
 

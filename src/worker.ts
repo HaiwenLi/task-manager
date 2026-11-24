@@ -731,19 +731,21 @@ async function noteRefusal(
 }
 
 /**
- * Park a task because every model on its chain is cooling. `failedTurns` is
- * how many turns this attempt already dispatched: a task blocked before its
- * first dispatch spent nothing, while one blocked after a refused turn did
- * spend a retry, and the note must not claim otherwise.
+ * Park a task because every model on its chain is cooling. `dispatchedTurns` is
+ * how many turns this attempt already dispatched. A task blocked before its
+ * first dispatch spent nothing. Whether a dispatched turn spent a retry depends
+ * on why it failed — a refused provider turn spends none — and an exhausted
+ * budget returns `blocked` before the loop ever gets here, so the note states
+ * the count and points at the task file instead of guessing.
  */
-async function blockForCooldown(r: Run, role: ModelRole, retryAfter: string, failedTurns = 0): Promise<"blocked"> {
+async function blockForCooldown(r: Run, role: ModelRole, retryAfter: string, dispatchedTurns = 0): Promise<"blocked"> {
   if (role === "reviewer") {
     // Name the models that are cooling, so the parked record says who refused.
     return await parkReviewPending(r, reviewerChain(r).join(", ") || undefined, `every reviewer model is cooling until ${retryAfter}`);
   }
-  const spent = failedTurns === 0
+  const spent = dispatchedTurns === 0
     ? "本任务未派发，也未消耗 retries。"
-    : `本尝试已派发，并在第 ${failedTurns} 个回合被拒后耗尽了重试预算；已消耗的重试以任务文件为准。`;
+    : `本尝试已派发 ${dispatchedTurns} 个回合，之后所有候选模型都进入了冷却；已消耗的重试次数以任务文件为准。`;
   await owned(r, async () => {
     const seq = ((await latestNote(r.cfg.tasksDir, r.task.id))?.seq ?? 0) + 1;
     await writeNote(r.cfg.tasksDir, {
@@ -755,10 +757,10 @@ async function blockForCooldown(r: Run, role: ModelRole, retryAfter: string, fai
     });
     await r.deps.store.setStatus(r.task.id, "blocked");
     await appendJournal(r.cfg.tasksDir, r.task.id, {
-      stage: "worker", event: "model-cooldown", detail: `every model cooling; next probe ${retryAfter}; turns spent ${failedTurns}`,
+      stage: "worker", event: "model-cooldown", detail: `every model cooling; next probe ${retryAfter}; turns spent ${dispatchedTurns}`,
     });
   });
-  emit(r, "blocked", `every model is cooling; next probe ${retryAfter}; ${failedTurns === 0 ? "retries untouched" : `${failedTurns} turn(s) already spent`}`);
+  emit(r, "blocked", `every model is cooling; next probe ${retryAfter}; ${dispatchedTurns === 0 ? "retries untouched" : `${dispatchedTurns} turn(s) already spent`}`);
   return "blocked";
 }
 
