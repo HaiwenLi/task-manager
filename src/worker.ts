@@ -197,7 +197,7 @@ export async function runTask(
   const now = new Date().toISOString();
   const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, batch: options.batch, previousSettled: false, sweepSkipNoted: false, budgetUnavailableNoted: false,
     dispatchFailures: new Map(),
-    record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing" } };
+    record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing", turnTimeoutMs: cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT } };
   let reservation: WorkspaceReservation | null = null;
   let reviewPending: ReviewPendingRecord | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -671,25 +671,35 @@ async function noteRefusal(
   });
 }
 
-async function blockForCooldown(r: Run, role: ModelRole, retryAfter: string): Promise<"blocked"> {
+/**
+ * Park a task because every model on its chain is cooling. `failedTurns` is
+ * how many turns this attempt already dispatched: a task blocked before its
+ * first dispatch spent nothing, while one blocked after a refused turn did
+ * spend a retry, and the note must not claim otherwise.
+ */
+async function blockForCooldown(r: Run, role: ModelRole, retryAfter: string, failedTurns = 0): Promise<"blocked"> {
   if (role === "reviewer") {
-    return await parkReviewPending(r, undefined, `every reviewer model is cooling until ${retryAfter}`);
+    // Name the models that are cooling, so the parked record says who refused.
+    return await parkReviewPending(r, reviewerChain(r).join(", ") || undefined, `every reviewer model is cooling until ${retryAfter}`);
   }
+  const spent = failedTurns === 0
+    ? "本任务未派发，也未消耗 retries。"
+    : `本尝试已派发，并在第 ${failedTurns} 个回合被拒后耗尽了重试预算；已消耗的重试以任务文件为准。`;
   await owned(r, async () => {
     const seq = ((await latestNote(r.cfg.tasksDir, r.task.id))?.seq ?? 0) + 1;
     await writeNote(r.cfg.tasksDir, {
       task: r.task.id, seq, status: "blocked:needs-owner",
-      done: "所有候选模型都处于共享冷却窗口；本任务未派发，也未消耗 retries。",
+      done: `所有候选模型都处于共享冷却窗口；${spent}`,
       found: `下一次可探测时间：${retryAfter}`,
       next: "等待窗口结束、调整模型链，或由所有者明确恢复；不要反复启动 run 撞同一批失效模型。",
       files: [],
     });
     await r.deps.store.setStatus(r.task.id, "blocked");
     await appendJournal(r.cfg.tasksDir, r.task.id, {
-      stage: "worker", event: "model-cooldown", detail: `every model cooling; next probe ${retryAfter}`,
+      stage: "worker", event: "model-cooldown", detail: `every model cooling; next probe ${retryAfter}; turns spent ${failedTurns}`,
     });
   });
-  emit(r, "blocked", `every model is cooling; next probe ${retryAfter}; retries untouched`);
+  emit(r, "blocked", `every model is cooling; next probe ${retryAfter}; ${failedTurns === 0 ? "retries untouched" : `${failedTurns} turn(s) already spent`}`);
   return "blocked";
 }
 
@@ -813,7 +823,7 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
     try {
       model = await modelFor(r, "worker");
     } catch (error) {
-      if (error instanceof ModelsCoolingError) return await blockForCooldown(r, "worker", error.retryAfter);
+      if (error instanceof ModelsCoolingError) return await blockForCooldown(r, "worker", error.retryAfter, turns);
       throw error;
     }
     if (restoreSession) {
@@ -852,6 +862,18 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
     // A failed/aborted turn cannot submit successful completion even if it wrote a marker.
     if (result.exitCode !== 0) {
       await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
+      // A turn that was cut off leaves its session mid-thought, maybe inside a
+      // tool call. The recording block above is skipped for it (a confirmed
+      // timeout reports no session id), so without this the session would keep
+      // the `clean` fact of its last successful turn and be resumed later.
+      if (result.timedOut && sessionId !== undefined) {
+        const interrupted = sessionId;
+        await owned(r, async () => {
+          r.executionState = await recordWorkerSession(r.cfg.tasksDir, r.task.id, {
+            sessionId: interrupted, clean: false, ...(model === undefined ? {} : { model }),
+          }, declaredExecution(r.task));
+        });
+      }
       emit(r, "turn-failed", result.timedOut ? "turn timed out; shutdown confirmed" : `exit ${result.exitCode}`);
       // Allowance refusals are classified before the retry accounting: the task
       // never ran, so this must not cost it a retry (see blockForQuota).

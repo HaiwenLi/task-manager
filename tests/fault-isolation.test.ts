@@ -5,7 +5,9 @@ import { join } from "node:path";
 import type { AgentAdapter, PromptResult } from "../src/adapters/types.js";
 import { OpenCodeAdapter } from "../src/adapters/opencode.js";
 import { runCli } from "../src/cli.js";
+import { readExecutionState } from "../src/execution-state.js";
 import type { Execution } from "../src/execution.js";
+import { latestNote } from "../src/handoff.js";
 import { readJournal } from "../src/journal.js";
 import { noteModelRefusal } from "../src/model-cooldown.js";
 import { readAttempt, readRuntime } from "../src/runtime.js";
@@ -178,7 +180,71 @@ describe("a failure confined to one task", () => {
     expect(lines[0]?.detail).toContain("unknown model");
   });
 
-  it("taskctl run drains the rest of the board and exits 1 when a task hit a controller error", async () => {
+});
+
+describe("records that a later decision depends on", () => {
+  it("marks a session dirty when a turn on it is cut off, so a later attempt does not resume it", async () => {
+    await seedTaskFile(tasks, buildTaskFile({
+      id: "a", complexity: "complex", verify: "mechanical", criteria: ["C1 ok"], acceptance: "check", model: "w/one",
+    }));
+    const seen: Array<string | undefined> = [];
+    let cutOff = true;
+    const backend: AgentAdapter = {
+      start: (args): Execution<PromptResult> => {
+        seen.push(args.sessionId);
+        let state: "running" | "exited" = "running";
+        // The first attempt works one turn, then its second turn never ends.
+        if (cutOff && seen.length === 2) {
+          return {
+            result: new Promise<PromptResult>(() => {}),
+            inspect: () => ({ state }),
+            cancel: async () => { state = "exited"; return true; },
+          };
+        }
+        const result = (async (): Promise<PromptResult> => {
+          if (!cutOff) await markDoneTask(args.text, tasks);
+          return { sessionId: "s-a", exitCode: 0, text: "working" };
+        })().finally(() => { state = "exited"; });
+        return { result, inspect: () => ({ state }), cancel: async () => false };
+      },
+      contextUsage: async () => 0,
+      contextLimit: async () => 100,
+      canResumeSession: async () => "reusable",
+    };
+
+    const first = await runTask({ ...cfg, turnTimeoutMs: 300 }, deps(backend), await store.get("a"), "w1");
+
+    expect(first).toBe("blocked");
+    expect((await readExecutionState(tasks, "a")).latestWorker).toMatchObject({ sessionId: "s-a", clean: false });
+
+    // The operator retries: the interrupted session is not resumed mid-thought.
+    cutOff = false;
+    await store.setStatus("a", "open");
+    const second = await runTask(cfg, deps(backend), await store.get("a"), "w2");
+
+    expect(second).toBe("done");
+    expect(seen[2]).toBeUndefined();
+  }, 10_000);
+
+  it("does not claim a task was never dispatched when a refused turn already spent a retry", async () => {
+    await seedTaskFile(tasks, task("a"));
+    const refusing: AgentAdapter = {
+      ...doneAdapter({ tasksDir: tasks, sessionId: (id) => `s-${id}` }),
+      prompt: async () => ({ sessionId: "s-refused", exitCode: 1, text: "503 service unavailable", failure: "provider" as const }),
+    };
+
+    const outcome = await runTask({ ...cfg, retryLimit: 2 }, deps(refusing), await store.get("a"), "w1");
+
+    expect(outcome).toBe("blocked");
+    expect((await store.get("a")).retries).toBe(1);
+    const note = await latestNote(tasks, "a");
+    expect(note?.markdown).not.toContain("未派发");
+    expect(note?.markdown).toContain("第 1 个回合");
+  });
+});
+
+describe("taskctl run", () => {
+  it("drains the rest of the board and exits 1 when a task hit a controller error", async () => {
     await seedTaskFile(tasks, task("a"), task("b"));
     const configPath = await writeBatchConfig(root, { tasksDir: tasks, workdir: work, lockTtlMs: 5_000, heartbeatMs: 20 });
     const lines: string[] = [];
