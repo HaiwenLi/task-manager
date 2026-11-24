@@ -1,4 +1,5 @@
-import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "./replace.js";
 import { join } from "node:path";
 import { dump } from "js-yaml";
 
@@ -39,7 +40,7 @@ export async function writeNote(tasksDir: string, n: HandoffNote): Promise<strin
   await mkdir(join(tasksDir, n.task, "sessions"), { recursive: true });
   const tmp = `${path}.tmp`;
   await writeFile(tmp, renderNote(n), "utf8");
-  await rename(tmp, path);
+  await renameWithRetry(tmp, path);
   return path;
 }
 

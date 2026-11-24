@@ -1,5 +1,6 @@
-import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
+import { renameWithRetry } from "./replace.js";
 import { join } from "node:path";
 import { withMutex } from "./mutex.js";
 
@@ -67,7 +68,7 @@ export async function heartbeatWatchLock(tasksDir: string, owner: string): Promi
     if (state.status !== "held" || state.lock.worker !== owner) return false;
     const temporary = `${path}.tmp`;
     await writeFile(temporary, JSON.stringify({ worker: owner, heartbeat: Date.now() } satisfies WatchLock), "utf8");
-    await rename(temporary, path);
+    await renameWithRetry(temporary, path);
     return true;
   });
 }

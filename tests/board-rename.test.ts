@@ -26,7 +26,8 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
-const { renameWithRetry, writeBoard } = await import("../src/board.js");
+const { writeBoard } = await import("../src/board.js");
+const { renameWithRetry } = await import("../src/replace.js");
 
 const errno = (code: string): NodeJS.ErrnoException => Object.assign(new Error(`${code}: simulated`), { code });
 

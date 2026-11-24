@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "./replace.js";
 import { join } from "node:path";
 import type { Task } from "./task-file.js";
 
@@ -58,7 +59,7 @@ export async function writeRuntime(tasksDir: string, id: string, name: string, r
   const file = join(tasksDir, id, name);
   const tmp = `${file}.${randomUUID()}.tmp`;
   await writeFile(tmp, JSON.stringify(record, null, 2), "utf8");
-  await rename(tmp, file);
+  await renameWithRetry(tmp, file);
 }
 
 /**

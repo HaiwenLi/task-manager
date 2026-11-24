@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "./replace.js";
 import { join } from "node:path";
 import type { AuditStage } from "./audit.js";
 import { detectType, TEMPLATES, type TaskType } from "./intake.js";
@@ -85,7 +86,7 @@ export async function recordFeedback(tasksDir: string, record: FeedbackRecord): 
   const recent = [...valid.slice(valid.length - (FEEDBACK_LIMIT - 1)), kept];
   const tmp = `${file}.${randomUUID()}.tmp`;
   await writeFile(tmp, recent.map((entry) => `${JSON.stringify(entry)}\n`).join(""), "utf8");
-  await rename(tmp, file);
+  await renameWithRetry(tmp, file);
   return true;
 }
 

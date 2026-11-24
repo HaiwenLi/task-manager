@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "./replace.js";
 import { join } from "node:path";
 import type { SessionUsageSnapshot } from "./adapters/types.js";
 import { withMutex } from "./mutex.js";
@@ -139,5 +140,5 @@ async function writeSnapshots(tasksDir: string, snapshots: Record<string, Sessio
   const target = sessionsFile(tasksDir);
   const tmp = `${target}.${randomUUID()}.tmp`;
   await writeFile(tmp, JSON.stringify(snapshots, null, 2), "utf8");
-  await rename(tmp, target);
+  await renameWithRetry(tmp, target);
 }

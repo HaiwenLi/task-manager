@@ -75,6 +75,7 @@ export async function watchQueue(
   let wakeRequested = false;
   let stopping = false;
   let ownershipError: Error | undefined;
+  let heartbeatFailureReported = false;
 
   const wake = (): void => {
     wakeRequested = true;
@@ -114,8 +115,15 @@ export async function watchQueue(
           }
           if (!stopping && ownershipError === undefined) beat();
         } catch (error) {
-          ownershipError = error instanceof Error ? error : new Error(String(error));
-          wake();
+          // Only a lock that is no longer ours ends the watch (the branch
+          // above). A heartbeat that could not be written says nothing about who
+          // holds the lock record, so the watcher reports it once and the next
+          // tick tries again.
+          if (!heartbeatFailureReported) {
+            heartbeatFailureReported = true;
+            options.onError?.(`watch heartbeat could not be written (${error instanceof Error ? error.message : String(error)}); the lock is still held, the next heartbeat retries`);
+          }
+          if (!stopping && ownershipError === undefined) beat();
         }
       })();
     }, Math.max(1, Math.min(cfg.heartbeatMs, cfg.lockTtlMs / 3)));

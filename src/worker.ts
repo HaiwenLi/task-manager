@@ -175,6 +175,8 @@ type Run = {
   dependencies?: string | null;
   /** The context budget was already reported as unreadable for this attempt. */
   budgetUnavailableNoted: boolean;
+  /** The lock heartbeat's first write failure was already journaled for this attempt. */
+  heartbeatWriteFailureNoted: boolean;
 };
 const emit = (r: Run, type: WorkerEventType, detail?: string) => r.deps.onEvent?.({ type, taskId: r.task.id, detail });
 const owned = <T>(r: Run, fn: () => Promise<T>) => withOwnership(r.cfg.tasksDir, r.task.id, r.owner, fn);
@@ -202,7 +204,7 @@ export async function runTask(
   let notifyLost!: () => void;
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
   const now = new Date().toISOString();
-  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, batch: options.batch, previousSettled: false, sweepSkipNoted: false, budgetUnavailableNoted: false,
+  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, batch: options.batch, previousSettled: false, sweepSkipNoted: false, budgetUnavailableNoted: false, heartbeatWriteFailureNoted: false,
     dispatchFailures: new Map(),
     record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing", turnTimeoutMs: cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT } };
   let reservation: WorkspaceReservation | null = null;
@@ -224,7 +226,15 @@ export async function runTask(
             await writeRuntime(cfg.tasksDir, task.id, "attempt.json", r.record);
           });
         }
-        catch { r.lost = true; notifyLost(); }
+        catch (err) {
+          // Only a lock that is no longer ours ends the attempt; anything else
+          // here is a write that did not land (see noteHeartbeatWriteFailure).
+          if (err instanceof OwnershipLostError) {
+            r.lost = true; notifyLost();
+          } else {
+            await noteHeartbeatWriteFailure(r, err);
+          }
+        }
         if (!stopping && !r.lost) tick();
       })();
     }, Math.max(1, Math.min(cfg.heartbeatMs, cfg.lockTtlMs / 3)));
@@ -366,6 +376,24 @@ function legacyExecution<T>(fn: () => Promise<T>): Execution<T> {
 }
 
 /**
+ * Record, once per attempt, that the lock heartbeat could not be written. That
+ * is not a lost lock: `heartbeat` answers the ownership question with `false`
+ * before it writes anything, and every guarded write checks ownership again for
+ * itself. Reading a refused write as a lost lock cancelled the running turn
+ * over a file-system hiccup and left the attempt active above a reservation it
+ * no longer used.
+ */
+async function noteHeartbeatWriteFailure(r: Run, err: unknown): Promise<void> {
+  if (r.heartbeatWriteFailureNoted) return;
+  r.heartbeatWriteFailureNoted = true;
+  const detail = err instanceof Error ? err.message : String(err);
+  await appendJournal(r.cfg.tasksDir, r.task.id, {
+    stage: "worker", event: "heartbeat-write-failed",
+    detail: `${detail}; the lock is still held, the next heartbeat retries`,
+  }).catch(() => {});
+}
+
+/**
  * Run one controlled turn. `acceptSettled` marks results that are themselves a
  * complete, retryable outcome (a provider rejection): those need no
  * cancellation proof, because the backend refused the turn before doing work.
@@ -377,7 +405,14 @@ async function controlled<T>(
   start: () => Execution<T>,
   acceptSettled?: (value: T) => boolean,
 ): Promise<T> {
-  if (!await heartbeat(r.cfg.tasksDir, r.task.id, r.owner)) throw new OwnershipLostError();
+  // `false` is the lock no longer being ours. A throw is the write that follows
+  // a successful check: it says nothing about ownership, and the guarded
+  // dispatch below checks that again for itself.
+  const fresh = await heartbeat(r.cfg.tasksDir, r.task.id, r.owner).catch(async (err: unknown) => {
+    await noteHeartbeatWriteFailure(r, err);
+    return true;
+  });
+  if (!fresh) throw new OwnershipLostError();
   await checkpoint(r, "active", label);
   let execution: Execution<T> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;

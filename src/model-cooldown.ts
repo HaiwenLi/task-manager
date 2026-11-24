@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "./replace.js";
 import { join } from "node:path";
 import { withMutex } from "./mutex.js";
 
@@ -69,7 +70,7 @@ async function mutate(tasksDir: string, update: (store: CooldownStore) => Cooldo
     const target = file(tasksDir);
     const tmp = `${target}.${randomUUID()}.tmp`;
     await writeFile(tmp, JSON.stringify(store, null, 2), "utf8");
-    await rename(tmp, target);
+    await renameWithRetry(tmp, target);
   });
 }
 

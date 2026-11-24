@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "./replace.js";
 import { join } from "node:path";
 import type { Task, TaskStatus } from "./task-file.js";
 
@@ -102,42 +103,6 @@ export function createCoalescedRefresh(refresh: () => Promise<unknown>): {
     request,
     flush: async () => { while (job) await job; },
   };
-}
-
-/**
- * Backoff for a rename that Windows refused.
- *
- * `rename` onto an existing file is not atomic-with-wait on Windows: while
- * another process holds a handle on the destination (an editor, a watcher, or
- * the second of two `taskctl board` runs) it fails with `EPERM` instead of
- * waiting. The failure is transient by nature — the handle goes away — so the
- * replacement is retried a bounded number of times rather than turned into an
- * error on the first collision. The total ceiling is ~3.9s, well under the
- * interval at which a person retries a command by hand.
- */
-const RENAME_RETRY_DELAYS_MS: readonly number[] = [5, 25, 125, 625, 3125];
-
-/**
- * Errors that mean "the destination was busy", not "the write is wrong".
- * `ENOENT` (the temp file vanished), `EACCES` on an immutable target, a full
- * disk and everything else propagate on the first attempt: retrying them only
- * delays the same error.
- */
-const TRANSIENT_RENAME_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
-
-/** Rename, retrying only a destination held by a concurrent handle. */
-export async function renameWithRetry(from: string, to: string): Promise<void> {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      await rename(from, to);
-      return;
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      const delay = RENAME_RETRY_DELAYS_MS[attempt];
-      if (code === undefined || !TRANSIENT_RENAME_CODES.has(code) || delay === undefined) throw err;
-      await new Promise<void>((resolve) => setTimeout(resolve, delay));
-    }
-  }
 }
 
 /**

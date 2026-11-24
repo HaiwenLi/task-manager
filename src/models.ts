@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "./replace.js";
 import { join } from "node:path";
 
 /**
@@ -135,7 +136,7 @@ export async function writeModelRotation(tasksDir: string, id: string, rotation:
   const file = join(dir, FILE);
   const tmp = `${file}.${randomUUID()}.tmp`;
   await writeFile(tmp, JSON.stringify(rotation, null, 2), "utf8");
-  await rename(tmp, file);
+  await renameWithRetry(tmp, file);
 }
 
 /**

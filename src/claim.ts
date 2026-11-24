@@ -1,5 +1,6 @@
 import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
+import { renameWithRetry } from "./replace.js";
 import { join } from "node:path";
 import { withMutex } from "./mutex.js";
 
@@ -72,7 +73,7 @@ export async function heartbeat(tasksDir: string, taskId: string, workerId: stri
     if (state.status !== "held" || state.lock.worker !== workerId) return false;
     const tmp = `${lockPath}.tmp`;
     await writeFile(tmp, JSON.stringify({ worker: workerId, heartbeat: Date.now() } satisfies Lock), "utf8");
-    await rename(tmp, lockPath);
+    await renameWithRetry(tmp, lockPath);
     return true;
   });
 }

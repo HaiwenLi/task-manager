@@ -1,4 +1,5 @@
-import { readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "./replace.js";
 import { join } from "node:path";
 import { declaredTaskSchema, parseTaskFile, serializeTaskFile, TASK_SCHEMA } from "./task-file.js";
 import type { Task, TaskStatus } from "./task-file.js";
@@ -152,7 +153,7 @@ export class TaskStore {
     const file = this.taskFile(id);
     const tmp = `${file}.tmp`;
     await writeFile(tmp, serializeTaskFile(task), "utf8");
-    await rename(tmp, file);
+    await renameWithRetry(tmp, file);
     return task;
   }
 }

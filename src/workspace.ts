@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rmdir, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, readlink, realpath, rmdir, unlink, writeFile } from "node:fs/promises";
+import { renameWithRetry } from "./replace.js";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -85,7 +86,7 @@ async function writeRegistry(registryDir: string, records: ReservationRecord[]):
   } finally {
     await file.close();
   }
-  await rename(temporary, join(registryDir, "reservations.json"));
+  await renameWithRetry(temporary, join(registryDir, "reservations.json"));
   // Windows does not expose directory fsync through this API. The registry file
   // itself is flushed before publishing, and always before local acquisition.
   if (process.platform !== "win32") {
