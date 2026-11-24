@@ -9,7 +9,7 @@ import { OpenCodeAdapter } from "./adapters/opencode.js";
 import type { AgentAdapter } from "./adapters/types.js";
 import { serializeTaskFile, type Task, type TaskExecution, type TaskVerify, TASK_SCHEMA } from "./task-file.js";
 import { buildFinding } from "./findings.js";
-import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, TEMPLATES, type TaskType } from "./intake.js";
+import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, parseIntakeAssessment, TEMPLATES, type TaskType } from "./intake.js";
 import { appendObservation, readProfile } from "./profile.js";
 import { extractCriteria, readSpec, writeSpec } from "./spec.js";
 import { appendJournal } from "./journal.js";
@@ -412,16 +412,37 @@ async function addCommand(
     log(`${id}  draft  spec-invalid`);
     return 1;
   }
-  await store.updateFields(id, { criteria });
-  if (complexity === "simple") {
+  const assessment = parseIntakeAssessment(specText, complexity);
+  const lane = quick ? "quick" : flags.has("simple") ? "simple" : assessment.lane;
+  const selectedComplexity = lane === "complex" ? "complex" : "simple";
+  const selectedExecution = flags.has("execution")
+    ? execution
+    : selectedComplexity === "simple" ? "continuous" : "iterative";
+  await store.updateFields(id, { criteria, complexity: selectedComplexity, execution: selectedExecution });
+  await writeRuntime(tasksDir, id, "classification.json", {
+    lane, proposedLane: assessment.lane, sufficiency: assessment.sufficiency,
+    reason: assessment.reason, model: cfg.model ?? "(backend-default)", at: new Date().toISOString(),
+  });
+  if (assessment.sufficiency === "needs-information") {
+    await writeFile(join(tasksDir, id, "questions.md"), [
+      "# 需要补充的信息", "", "回答这些问题会改变交付物、验收、边界或风险判断。", "",
+      ...assessment.questions.map((question, index) => `${index + 1}. ${question}`), "",
+    ].join("\n"), "utf8");
+    await appendJournal(tasksDir, id, {
+      stage: "clarify", event: "needs-information", detail: `questions=${assessment.questions.length}`,
+    });
+    log(`${id}  draft  needs-information=${assessment.questions.length}`);
+    return 0;
+  }
+  if (selectedComplexity === "simple") {
     await store.setStatus(id, "open");
   }
   await appendJournal(tasksDir, id, {
     stage: "clarify",
     event: "spec-drafted",
-    detail: `criteria=${criteria.length}`,
+    detail: `criteria=${criteria.length} lane=${lane} sufficiency=${assessment.sufficiency}`,
   });
-  log(`${id}  ${complexity === "simple" ? "open" : "draft"}  criteria=${criteria.length}`);
+  log(`${id}  ${selectedComplexity === "simple" ? "open" : "draft"}  lane=${lane} criteria=${criteria.length}`);
   return 0;
 }
 

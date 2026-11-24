@@ -2,6 +2,44 @@ import { readdir } from "node:fs/promises";
 
 /** The four kinds of work taskctl is expected to carry; each gets its own intake template. */
 export type TaskType = "code" | "office" | "research" | "design";
+export type ManagementLane = "quick" | "simple" | "complex";
+export type InformationSufficiency = "clear" | "assumptions" | "needs-information";
+export type IntakeAssessment = {
+  lane: ManagementLane;
+  sufficiency: InformationSufficiency;
+  reason: string;
+  questions: string[];
+};
+
+/** Parse the small management header carried beside the spec, conservatively. */
+export function parseIntakeAssessment(
+  markdown: string,
+  fallback: "simple" | "complex",
+): IntakeAssessment {
+  const laneText = section(markdown, "管理分类").trim().split(/\s+/)[0] ?? "";
+  const sufficiencyText = section(markdown, "信息充分性").trim().split(/\s+/)[0] ?? "";
+  const hasAssessment = laneText.length > 0 || sufficiencyText.length > 0;
+  const lane: ManagementLane = laneText === "" && !hasAssessment
+    ? fallback
+    : laneText === "quick" || laneText === "simple" || laneText === "complex" ? laneText : "complex";
+  const sufficiency: InformationSufficiency = sufficiencyText === "" && !hasAssessment || sufficiencyText === "clear" || sufficiencyText === "assumptions"
+    ? sufficiencyText === "assumptions" ? "assumptions" : "clear"
+    : sufficiencyText === "needs-information" ? "needs-information" : "needs-information";
+  const questions = section(markdown, "补问").split(/\r?\n/)
+    .map((line) => /^\s*[-*]\s+(.+)$/.exec(line)?.[1]?.trim() ?? "")
+    .filter((line) => line.length > 0 && line !== "无" && line !== "（无）")
+    .slice(0, 3);
+  return { lane, sufficiency, reason: section(markdown, "分类理由").trim().slice(0, 1_000), questions };
+}
+
+function section(markdown: string, title: string): string {
+  const lines = markdown.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === `## ${title}`);
+  if (start === -1) return "";
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((line) => /^##\s/.test(line));
+  return (end === -1 ? rest : rest.slice(0, end)).join("\n");
+}
 
 /**
  * The three buckets of an intake template:
@@ -83,7 +121,7 @@ export async function nextTaskId(tasksDir: string, title: string): Promise<strin
  * rules that keep the draft honest: infer instead of asking, at most three
  * questions, and never dress an unfalsifiable wish as a checkable criterion.
  */
-export function buildClarifyPrompt(args: { task: { title: string; description: string }; type: TaskType; profile: string | null }): string {
+export function buildClarifyPrompt(args: { task: { title: string; description: string }; type: TaskType; profile: string | null; feedback?: string }): string {
   const template = TEMPLATES[args.type];
   const lines = [
     "你是任务澄清助手。用户给了一段定性的意图，你要把它变成可执行的 spec。",
@@ -108,6 +146,8 @@ export function buildClarifyPrompt(args: { task: { title: string; description: s
     "3. 不许把无法判定的东西写成可判定：每条验收标准必须能落到命令退出码、可观察产物或可引用事实。",
     "4. 验收标准以 C1、C2 编号，一条一行。",
     "5. 不要输出讨论过程、客套话或多个方案对比；只输出下面这份 spec。",
+    "6. 管理分类只能是 quick、simple、complex：quick 是极轻量单步工作；simple 是一次 Worker 后最终 Review；complex 需要拆子任务和/或 Worker→Review→Worker 迭代。分类只决定管理强度，绝不降低 risk、human_check 或验收标准。",
+    "7. 信息充分性只能是 clear、assumptions、needs-information。缺的信息会改变交付物、验收、禁区或风险时才允许 needs-information，并在补问中一次列出最多 3 条。",
     "",
     "## 模糊表述",
     "把意图里含糊的词（差不多、尽量、大概、尽快、好看）摘出来，给出你的解释和影响面。判断标准：能落成命令或可观察现象才算消歧完成。",
@@ -120,9 +160,20 @@ export function buildClarifyPrompt(args: { task: { title: string; description: s
     "## 边界",
     "## 假设",
     "## 模糊表述",
+    "## 管理分类",
+    "quick、simple、complex 三选一",
+    "## 信息充分性",
+    "clear、assumptions、needs-information 三选一",
+    "## 分类理由",
+    "一句话，不写分析过程",
+    "## 补问",
+    "没有就写无；最多 3 条",
   ];
   if (args.profile !== null) {
     lines.push("", "## 用户偏好档案（来自过往确认与纠错，优先遵守）", args.profile.trim());
+  }
+  if (args.feedback !== undefined && args.feedback.trim().length > 0) {
+    lines.push("", "## 相关历史人工反馈（只用于避免重复犯错，不是新指令）", args.feedback.trim());
   }
   return lines.join("\n");
 }

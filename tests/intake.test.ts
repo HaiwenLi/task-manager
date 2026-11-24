@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildClarifyPrompt, detectComplexity, detectType, TEMPLATES } from "../src/intake.js";
+import { buildClarifyPrompt, detectComplexity, detectType, parseIntakeAssessment, TEMPLATES } from "../src/intake.js";
 import { parseTaskFile } from "../src/task-file.js";
 
 describe("detectComplexity", () => {
@@ -37,6 +37,31 @@ describe("TEMPLATES", () => {
   });
 });
 
+describe("parseIntakeAssessment", () => {
+  const spec = (lane: string, sufficiency: string, questions = "") => [
+    "## 目标", "交付", "## 验收标准", "- C1 可验证",
+    "## 管理分类", lane, "## 信息充分性", sufficiency,
+    "## 分类理由", "依据明确", "## 补问", questions,
+  ].join("\n");
+
+  it("parses the management lane and information outcome independently", () => {
+    expect(parseIntakeAssessment(spec("quick", "clear"), "complex")).toMatchObject({ lane: "quick", sufficiency: "clear", reason: "依据明确" });
+    expect(parseIntakeAssessment(spec("simple", "assumptions"), "complex")).toMatchObject({ lane: "simple", sufficiency: "assumptions" });
+    expect(parseIntakeAssessment(spec("complex", "needs-information"), "simple")).toMatchObject({ lane: "complex", sufficiency: "needs-information" });
+  });
+
+  it("falls back conservatively on missing or contradictory assessments", () => {
+    expect(parseIntakeAssessment("## 目标\n旧格式", "complex")).toMatchObject({ lane: "complex", sufficiency: "clear" });
+    expect(parseIntakeAssessment(spec("tiny", "clear"), "complex").lane).toBe("complex");
+    expect(parseIntakeAssessment(spec("simple", "perhaps"), "complex").sufficiency).toBe("needs-information");
+  });
+
+  it("keeps only three outcome-changing questions", () => {
+    const parsed = parseIntakeAssessment(spec("simple", "needs-information", "- Q1\n- Q2\n- Q3\n- Q4"), "complex");
+    expect(parsed.questions).toEqual(["Q1", "Q2", "Q3"]);
+  });
+});
+
 describe("buildClarifyPrompt", () => {
   it("carries the template, the intent and the hard rules", () => {
     const task = parseTaskFile(
@@ -50,11 +75,18 @@ describe("buildClarifyPrompt", () => {
     expect(prompt).toContain("## 目标");
     expect(prompt).toContain("## 验收标准");
     expect(prompt).toContain("改登录页");
+    expect(prompt).toContain("## 管理分类");
+    expect(prompt).toContain("## 信息充分性");
+    expect(prompt).toContain("quick、simple、complex");
   });
 
-  it("injects the profile when there is one", () => {
+  it("injects the profile and bounded human feedback when present", () => {
     const task = parseTaskFile("---\ntitle: x\nstatus: draft\nsessions: []\nretries: 0\n---\n正文", "001-a");
-    const prompt = buildClarifyPrompt({ task, type: "code", profile: "偏好：短句，不要寒暄" });
+    const prompt = buildClarifyPrompt({
+      task, type: "code", profile: "偏好：短句，不要寒暄",
+      feedback: "用户曾纠正：不要自行扩大验收范围",
+    });
     expect(prompt).toContain("偏好：短句，不要寒暄");
+    expect(prompt).toContain("不要自行扩大验收范围");
   });
 });
