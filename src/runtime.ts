@@ -94,6 +94,9 @@ export function definitionFields(task: Task): Record<string, unknown> {
     risk: task.risk,
     humanCheck: task.humanCheck,
     dependsOn: task.dependsOn,
+    // Which bundle a child belongs to decides whether it may run at all: moving
+    // a child to another parent mid-attempt is a different task.
+    parentId: task.parentId,
     // What has to agree the work is done is part of the definition: switching a
     // task from a reviewer's verdict to a render check mid-attempt changes the
     // bar, and must invalidate the attempt rather than be reviewed under it.

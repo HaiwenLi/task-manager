@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { claim, heartbeat, lockLive, release, withOwnership, OwnershipLostError } from "./claim.js";
+import { waitReason } from "./eligibility.js";
 import { latestNote, writeNote, type HandoffNote } from "./handoff.js";
 import { startAcceptance, type AcceptanceResult } from "./acceptance.js";
 import { buildWorkerPrompt } from "./protocol.js";
@@ -208,10 +209,16 @@ export async function runTask(
   };
   try {
     // Re-read after claim: a queued snapshot is not authority to reopen a terminal task.
-    const current = await owned(r, async () => (await deps.store.list()).find(t => t.id === task.id));
+    const board = await owned(r, async () => deps.store.list());
+    const current = board.find(t => t.id === task.id);
     if (!current || (r.reviewOnly
       ? current.status !== "blocked"
       : current.status !== "open" && current.status !== "running")) return "skipped";
+    // The scheduler already filtered on this, but against a snapshot taken
+    // earlier. Asked again here, of the board as it is now, so no caller can
+    // claim a split child before its bundle is approved, nor a task before its
+    // dependencies are done.
+    if (!r.reviewOnly && current.status === "open" && waitReason(current, board) !== null) return "skipped";
     r.task = structuredClone(current); r.definition = definitionDigest(current);
     r.executionState = await readExecutionState(cfg.tasksDir, task.id, declaredExecution(current));
     r.escalated = r.executionState.requiresReview;

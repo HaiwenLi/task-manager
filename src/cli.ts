@@ -264,7 +264,7 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   refreshBoard();
   // Plan Task 9：逐事件打印 [task] 状态 单行日志 —— 事件发生即输出，
   // 而不是整队跑完再补一份总结
-  await runScheduler(cfg, {
+  const result = await runScheduler(cfg, {
     store,
     adapter,
     ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
@@ -278,6 +278,13 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   refreshBoard();
   await boardRefresh.flush();
   await logJob;
+  // Work left in `open` with no explanation reads as "nothing to do". It is not.
+  if (result.pending.length > 0) {
+    log(
+      `[scheduler] stopped at the pass budget with ${result.pending.length} ready task(s) not started: `
+      + `${result.pending.join(", ")}. Run taskctl run again to continue.`,
+    );
+  }
   return 0;
 }
 

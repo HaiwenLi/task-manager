@@ -96,6 +96,12 @@ export type Task = {
   keepAtRoot: string[];
   /** Tasks that must be `done` before this one may be claimed. */
   dependsOn: string[];
+  /**
+   * The split this task was published from. Only generated children carry it:
+   * an `open` child is not runnable while an ancestor is still `draft`, which
+   * is what lets a whole split bundle wait for one approval.
+   */
+  parentId?: string;
   /** Explicit human sign-off regardless of risk. */
   humanCheck: boolean;
   /** External changes this task agrees to tolerate; see {@link DriftKind}. */
@@ -208,6 +214,7 @@ export function parseTaskFile(raw: string, id: string): Task {
     workdir: optionalString(data, "workdir", id),
     keepAtRoot: parseStringList(data, "keep_at_root", id),
     dependsOn: parseDependsOn(data, id),
+    parentId: parseParentId(data, id),
     humanCheck: parseHumanCheck(data, id),
     tolerate: parseTolerate(data, id),
     quick: parseQuick(data, id),
@@ -244,6 +251,7 @@ export function serializeTaskFile(task: Task): string {
     ...(task.workdir !== undefined && { workdir: task.workdir }),
     ...(task.keepAtRoot.length > 0 && { keep_at_root: task.keepAtRoot }),
     ...(task.dependsOn.length > 0 && { depends_on: task.dependsOn }),
+    ...(task.parentId !== undefined && { parent_id: task.parentId }),
     ...(task.humanCheck && { human_check: task.humanCheck }),
     ...(task.tolerate.length > 0 && { tolerate: task.tolerate }),
     ...(task.quick && { quick: task.quick }),
@@ -322,6 +330,18 @@ function parseCriteria(data: Record<string, unknown>, id: string): string[] {
     throw new TaskFileError(`task file ${id}: field criteria must be a list of non-empty strings`);
   }
   return [...value];
+}
+
+/** A child may name any other task as parent except itself. */
+function parseParentId(data: Record<string, unknown>, id: string): string | undefined {
+  const value = optionalString(data, "parent_id", id);
+  if (value !== undefined && value.length === 0) {
+    throw new TaskFileError(`task file ${id}: field parent_id must be a task id`);
+  }
+  if (value === id) {
+    throw new TaskFileError(`task file ${id}: parent_id must not be itself`);
+  }
+  return value;
 }
 
 function parseDependsOn(data: Record<string, unknown>, id: string): string[] {
