@@ -45,6 +45,42 @@ export function batchEligibility(
 }
 
 /**
+ * One shared runtime probe for explicit and automatic selection. Both callers
+ * must see the same eligibility, workdir, live-lock and unsettled-attempt
+ * checks; only the terminal handling differs (collect issues vs stop prefix).
+ */
+type BatchTaskProbe = { issue: string | null; workdir: string; expectedWorkdir: string };
+
+async function probeBatchTask(
+  cfg: WorkerConfig,
+  task: Task,
+  board: Task[],
+  earlier: Set<string>,
+  expectedWorkdir: string | undefined,
+): Promise<BatchTaskProbe> {
+  const workdir = taskWorkdir(cfg.workdir, task);
+  const expected = expectedWorkdir ?? workdir;
+  let issue = batchEligibility(task, board, earlier);
+  if (issue === null && workdir !== expected) {
+    issue = `task ${task.id}: workdir ${workdir} differs from the first selected workdir ${expected}`;
+  }
+  if (issue === null && await lockLive(cfg.tasksDir, task.id, cfg.lockTtlMs)) {
+    issue = `task ${task.id}: a live lock is held by another execution`;
+  }
+  if (issue === null) {
+    try {
+      const previous = await readAttempt(cfg.tasksDir, task.id);
+      if (previous !== null && previous.phase !== "settled") {
+        issue = `task ${task.id}: previous attempt is not settled (${previous.phase})`;
+      }
+    } catch (error) {
+      issue = `task ${task.id}: previous attempt is not settled (${error instanceof Error ? error.message : String(error)})`;
+    }
+  }
+  return { issue, workdir, expectedWorkdir: expected };
+}
+
+/**
  * Validate the entire explicit selection before any task is claimed. Runtime
  * checks are deliberately conservative: a live owner or any unsettled previous
  * attempt needs reconciliation, not an automatic replay inside a batch.
@@ -80,28 +116,11 @@ export async function validateBatchSelection(
       issues.push(`unknown task ${id}`);
       continue;
     }
+    const probe = await probeBatchTask(cfg, task, board, earlier, expectedWorkdir);
+    expectedWorkdir = probe.expectedWorkdir;
     selected.push(task);
-    const ineligible = batchEligibility(task, board, earlier);
-    if (ineligible !== null) issues.push(ineligible);
     earlier.add(id);
-
-    const workdir = taskWorkdir(cfg.workdir, task);
-    expectedWorkdir ??= workdir;
-    if (workdir !== expectedWorkdir) {
-      issues.push(`task ${id}: workdir ${workdir} differs from the first selected workdir ${expectedWorkdir}`);
-    }
-
-    if (await lockLive(cfg.tasksDir, id, cfg.lockTtlMs)) {
-      issues.push(`task ${id}: a live lock is held by another execution`);
-    }
-    try {
-      const previous = await readAttempt(cfg.tasksDir, id);
-      if (previous !== null && previous.phase !== "settled") {
-        issues.push(`task ${id}: previous attempt is not settled (${previous.phase})`);
-      }
-    } catch (error) {
-      issues.push(`task ${id}: previous attempt is not settled (${error instanceof Error ? error.message : String(error)})`);
-    }
+    if (probe.issue !== null) issues.push(probe.issue);
   }
 
   if (issues.length > 0) throw new BatchValidationError(issues);
@@ -127,19 +146,11 @@ export async function selectAutomaticBatch(
 
   for (const task of candidates) {
     if (selected.length >= maximum) break;
-    if (batchEligibility(task, board, earlier) !== null) break;
-    const workdir = taskWorkdir(cfg.workdir, task);
-    if (expectedWorkdir !== undefined && workdir !== expectedWorkdir) break;
-    if (await lockLive(cfg.tasksDir, task.id, cfg.lockTtlMs)) break;
-    try {
-      const previous = await readAttempt(cfg.tasksDir, task.id);
-      if (previous !== null && previous.phase !== "settled") break;
-    } catch {
-      break;
-    }
+    const probe = await probeBatchTask(cfg, task, board, earlier, expectedWorkdir);
+    if (probe.issue !== null) break;
     selected.push(task.id);
     earlier.add(task.id);
-    expectedWorkdir ??= workdir;
+    expectedWorkdir = probe.expectedWorkdir;
   }
   return selected;
 }
