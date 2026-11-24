@@ -8,6 +8,7 @@ import { readRuntime } from "../src/runtime.js";
 import { serializeTaskFile, type Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
+import { markDoneTask, passAcceptance } from "./helpers/watch-fixture.js";
 
 let root: string;
 let tasks: string;
@@ -24,10 +25,8 @@ async function seed(definition: Task): Promise<void> {
 function adapter(onTurn?: (id: string) => Promise<void>): AgentAdapter {
   return {
     prompt: async (args) => {
-      const id = /taskctl done --task (\S+) --tasks-dir/.exec(args.text)![1]!;
+      const id = await markDoneTask(args.text, tasks);
       turns.push(id);
-      await mkdir(join(tasks, id), { recursive: true });
-      await writeFile(join(tasks, id, "done.requested"), "done");
       await onTurn?.(id);
       return { sessionId: `s-${id}`, exitCode: 0, text: "done" };
     },
@@ -36,7 +35,7 @@ function adapter(onTurn?: (id: string) => Promise<void>): AgentAdapter {
   };
 }
 
-const acceptance = async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" });
+const acceptance = passAcceptance;
 
 async function cli(args: string[], agent: AgentAdapter): Promise<number> {
   return runCli(args, {

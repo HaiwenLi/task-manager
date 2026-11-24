@@ -8,9 +8,13 @@ import { runCli } from "../src/cli.js";
 import { writeRuntime, type AttemptRecord } from "../src/runtime.js";
 import { serializeTaskFile, type Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
-import { stopRequestPath, watchQueue, type WatchFs } from "../src/watch.js";
+import { watchQueue } from "../src/watch.js";
 import type { WorkerConfig, WorkerDeps, WorkerEvent } from "../src/worker.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
+import {
+  createWatchEventSeam, markDoneTask, passAcceptance, requestStopThroughFile,
+  runWatchCli, waitForConditionAsync,
+} from "./helpers/watch-fixture.js";
 
 let root: string;
 let tasks: string;
@@ -23,6 +27,7 @@ let probeCalls: string[];
 let reviewed: string[];
 let events: WorkerEvent[];
 let listeners: Map<string, () => void>;
+let watchFs: ReturnType<typeof createWatchEventSeam>["watchFs"];
 let onTurn: ((id: string) => Promise<void>) | undefined;
 
 async function seed(definition: Task): Promise<void> {
@@ -36,10 +41,8 @@ function adapter(): AgentAdapter {
       return "reusable";
     },
     prompt: async (args) => {
-      const id = /taskctl done --task (\S+) --tasks-dir/.exec(args.text)![1]!;
+      const id = await markDoneTask(args.text, tasks);
       turns.push({ id, sessionId: args.sessionId, text: args.text });
-      await mkdir(join(tasks, id), { recursive: true });
-      await writeFile(join(tasks, id, "done.requested"), "done");
       await onTurn?.(id);
       return { sessionId: args.sessionId ?? `ses-${id}`, exitCode: 0, text: "done" };
     },
@@ -63,47 +66,27 @@ function deps(): WorkerDeps {
   return {
     store,
     adapter: adapter(),
-    acceptance: async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" }),
+    acceptance: passAcceptance,
     review: reviewFor,
     onEvent: (event) => { events.push(event); },
   };
 }
 
-const watchFs: WatchFs = (path, listener) => {
-  listeners.set(path, listener);
-  return { close: () => { listeners.delete(path); } };
-};
-
-async function cliWatch(): Promise<number> {
-  const configPath = join(root, "taskctl.json");
-  await writeFile(configPath, JSON.stringify({
-    tasksDir: tasks,
-    workdir: work,
-    model: "w/one",
-    lockTtlMs: 5_000,
-    heartbeatMs: 20,
-  }), "utf8");
-  return runCli(["watch", "--config", configPath], {
-    adapter: adapter(),
-    acceptance: async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" }),
+function cliWatch(): Promise<number> {
+  return runWatchCli({
+    root, tasksDir: tasks, workdir: work, agent: adapter(),
+    acceptance: passAcceptance,
     review: reviewFor,
-    log: () => {},
-    err: () => {},
     watch: { watchFs, fallbackMs: 1_000, debounceMs: 5 },
   });
 }
 
-async function waitForAsync(check: () => Promise<boolean>, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!await check()) {
-    if (Date.now() >= deadline) throw new Error("condition did not become true before timeout");
-    await new Promise((resolve) => { setTimeout(resolve, 10); });
-  }
+function waitForAsync(check: () => Promise<boolean>, timeoutMs = 2_000): Promise<void> {
+  return waitForConditionAsync(check, timeoutMs);
 }
 
-async function requestStop(): Promise<void> {
-  await writeFile(stopRequestPath(tasks), new Date().toISOString(), "utf8");
-  listeners.get(control)?.();
+function requestStop(): Promise<void> {
+  return requestStopThroughFile(tasks, () => listeners.get(control)?.());
 }
 
 function finished(...ids: string[]): boolean {
@@ -118,6 +101,7 @@ beforeEach(async () => {
   await mkdir(tasks);
   await mkdir(work);
   store = new TaskStore(tasks);
+  ({ listeners, watchFs } = createWatchEventSeam());
   cfg = {
     tasksDir: tasks,
     workdir: work,
@@ -132,7 +116,6 @@ beforeEach(async () => {
   probeCalls = [];
   reviewed = [];
   events = [];
-  listeners = new Map();
   onTurn = undefined;
 });
 

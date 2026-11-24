@@ -13,9 +13,13 @@ import {
   releaseWatchLock,
   watchLockPath,
 } from "../src/watch-lock.js";
-import { stopRequestPath, watchQueue, type WatchFs } from "../src/watch.js";
+import { stopRequestPath, watchQueue } from "../src/watch.js";
 import type { WorkerConfig, WorkerDeps } from "../src/worker.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
+import {
+  createWatchEventSeam, markDoneTask, passAcceptance, requestStopThroughCli,
+  requestStopThroughFile, runWatchCli, waitForCondition,
+} from "./helpers/watch-fixture.js";
 
 let root: string;
 let tasks: string;
@@ -25,6 +29,7 @@ let store: TaskStore;
 let cfg: WorkerConfig;
 let turns: string[];
 let listeners: Map<string, () => void>;
+let watchFs: ReturnType<typeof createWatchEventSeam>["watchFs"];
 let releaseActive: (() => void) | undefined;
 let activeStarted: (() => void) | undefined;
 let adapterCalls: string[];
@@ -36,14 +41,12 @@ async function seed(definition: Task): Promise<void> {
 function adapter(): AgentAdapter {
   return {
     prompt: async (args) => {
-      const id = /taskctl done --task (\S+) --tasks-dir/.exec(args.text)![1]!;
+      const id = await markDoneTask(args.text, tasks);
       turns.push(id);
       if (id === "a" && activeStarted !== undefined) {
         activeStarted();
         await new Promise<void>((resolve) => { releaseActive = resolve; });
       }
-      await mkdir(join(tasks, id), { recursive: true });
-      await writeFile(join(tasks, id, "done.requested"), "done");
       return { sessionId: `s-${id}`, exitCode: 0, text: "done" };
     },
     contextUsage: async () => 0,
@@ -71,57 +74,36 @@ function deps(customStore: TaskStore = store): WorkerDeps {
   return {
     store: customStore,
     adapter: adapter(),
-    acceptance: async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" }),
+    acceptance: passAcceptance,
   };
 }
 
-const watchFs: WatchFs = (path, listener) => {
-  listeners.set(path, listener);
-  return { close: () => { listeners.delete(path); } };
-};
-
-async function cliWatch(
+function cliWatch(
   agent: AgentAdapter = adapter(),
   customStore: TaskStore = store,
   fallbackMs = 1_000,
   debounceMs = 5,
   errors: string[] = [],
 ): Promise<number> {
-  const configPath = join(root, "taskctl.json");
-  await writeFile(configPath, JSON.stringify({
-    tasksDir: tasks,
-    workdir: work,
-    model: "w/one",
-    lockTtlMs: 5_000,
-    heartbeatMs: 20,
-  }), "utf8");
-  return runCli(["watch", "--config", configPath], {
-    adapter: agent,
-    acceptance: async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" }),
-    log: () => {},
-    err: (line) => { errors.push(line); },
+  return runWatchCli({
+    root, tasksDir: tasks, workdir: work, agent,
+    acceptance: passAcceptance,
     store: customStore,
+    err: (line) => { errors.push(line); },
     watch: { watchFs, fallbackMs, debounceMs },
   });
 }
 
-async function stopThroughCli(): Promise<void> {
-  const code = await runCli(["stop", "--tasks-dir", tasks], { log: () => {}, err: () => {} });
-  if (code !== 0) throw new Error(`stop CLI exited ${code}`);
-  listeners.get(control)?.();
+function stopThroughCli(): Promise<void> {
+  return requestStopThroughCli(tasks, () => listeners.get(control)?.());
 }
 
-async function waitFor(check: () => boolean, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!check()) {
-    if (Date.now() >= deadline) throw new Error("condition did not become true before timeout");
-    await delay(10);
-  }
+function waitFor(check: () => boolean, timeoutMs = 2_000): Promise<void> {
+  return waitForCondition(check, timeoutMs);
 }
 
-async function requestStop(): Promise<void> {
-  await writeFile(stopRequestPath(tasks), new Date().toISOString(), "utf8");
-  listeners.get(control)?.();
+function requestStop(): Promise<void> {
+  return requestStopThroughFile(tasks, () => listeners.get(control)?.());
 }
 
 beforeEach(async () => {
@@ -132,6 +114,7 @@ beforeEach(async () => {
   await mkdir(tasks);
   await mkdir(work);
   store = new TaskStore(tasks);
+  ({ listeners, watchFs } = createWatchEventSeam());
   cfg = {
     tasksDir: tasks,
     workdir: work,
@@ -143,7 +126,6 @@ beforeEach(async () => {
     heartbeatMs: 20,
   };
   turns = [];
-  listeners = new Map();
   releaseActive = undefined;
   activeStarted = undefined;
   adapterCalls = [];

@@ -13,6 +13,7 @@ import { TaskStore } from "../src/task-store.js";
 import { readUsage } from "../src/usage.js";
 import { runTask, type WorkerConfig, type WorkerDeps } from "../src/worker.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
+import { markDoneTask, passAcceptance } from "./helpers/watch-fixture.js";
 
 type Turn = {
   id: string;
@@ -47,10 +48,8 @@ function adapter(): AgentAdapter {
       return probeStatus;
     },
     prompt: async (args) => {
-      const id = /taskctl done --task (\S+) --tasks-dir/.exec(args.text)![1]!;
+      const id = await markDoneTask(args.text, tasks);
       turns.push({ id, sessionId: args.sessionId, cwd: args.cwd, env: args.env, text: args.text });
-      await mkdir(join(tasks, id), { recursive: true });
-      await writeFile(join(tasks, id, "done.requested"), "done");
       return {
         sessionId: args.sessionId ?? (id === "a" ? "ses-shared" : `fresh-${id}`),
         exitCode: 0,
@@ -76,14 +75,14 @@ function deps(agent: AgentAdapter = adapter()): WorkerDeps {
   return {
     store,
     adapter: agent,
-    acceptance: async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" }),
+    acceptance: passAcceptance,
   };
 }
 
 async function cli(ids: string, agent: AgentAdapter = adapter()): Promise<number> {
   return runCli(["run", "--batch", ids, "--config", configPath], {
     adapter: agent,
-    acceptance: async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" }),
+    acceptance: passAcceptance,
     log: (line) => { cliLines.push(line); },
     err: (line) => { cliLines.push(line); },
   });
