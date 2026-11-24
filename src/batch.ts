@@ -127,6 +127,12 @@ export async function validateBatchSelection(
   return selected;
 }
 
+/** The one readiness derivation shared by automatic selection and watch's fallback head. */
+export function readyTasks(board: Task[]): Task[] {
+  const done = new Set(board.filter((task) => task.status === "done").map((task) => task.id));
+  return ready(board, done);
+}
+
 /**
  * Choose the contiguous eligible prefix of the ready queue. An ineligible task
  * is never skipped: watch runs that earlier task ordinarily instead of letting
@@ -137,8 +143,7 @@ export async function selectAutomaticBatch(
   board: Task[],
 ): Promise<string[]> {
   assertAcyclic(board);
-  const done = new Set(board.filter((task) => task.status === "done").map((task) => task.id));
-  const candidates = ready(board, done);
+  const candidates = readyTasks(board);
   const maximum = cfg.batchMaxTasks ?? 5;
   const selected: string[] = [];
   const earlier = new Set<string>();

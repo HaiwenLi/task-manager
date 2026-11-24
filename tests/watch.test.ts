@@ -222,6 +222,33 @@ describe("watchQueue", () => {
     expect(claims).toBe(2);
   });
 
+  it("waits after an exhausted open batch", async () => {
+    await seed(task("a"));
+    await seed(task("b"));
+    let batches = 0;
+    const running = watchQueue(cfg, deps(), {
+      watchFs,
+      fallbackMs: 1_000,
+      debounceMs: 5,
+      runBatch: async () => {
+        batches++;
+        if (batches === 2) await requestStop();
+        return { done: [], stoppedAt: "a", outcome: "open", pending: ["b"] };
+      },
+    });
+    try {
+      await waitFor(() => batches >= 1);
+      await delay(30);
+      expect(batches).toBe(1);
+      listeners.get(tasks)?.();
+      await running;
+    } finally {
+      if (batches < 2) await requestStop();
+      await running;
+    }
+    expect(batches).toBe(2);
+  });
+
   it("picks up a newly added open task without another run", async () => {
     const running = watchQueue(cfg, deps(), { watchFs, fallbackMs: 1_000, debounceMs: 5 });
     try {

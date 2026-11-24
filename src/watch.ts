@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import { watch as fsWatch } from "node:fs";
 import { mkdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { runBatch, selectAutomaticBatch } from "./batch.js";
+import { readyTasks, runBatch, selectAutomaticBatch } from "./batch.js";
 import { lockLive } from "./claim.js";
-import { assertAcyclic, ready, taskWorkdir } from "./scheduler.js";
+import { assertAcyclic, taskWorkdir } from "./scheduler.js";
 import { runTask, type WorkerConfig, type WorkerDeps } from "./worker.js";
 import { controlDir, acquireWatchLock, heartbeatWatchLock, releaseWatchLock } from "./watch-lock.js";
 
@@ -163,12 +163,16 @@ async function scheduleOnce(
       // The selection is fixed at this boundary. Arrivals during it are picked
       // up by a later board scan, never appended to the active batch.
       const result = await runSelected(cfg, deps, selected, { shouldStop });
-      return result.done.length > 0 || result.stoppedAt !== undefined ? "worked" : "wait";
+      // A batch that exhausted its open budget did no terminal work: wait for
+      // the next event/fallback exactly like the ordinary open outcome.
+      return result.done.length > 0 || (result.stoppedAt !== undefined && result.outcome !== "open")
+        ? "worked"
+        : "wait";
     }
     const done = new Set(board.filter((task) => task.status === "done").map((task) => task.id));
     candidate = selected.length === 1
       ? board.find((task) => task.id === selected[0])
-      : ready(board, done)[0];
+      : readyTasks(board)[0];
   }
   if (candidate === undefined) return "wait";
   // Selection has several await boundaries. Stop and heartbeat loss must be
