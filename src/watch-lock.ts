@@ -3,7 +3,8 @@ import type { FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import { withMutex } from "./mutex.js";
 
-const controlDir = (tasksDir: string): string => join(tasksDir, "..", ".taskctl");
+/** The sibling `.taskctl` runtime-control directory shared by watch paths. */
+export const controlDir = (tasksDir: string): string => join(tasksDir, "..", ".taskctl");
 export const watchLockPath = (tasksDir: string): string => join(controlDir(tasksDir), "watch.lock");
 const watchMutexPath = (tasksDir: string): string => join(controlDir(tasksDir), ".watch-mutation.lock");
 

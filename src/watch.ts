@@ -6,9 +6,8 @@ import { runBatch, selectAutomaticBatch } from "./batch.js";
 import { lockLive } from "./claim.js";
 import { assertAcyclic, ready, taskWorkdir } from "./scheduler.js";
 import { runTask, type WorkerConfig, type WorkerDeps } from "./worker.js";
-import { acquireWatchLock, heartbeatWatchLock, releaseWatchLock } from "./watch-lock.js";
+import { controlDir, acquireWatchLock, heartbeatWatchLock, releaseWatchLock } from "./watch-lock.js";
 
-const controlDir = (tasksDir: string): string => join(tasksDir, "..", ".taskctl");
 export const stopRequestPath = (tasksDir: string): string => join(controlDir(tasksDir), "stop.requested");
 
 /** Minimal filesystem seam: production uses `fs.watch`; tests fire listeners. */
