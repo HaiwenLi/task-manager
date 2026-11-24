@@ -122,8 +122,8 @@ export async function watchQueue(
     for (;;) {
       if (await stopRequested(cfg.tasksDir)) return;
       if (ownershipError !== undefined) throw ownershipError;
-      const worked = await scheduleOnce(cfg, deps, runOne, runSelected, stopOrLost);
-      if (worked) continue;
+      const scheduled = await scheduleOnce(cfg, deps, runOne, runSelected, stopOrLost);
+      if (scheduled === "worked") continue;
       await waitForWake();
     }
   } finally {
@@ -137,14 +137,14 @@ export async function watchQueue(
   }
 }
 
-/** One scheduling boundary. Returns false when there is nothing safe to offer. */
+/** One scheduling boundary. Only a worked cycle justifies an immediate fresh snapshot. */
 async function scheduleOnce(
   cfg: WorkerConfig,
   deps: WorkerDeps,
   runOne: typeof runTask,
   runSelected: typeof runBatch,
   shouldStop: () => Promise<boolean>,
-): Promise<boolean> {
+): Promise<"worked" | "wait"> {
   const board = await deps.store.list();
   assertAcyclic(board);
   let candidate = undefined as (typeof board)[number] | undefined;
@@ -160,19 +160,19 @@ async function scheduleOnce(
       // The selection is fixed at this boundary. Arrivals during it are picked
       // up by a later board scan, never appended to the active batch.
       const result = await runSelected(cfg, deps, selected, { shouldStop });
-      return result.done.length > 0 || result.stoppedAt !== undefined;
+      return result.done.length > 0 || result.stoppedAt !== undefined ? "worked" : "wait";
     }
     const done = new Set(board.filter((task) => task.status === "done").map((task) => task.id));
     candidate = selected.length === 1
       ? board.find((task) => task.id === selected[0])
       : ready(board, done)[0];
   }
-  if (candidate === undefined) return false;
+  if (candidate === undefined) return "wait";
   const outcome = await runOne(
     { ...cfg, workdir: taskWorkdir(cfg.workdir, candidate) },
     deps,
     candidate,
     `watch-${process.pid}-${candidate.id}`,
   );
-  return outcome !== "skipped";
+  return outcome === "open" || outcome === "skipped" ? "wait" : "worked";
 }

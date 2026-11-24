@@ -188,6 +188,32 @@ describe("watchQueue", () => {
     await expect(readFile(watchLockPath(tasks), "utf8")).rejects.toThrow("ENOENT");
   });
 
+  it("waits for an explicit wake after an open outcome", async () => {
+    await seed(task("a"));
+    let claims = 0;
+    const running = watchQueue(cfg, deps(), {
+      watchFs,
+      fallbackMs: 1_000,
+      debounceMs: 5,
+      runOne: async () => {
+        claims++;
+        if (claims === 2) await requestStop();
+        return "open";
+      },
+    });
+    try {
+      await waitFor(() => claims >= 1);
+      await delay(30);
+      expect(claims).toBe(1);
+      listeners.get(tasks)?.();
+      await running;
+    } finally {
+      if (claims < 2) await requestStop();
+      await running;
+    }
+    expect(claims).toBe(2);
+  });
+
   it("picks up a newly added open task without another run", async () => {
     const running = watchQueue(cfg, deps(), { watchFs, fallbackMs: 1_000, debounceMs: 5 });
     try {
