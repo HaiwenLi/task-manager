@@ -99,6 +99,7 @@ retries: 0
 | `workdir` | | 本任务的工作目录（相对配置里的 `workdir`）；同一目录同时只跑一个任务 |
 | `keep_at_root` | | 根目录文件名 glob 列表，命中者**豁免回合后清扫**（如 `run.log`）。不进 `definitionDigest`：它决定杂物停哪儿，不决定"做完"是什么 |
 | `depends_on` | | 依赖的任务 id；全部 `done` 才会被领取，成环直接报错 |
+| `parent_id` | | 由 `taskctl split` 生成的子任务才有。祖先里只要还有一个 `draft`，这个子任务就不会被领取——整个拆分包靠这一次签字放行。属于定义字段，进 `definitionDigest`；只支持一层，不能嵌套 |
 | `human_check` | | `true` 时无论风险都要人工放行 |
 | `tolerate` | | 声明**容忍的外部变更种类**：`external_cell_change`、`new_column`、`deleted_row`、`extra_file`。只写这几个值，写错直接报错（打错字不该变成"声明了但什么都没容忍"）。见下节 |
 | `quick` | | `true` 表示**没出 spec、没跑澄清会话**，意图原文就是定义。`taskctl add --quick` 写入；有客观 `mechanical/render` 证据时可以收尾，若需要 human review 却没有 criteria，则转人工判断（见「车道与验收方式」） |
@@ -110,7 +111,7 @@ retries: 0
 
 `schema: taskctl/v1` 是显式注册：`tasks/` 目录里可以放别的 Markdown（手抄的快照、草稿、导出的旧任务），只有声明了这一行的文件才会被调度。缺这行或 frontmatter 解析不了的文件不领取、不排期，`taskctl status` 会在看板后面单独列出 `ignored` 及原因；已注册但内容坏掉的任务仍然照常报错，不会被静默忽略。`taskctl add` 生成的文件自带这一行。
 
-辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`definition.json`（领取时写下的定义快照，本次尝试的判据）、`acceptance.json`（命令、验收模式、时间、输出、身份摘要与实际使用的模型）、`acceptance-failures.json`（连续同一验收失败的指纹与次数）、`review.json`（复核判决、模型、被容忍的外部变更与实际注入的改动证据）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`execution-state.json`（持久升级与最近 worker session）、`review-pending.json`（只待复核的保留现场）、`classification.json`（接入分类：实际/建议车道、是否兜底升级、信息充分性、理由）、`questions.md`（待回答的问题；存在期间不能 approve）、`usage.jsonl`（每回合资源快照与增量）、`done.requested`（完成请求）、`logs/`（控制器逐任务日志与 worker 的 `$TASKCTL_LOG_DIR`）、`scratch/`（回合后清扫的落点，只进不出）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
+辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`definition.json`（领取时写下的定义快照，本次尝试的判据）、`acceptance.json`（命令、验收模式、时间、输出、身份摘要与实际使用的模型）、`acceptance-failures.json`（连续同一验收失败的指纹与次数）、`review.json`（复核判决、模型、被容忍的外部变更与实际注入的改动证据）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`execution-state.json`（持久升级与最近 worker session）、`review-pending.json`（只待复核的保留现场）、`classification.json`（接入分类：实际/建议车道、是否兜底升级、信息充分性、理由）、`questions.md`（待回答的问题；存在期间不能 approve）、`split-plan.json`（拆分计划：子任务、继承字段与整合步骤）、`split-applied.json`（父任务已连接到哪份计划）、`split-plan.rejected.txt`（被拒绝的规划器原话）、`usage.jsonl`（每回合资源快照与增量）、`done.requested`（完成请求）、`logs/`（控制器逐任务日志与 worker 的 `$TASKCTL_LOG_DIR`）、`scratch/`（回合后清扫的落点，只进不出）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
 
 ## 车道与验收方式
 
@@ -171,6 +172,7 @@ taskctl approve --task <id>                      # 修订后的定义要重新�
 ```
 taskctl add "<意图>"        澄清会话出 spec + criteria，并给出管理分类；complex 停在 draft 等签字
 taskctl spec --task <id>    看稿
+taskctl split --task <id> [--apply]   把 draft 的复杂任务拆成子任务并整合；加 --apply 才发布
 taskctl answer --task <id> --file <answers.md>   回答 questions.md（needs-information 时）
 taskctl approve --task <id> 签字 → open
 taskctl run                 并发执行 → 验收命令 → 独立复核 → done / 返工 / 等放行
@@ -227,6 +229,32 @@ taskctl template --type …   看某类任务的必答/可推/补问模板
 要看的趋势是**首轮通过率上升、人工打回减少**，而不是复核调用变少。两种返工必须分开：一个是工具按设计在自助（便宜、预期内），一个是人不得不介入（这正是要消除的重复）。轮数由 journal 里记录"决定返工"的事件（`worker rework`、`review rework`）统计，不用会被 `retry` 重置的计数器，也不从相邻行推断；分母为 0 时显示 `-` 而不是 `0%`。
 
 旧的 `返工率` 行已移除：它把复核过的任务数除以全部任务（含从未执行的），和这里的口径并排会给出两个互相矛盾的"返工"数字。
+
+### 拆分复杂任务（taskctl split）
+
+一个 complex 任务往往不是一个 worker 回合能做完的事。`taskctl split` 在它**还是 `draft`** 的时候把它拆成若干可以独立验收的子任务，并写清父任务最后怎么整合：
+
+```bash
+taskctl split --task 003-feature            # 只出计划：tasks/003-feature/split-plan.json，看板不变
+taskctl split --task 003-feature --apply    # 发布拆分包；计划已存在就按原样发布，不再调用模型
+taskctl approve --task 003-feature          # 签字 = 放行整个拆分包
+taskctl run
+```
+
+流程与保证：
+
+- **一次模型调用，写下来的就是全部。** 规划器只提出计划（每个子任务的标题、说明、验收标准、验收方式、执行策略，以及子任务之间的先后），并用短 `key` 指代它们；taskctl 按看板编号分配真正的 id 存进计划。之后发布不再咨询模型——同一份计划文件重放多少次结果都一样，手工编辑过的计划也按编辑后的原样发布。已有计划时再跑 `split` 只是把计划显示出来，不会悄悄买一份新的。
+- **校验不过就什么都不写。** 子任务太少、依赖了不存在的兄弟或成环、没有可判定的验收标准、`mechanical` 没给命令、`render` 没给目标、改写或丢掉了父任务的最终验收标准、嵌套拆分……都会被拒绝；原因进日志和终端，规划器的原话留在 `tasks/<id>/split-plan.rejected.txt`。还有未回答的问题（`questions.md`）时也拒绝出计划——计划是对着 spec 做的。
+- **批准前一个回合都不会跑。** 子任务以 `open` 发布，但只要祖先还是 `draft` 就不会被领取；调度器和领取处各自独立判断，谁都不只依赖对方的过滤。`approve` 父任务的那一刻整个包一起放行，并写明放行了几个子任务。
+- **先子后父，崩溃可续。** 发布顺序：全部拒绝条件判定完 → 写子任务文件 → 重新扫描实际文件校验依赖 → 最后才把父任务连上（`depends_on` 追加子任务、正文加一节「拆分与整合」、补上整合才需要的验收标准；原有意图与最终验收标准原样保留）。崩溃在连接之前，子任务被仍是 `draft` 的父任务挡着，重跑 `--apply` 用同一批 id 接着做完；崩溃在之后，重跑不改任何字节。
+- **与已有文件不一致就停下。** 同 id 的任务已存在，却不是本父任务的子任务，或内容与计划不同（被人改过，或来自另一份计划）：发布中止、什么都不写，留给人判断。
+- **子任务继承父任务的 `risk`、`human_check`、`tolerate`、`keep_at_root`、`workdir`、`model`**，规划不能降低它们。要让某个子任务更宽松，只能在签字前直接改它的任务文件——那是你的显式声明。子任务共用父任务的工作目录，所以按依赖顺序串行执行。
+- **父任务等待期间不占工作区。** 子任务全部 `done` 之前，父任务根本不会被领取。轮到它时，worker 和 reviewer 各收到一份有界摘要：每个子任务的 id、标题、最终状态、最新交接的状态行、产物路径、验收记录与复核结论的出处——只给结论与出处，不重放它们的会话。
+- **等什么，看得见。** `status` / `board` 会把 `open` 任务说清楚：`等父任务批准（… 仍是 draft）`、`等依赖：…`、`依赖受阻：…（已阻塞 / 等放行）`；`report` 显示任务所属的父任务，或父任务在等哪些子任务。依赖链再深也不会被固定的 pass 预算截断；预算真的耗尽时，`run` 会列出没启动的任务。
+
+重新规划：删除 `tasks/<id>/split-plan.json`，再跑一次 `taskctl split --task <id>`。已经发布的子任务不会被悄悄替换。出计划之后父任务定义被改过，`--apply` 会拒绝并说明；已经连接过的包，之后你再手改父任务，`--apply` 是空操作而不是报错——那时父任务是你的，签字前随你改。
+
+只支持一层拆分，也不支持执行中动态改计划：那需要多文件原子发布、阻塞传播和依赖等待报告同时到位，等真实的拆分记录证明有必要再说。
 
 ## 运行
 

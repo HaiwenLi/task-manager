@@ -130,7 +130,8 @@ describe("dependency summaries in prompts", () => {
     const adapter: AgentAdapter = {
       prompt: async (args) => {
         prompts.push(args.text);
-        const id = /^# 任务：(.*)$/m.exec(args.text)![1]!;
+        // The header carries the title; the id is in the command the worker is told to run.
+        const id = /taskctl done --task (\S+) --tasks-dir/.exec(args.text)![1]!;
         await mkdir(join(tasks, id), { recursive: true });
         await writeFile(join(tasks, id, "done.requested"), "done");
         return { sessionId: `s-${id}`, text: "done", exitCode: 0 };

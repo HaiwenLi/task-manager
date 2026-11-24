@@ -20,6 +20,10 @@ import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./aud
 import { readRelevantFeedback, recordTaskFeedback, type FeedbackEvent } from "./feedback.js";
 import { readFlow } from "./metrics.js";
 import { clearQuestions, questionsPath, readQuestions, writeQuestions } from "./questions.js";
+import { waitReason } from "./eligibility.js";
+import {
+  applySplitPlan, buildSplitPrompt, parseSplitPlan, readSplitPlan, renderSplitPlan, splitPlanPath, SplitError, writeSplitPlan,
+} from "./split.js";
 import { readRuntime, readAttempt, writeRuntime } from "./runtime.js";
 import { reconcileTask, retryTask } from "./reconcile.js";
 import { checkRender, describeFailures, RenderUnavailableError, DEFAULT_VIEWPORTS } from "./render.js";
@@ -48,6 +52,7 @@ const USAGE = [
   "usage:",
   "  taskctl add \"<意图>\" [--type code|office|research|design] [--simple] [--quick] [--verify human|mechanical|render] [--execution continuous|iterative] [--target <a.html,b.html>] [--id <id>] [--config taskctl.json]",
   "  taskctl spec --task <id> [--tasks-dir <dir>]",
+  "  taskctl split --task <id> [--apply] [--tasks-dir <dir>] [--config taskctl.json]",
   "  taskctl approve --task <id> [--tasks-dir <dir>]",
   "  taskctl answer --task <id> --file <path> [--tasks-dir <dir>]",
   "  taskctl run [--log <file>] [--config taskctl.json]",
@@ -169,6 +174,9 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "answer":
       checkFlags(command, flags, ["task", "file", "tasks-dir", "config"], ["task", "file"]);
       return answerCommand(flags, log);
+    case "split":
+      checkFlags(command, flags, ["task", "apply", "tasks-dir", "config"], ["task"]);
+      return splitCommand(flags, deps, log);
     case "run":
       checkFlags(command, flags, ["config", "log"], []);
       return runCommand(flags, deps, log);
@@ -542,7 +550,10 @@ async function approveCommand(flags: Map<string, string>, log: (line: string) =>
   }
   await store.setStatus(id, "open");
   await appendJournal(tasksDir, id, { stage: "human", event: "approved", detail: `criteria=${criteria.length}` });
-  log(`${id}  open  approved`);
+  // Signing a split parent is signing the whole bundle: its children, open all
+  // along, become runnable at this moment. Saying how many keeps that visible.
+  const released = (await store.list()).filter((task) => task.parentId === id && task.status === "open").length;
+  log(`${id}  open  approved${released === 0 ? "" : `  bundle: ${released} child task(s) released`}`);
   return 0;
 }
 
@@ -622,6 +633,96 @@ function answerBlock(questions: string[], answers: string, at: string): string {
   ].join("\n");
 }
 
+/**
+ * `taskctl split --task <id> [--apply]` — plan how a draft parent is split,
+ * and publish the bundle.
+ *
+ * Without `--apply` the only thing written is the plan, so it can be read
+ * first. With it the bundle is published but held: no child runs until the
+ * parent is approved, which is what makes planning and applying in one step
+ * safe.
+ *
+ * A plan that already exists is used as written — shown, or applied. It is
+ * never replaced by a fresh model call just because the command ran again,
+ * and an edited plan file is applied exactly as edited. To plan again, the
+ * plan file is deleted on purpose; the command says so.
+ */
+async function splitCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
+  const tasksDir = await tasksDirFor(flags);
+  const id = flags.get("task")!;
+  const apply = flags.has("apply");
+  const store = new TaskStore(tasksDir);
+  const parent = await store.get(id);
+  if (parent.status !== "draft") {
+    throw new Error(`task ${id} is ${parent.status}, expected draft: only a parent still waiting for approval can be split`);
+  }
+  if (parent.parentId !== undefined) {
+    throw new Error(`task ${id} is itself a split child; a nested split is not supported`);
+  }
+  // A plan is made against the spec. With a question still open, that is not
+  // yet the spec the work will run by.
+  const questions = await readQuestions(tasksDir, id);
+  if (questions !== null) {
+    throw new Error(
+      `task ${id} has ${questions.items.length} unanswered question(s); answer them before planning: `
+      + `taskctl answer --task ${id} --file <answers>`,
+    );
+  }
+
+  let plan = await readSplitPlan(tasksDir, id);
+  if (plan === null) {
+    const cfg = await configFor(flags);
+    const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+    const spec = (await readSpec(tasksDir, id)) ?? "";
+    const result = await adapter.prompt({
+      text: buildSplitPrompt({ parent, spec }),
+      cwd: cfg.workdir,
+      model: cfg.model,
+      effort: cfg.effort,
+      title: `split: ${parent.title}`,
+    });
+    if (result.exitCode !== 0) {
+      await appendJournal(tasksDir, id, { stage: "split", event: "plan-failed", detail: `exit ${result.exitCode}` });
+      log(`${id}  draft  split-failed`);
+      return 1;
+    }
+    try {
+      plan = parseSplitPlan(result.text, {
+        parent, spec, board: await store.list(), model: cfg.model ?? "(backend-default)", now: new Date(),
+      });
+    } catch (err) {
+      if (!(err instanceof SplitError)) throw err;
+      await appendJournal(tasksDir, id, { stage: "split", event: "plan-invalid", detail: err.message });
+      // The planner's own words are kept: "not a JSON object" is far easier to
+      // fix with the text that produced it than with that sentence alone.
+      await mkdir(join(tasksDir, id), { recursive: true });
+      await writeFile(join(tasksDir, id, "split-plan.rejected.txt"), result.text.slice(0, 20_000), "utf8");
+      log(`${id}  draft  split-plan-invalid  ${err.message}`);
+      return 1;
+    }
+    const path = await writeSplitPlan(tasksDir, plan);
+    await appendJournal(tasksDir, id, { stage: "split", event: "planned", detail: `children=${plan.children.length}` });
+    for (const line of renderSplitPlan(plan)) log(line);
+    log(path);
+    // Planning alone changes nothing on the board. Publishing is `--apply`.
+    if (!apply) return 0;
+  } else if (!apply) {
+    for (const line of renderSplitPlan(plan)) log(line);
+    log(`${splitPlanPath(tasksDir, id)}  (already planned: --apply publishes it as written; delete this file to plan again)`);
+    return 0;
+  }
+
+  const published = await applySplitPlan(tasksDir, plan);
+  await appendJournal(tasksDir, id, {
+    stage: "split",
+    event: "applied",
+    detail: `children=${plan.children.length} written=${published.written.length} present=${published.alreadyPresent.length}`,
+  });
+  log(`${id}  draft  split applied  children=${plan.children.length}  written=${published.written.length}  already-present=${published.alreadyPresent.length}`);
+  log(`held until the parent is approved: review the child files, then taskctl approve --task ${id}`);
+  return 0;
+}
+
 /** `taskctl done --task <id>` — write the marker the worker polls for. */
 async function doneCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
   const tasksDir = await tasksDirFor(flags);
@@ -693,7 +794,7 @@ async function statusCommand(flags: Map<string, string>, log: (line: string) => 
       task.status,
       String(task.retries),
       String(task.sessions.length),
-      await waitingOn(tasksDir, task),
+      await waitingOn(tasksDir, task, tasks),
     ]);
   }
   for (const line of renderTable(rows)) {
@@ -734,14 +835,40 @@ async function boardCommand(flags: Map<string, string>, log: (line: string) => v
   return 0;
 }
 
+const STUCK_LABELS: Record<string, string> = { blocked: "已阻塞", "awaiting-human": "等放行", draft: "等签字" };
+
 /**
- * What a task is waiting on: the status line of its latest handoff note, else
- * its open questions, else `-` (the board then falls back to the status).
+ * What a task is waiting on, in words: the status line of its latest handoff
+ * note; else, for an open task, why it is not ready — an unsigned bundle, a
+ * dependency, or a dependency that will not finish on its own; else, for a
+ * draft, the bundle its signature releases; else its open questions; else `-`.
+ *
+ * A task sitting in `open` with no explanation reads as "nothing to do". For a
+ * held or blocked task that is exactly wrong, and it is what a person looking
+ * at the board most needs to know.
  */
-async function waitingOn(tasksDir: string, task: Pick<Task, "id">): Promise<string> {
+async function waitingOn(tasksDir: string, task: Task, board: Task[]): Promise<string> {
   const note = await latestNote(tasksDir, task.id);
   const fromNote = note === null ? "-" : statusLineFromNote(note.markdown);
   if (fromNote !== "-") return fromNote;
+  if (task.status === "open") {
+    const reason = waitReason(task, board);
+    if (reason?.kind === "bundle-approval") return `等父任务批准（${reason.ancestor} 仍是 draft）`;
+    if (reason?.kind === "dependencies") {
+      if (reason.stuck.length === 0) return `等依赖：${reason.pending.join(", ")}`;
+      const statusOf = new Map(board.map((other) => [other.id, other.status]));
+      const stuck = reason.stuck.map((id) => {
+        const status = statusOf.get(id);
+        return `${id}（${status === undefined ? "不存在" : STUCK_LABELS[status] ?? status}）`;
+      });
+      const others = reason.pending.filter((id) => !reason.stuck.includes(id));
+      return `依赖受阻：${stuck.join(", ")}${others.length === 0 ? "" : `；另等：${others.join(", ")}`}`;
+    }
+  }
+  if (task.status === "draft") {
+    const children = board.filter((other) => other.parentId === task.id).length;
+    if (children > 0) return `等签字（拆分包：${children} 个子任务随之放行）`;
+  }
   const questions = await readQuestions(tasksDir, task.id);
   return questions === null ? "-" : `待回答问题 ${questions.items.length} 条（${questionsPath(tasksDir, task.id)}）`;
 }
@@ -750,7 +877,7 @@ async function waitingOn(tasksDir: string, task: Pick<Task, "id">): Promise<stri
 async function boardNotes(tasksDir: string, tasks: Task[]): Promise<Map<string, string>> {
   const notes = new Map<string, string>();
   for (const task of tasks) {
-    const waiting = await waitingOn(tasksDir, task);
+    const waiting = await waitingOn(tasksDir, task, tasks);
     if (waiting !== "-") {
       notes.set(task.id, waiting);
       continue;

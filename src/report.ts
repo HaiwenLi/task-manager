@@ -24,7 +24,9 @@ type ReviewFile = {
  * self-report.
  */
 export async function buildReport(tasksDir: string, id: string): Promise<string[]> {
-  const task = await new TaskStore(tasksDir).get(id);
+  const store = new TaskStore(tasksDir);
+  const task = await store.get(id);
+  const board = await store.list();
   const spec = await readSpec(tasksDir, id);
   const acceptance = await readRuntime<AcceptanceFile>(tasksDir, id, "acceptance.json");
   const review = await readRuntime<ReviewFile>(tasksDir, id, "review.json");
@@ -39,6 +41,7 @@ export async function buildReport(tasksDir: string, id: string): Promise<string[
     `verify ${task.verify}${task.quick ? "  (quick lane: no spec)" : ""}` +
       (task.renderTargets.length > 0 ? `  targets ${task.renderTargets.join(", ")}` : ""),
     ...(task.tolerate.length > 0 ? [`tolerate ${task.tolerate.join(", ")}`] : []),
+    ...splitLines(task, board),
     "",
     "## spec",
     ...(spec === null ? ["(no spec)"] : [firstLine(spec)]),
@@ -112,6 +115,20 @@ function renderAudit(record: AuditRecord): string {
   const stage = record.stage === "none" ? "" : ` stage=${record.stage}`;
   const note = record.note === undefined ? "" : ` ${record.note}`;
   return `${record.at.slice(0, 19)} ${record.verdict}${stage}${record.highlight === true ? " ★highlight" : ""}${note}`;
+}
+
+/**
+ * Which bundle a task belongs to, or which children a parent is waiting on.
+ * A split is several task files; on a single task's page the link between
+ * them is otherwise invisible.
+ */
+function splitLines(task: Task, board: Task[]): string[] {
+  if (task.parentId !== undefined) {
+    const parent = board.find((other) => other.id === task.parentId);
+    return [`parent ${task.parentId}${parent === undefined ? " (not on the board)" : ` (${parent.status})`}`];
+  }
+  const children = board.filter((other) => other.parentId === task.id);
+  return children.length === 0 ? [] : [`children ${children.map((child) => `${child.id} (${child.status})`).join(", ")}`];
 }
 
 function firstLine(text: string): string {

@@ -139,10 +139,32 @@ Implementation notes the plan did not fix:
 
 **Files:** `src/cli.ts`, `src/report.ts`, `README.md`; tests `tests/split.test.ts`, `tests/split-flow.test.ts`
 
-- [ ] Write failing CLI tests for `taskctl split --task <id> [--apply]` (plan only, plan-and-apply, re-plan
+- [x] Write failing CLI tests for `taskctl split --task <id> [--apply]` (plan only, plan-and-apply, re-plan
       refusal after publication, apply of an existing plan) and for status/board wording of bundle waiting,
       dependency waiting and a stuck dependency.
-- [ ] Write the integration test: nothing runs before approval; children run in order; the parent integrates
+- [x] Write the integration test: nothing runs before approval; children run in order; the parent integrates
       with the summaries and its own review; all finish.
-- [ ] Implement the command and wording; document the flow; run `npm test`, `npx tsc --noEmit`,
+- [x] Implement the command and wording; document the flow; run `npm test`, `npx tsc --noEmit`,
       `git diff --check`.
+
+**Evidence (2026-11-24), Task 6:** `tests/split-flow.test.ts` 10 tests through the real CLI, scheduler and worker;
+full suite 544 passed / 1 skipped; `npx tsc --noEmit` exit 0; `git diff --check` clean; `scripts/smoke.ps1` without
+`-Live` prepared the environment. No live-provider run was made. Mutation check, control and restore clean, 11
+reversals: planning alone publishing, an existing plan applied without `--apply`, planning over unanswered
+questions, splitting a non-draft parent, an invalid plan reported as success, and each of the four status
+wordings, the report's bundle link and the approval's bundle line were each killed by the test named for them.
+
+Implementation notes the plan did not fix:
+
+- The first run of the end-to-end test found a real defect: `split` without `--apply` wrote the plan and then
+  fell through into publication. Planning alone now returns before applying. The integration test caught it
+  before any mutation check was written.
+- Re-planning is manual by design. With a plan on disk, `split` shows it and spends no model call; a new plan
+  requires deleting `tasks/<id>/split-plan.json`. The alternative — re-running the command buys a different
+  plan — would have made "show me the plan again" cost a model call and change the answer.
+- `--apply` on a bundle already linked is a no-op even if the parent was hand-edited afterwards. The link
+  record identifies the plan; from there the parent is the operator's to edit before signing.
+- Two test-harness mistakes worth recording because both looked like implementation bugs: a fake worker read
+  the task *title* from the prompt header and wrote `done.requested` into the wrong directory (the task then
+  blocked on its turn budget), and one assertion assumed a child with a dependency would have no dependency
+  summary. Both were found by reproducing the flow and printing the journal, not by guessing at the code.

@@ -340,7 +340,7 @@ export async function applySplitPlan(
   if (!linked && definitionDigest(parent) !== plan.parentDigest) {
     throw new SplitError(
       `the definition of task ${id} changed since the plan was made (plan ${plan.parentDigest.slice(0, 12)}, found ${definitionDigest(parent).slice(0, 12)}); `
-      + `run taskctl split --task ${id} again to re-plan`,
+      + `delete ${splitPlanPath(tasksDir, id)} and run taskctl split --task ${id} to plan again`,
     );
   }
 
