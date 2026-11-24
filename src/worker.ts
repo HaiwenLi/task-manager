@@ -707,7 +707,7 @@ async function blockForQuota(r: Run, current: string, result: PromptResult & { d
 async function restoreWorkerSession(r: Run, model: string | undefined): Promise<string | undefined> {
   const batchPrevious = r.batch?.resumeFrom;
   const previous = batchPrevious ?? r.executionState?.latestWorker;
-  if (!previous?.clean || !previous.model || !r.deps.adapter.canResumeSession) return undefined;
+  if (!previous?.clean || !previous.model) return undefined;
   if (previous.model !== model) {
     // A cross-task candidate that names another actual model must not fall back
     // to some older task-local session: the batch explicitly starts fresh.
@@ -722,6 +722,15 @@ async function restoreWorkerSession(r: Run, model: string | undefined): Promise<
   // runBatch supplies a candidate only after the previous task settled done.
   // The ordinary task-local path still requires this task's own settled attempt.
   if (batchPrevious === undefined && !r.previousSettled) return undefined;
+  if (!r.deps.adapter.canResumeSession) {
+    // A missing capability is still a durable reuse decision: without the
+    // journal, fresh dispatch looks identical to "there was never a candidate".
+    await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
+      stage: "worker", event: "session-reuse-skipped",
+      detail: `${previous.sessionId}: session status probe unavailable; starting fresh`,
+    }));
+    return undefined;
+  }
   const status = await r.deps.adapter.canResumeSession(previous.sessionId, { model, cwd: r.cfg.workdir });
   if (status === "active") {
     throw new UncertainExecutionError(`recorded worker session ${previous.sessionId} is still active; reconcile before starting another worker`);

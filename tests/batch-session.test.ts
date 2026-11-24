@@ -84,10 +84,10 @@ function adapter(): AgentAdapter {
   };
 }
 
-function deps(): WorkerDeps {
+function deps(agent: AgentAdapter = adapter()): WorkerDeps {
   return {
     store,
-    adapter: adapter(),
+    adapter: agent,
     acceptance: async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" }),
   };
 }
@@ -162,6 +162,21 @@ describe("cross-task batch sessions", () => {
     expect(reuse).toHaveLength(1);
     expect(reuse[0]!.detail).toContain("w/one");
     expect(reuse[0]!.detail).toContain("w/two");
+  });
+
+  it("starts fresh and journals an unavailable probe when the adapter cannot probe sessions", async () => {
+    await seed(task("a"), task("b"));
+    const probeless = adapter();
+    delete probeless.canResumeSession;
+
+    const result = await runBatch(cfg, deps(probeless), ["a", "b"]);
+
+    expect(result.done).toEqual(["a", "b"]);
+    expect(turns.map((turn) => turn.sessionId)).toEqual([undefined, undefined]);
+    const reuse = (await readJournal(tasks, "b")).filter((entry) => entry.event === "session-reuse-skipped");
+    expect(reuse).toHaveLength(1);
+    expect(reuse[0]!.detail).toContain("ses-shared");
+    expect(reuse[0]!.detail).toContain("unavailable");
   });
 
   it("starts fresh and journals when the backend reuse state is unavailable", async () => {
