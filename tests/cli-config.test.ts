@@ -113,6 +113,15 @@ describe("resolveConfig", () => {
     expect(() => resolveConfig({ artifacts: { unknown: true } }, "taskctl.json")).toThrow(/unknown artifacts field/);
   });
 
+  it("resolves batchMaxTasks with a default of five and one as the grouping opt-out", () => {
+    expect(resolveConfig({}, "taskctl.json").batchMaxTasks).toBe(5);
+    expect(resolveConfig({ batchMaxTasks: 1 }, "taskctl.json").batchMaxTasks).toBe(1);
+    expect(resolveConfig({ batchMaxTasks: 2 }, "taskctl.json").batchMaxTasks).toBe(2);
+    expect(() => resolveConfig({ batchMaxTasks: 0 }, "taskctl.json")).toThrow(/positive/);
+    expect(() => resolveConfig({ batchMaxTasks: 1.5 }, "taskctl.json")).toThrow(/integer/);
+    expect(() => resolveConfig({ batchMaxTasks: "2" }, "taskctl.json")).toThrow(/positive/);
+  });
+
   it("rejects unknown fields", () => {
     expect(() => resolveConfig({ nope: 1 }, "taskctl.json")).toThrow(/unknown field/);
   });

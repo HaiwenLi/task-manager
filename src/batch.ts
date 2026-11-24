@@ -2,7 +2,7 @@ import { lockLive } from "./claim.js";
 import { draftAncestor } from "./eligibility.js";
 import { definitionDigest, readAttempt } from "./runtime.js";
 import { readExecutionState, type WorkerSessionFact } from "./execution-state.js";
-import { assertAcyclic, passBudget, taskWorkdir } from "./scheduler.js";
+import { assertAcyclic, passBudget, ready, taskWorkdir } from "./scheduler.js";
 import type { Task } from "./task-file.js";
 import { runTask, type TaskOutcome, type WorkerConfig, type WorkerDeps } from "./worker.js";
 
@@ -107,6 +107,42 @@ export async function validateBatchSelection(
   }
 
   if (issues.length > 0) throw new BatchValidationError(issues);
+  return selected;
+}
+
+/**
+ * Choose the contiguous eligible prefix of the ready queue. An ineligible task
+ * is never skipped: watch runs that earlier task ordinarily instead of letting
+ * later work jump it merely to form a cheaper batch.
+ */
+export async function selectAutomaticBatch(
+  cfg: WorkerConfig,
+  board: Task[],
+): Promise<string[]> {
+  assertAcyclic(board);
+  const done = new Set(board.filter((task) => task.status === "done").map((task) => task.id));
+  const candidates = ready(board, done);
+  const maximum = cfg.batchMaxTasks ?? 5;
+  const selected: string[] = [];
+  const earlier = new Set<string>();
+  let expectedWorkdir: string | undefined;
+
+  for (const task of candidates) {
+    if (selected.length >= maximum) break;
+    if (batchEligibility(task, board, earlier, cfg.workdir) !== null) break;
+    const workdir = taskWorkdir(cfg.workdir, task);
+    if (expectedWorkdir !== undefined && workdir !== expectedWorkdir) break;
+    if (await lockLive(cfg.tasksDir, task.id, cfg.lockTtlMs)) break;
+    try {
+      const previous = await readAttempt(cfg.tasksDir, task.id);
+      if (previous !== null && previous.phase !== "settled") break;
+    } catch {
+      break;
+    }
+    selected.push(task.id);
+    earlier.add(task.id);
+    expectedWorkdir ??= workdir;
+  }
   return selected;
 }
 

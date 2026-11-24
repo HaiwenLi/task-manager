@@ -92,6 +92,8 @@ export type WorkerConfig = {
   modelCooldownMs?: number;
   /** How many tasks the scheduler may run at once (default 2). */
   parallel?: number;
+  /** Maximum automatic watch batch size (default 5); 1 disables grouping. */
+  batchMaxTasks?: number;
   /** Viewports a `verify: render` task must pass (default 1440x900 and 390x844). */
   renderViewports?: string[];
   /** Browser binary for render checks; auto-detected when absent. */

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { watch as fsWatch } from "node:fs";
 import { mkdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import type { runBatch } from "./batch.js";
+import { runBatch, selectAutomaticBatch } from "./batch.js";
 import { lockLive } from "./claim.js";
 import { assertAcyclic, ready, taskWorkdir } from "./scheduler.js";
 import { runTask, type WorkerConfig, type WorkerDeps } from "./worker.js";
@@ -52,6 +52,7 @@ export async function watchQueue(
   const fallbackMs = options.fallbackMs ?? 30_000;
   const watchFs: WatchFs = options.watchFs ?? ((path, listener) => fsWatch(path, listener));
   const runOne = options.runOne ?? runTask;
+  const runSelected = options.runBatch ?? runBatch;
   const watchers: Array<{ close(): void }> = [];
   let debounce: ReturnType<typeof setTimeout> | undefined;
   let fallback: ReturnType<typeof setTimeout> | undefined;
@@ -88,6 +89,7 @@ export async function watchQueue(
     fallback = undefined;
     wakeRequested = false;
   };
+  const stopOrLost = async (): Promise<boolean> => ownershipError !== undefined || await stopRequested(cfg.tasksDir);
   const beat = (): void => {
     heartbeatTimer = setTimeout(() => {
       renewal = (async () => {
@@ -120,7 +122,7 @@ export async function watchQueue(
     for (;;) {
       if (await stopRequested(cfg.tasksDir)) return;
       if (ownershipError !== undefined) throw ownershipError;
-      const worked = await scheduleOnce(cfg, deps, runOne);
+      const worked = await scheduleOnce(cfg, deps, runOne, runSelected, stopOrLost);
       if (worked) continue;
       await waitForWake();
     }
@@ -140,6 +142,8 @@ async function scheduleOnce(
   cfg: WorkerConfig,
   deps: WorkerDeps,
   runOne: typeof runTask,
+  runSelected: typeof runBatch,
+  shouldStop: () => Promise<boolean>,
 ): Promise<boolean> {
   const board = await deps.store.list();
   assertAcyclic(board);
@@ -151,8 +155,17 @@ async function scheduleOnce(
     }
   }
   if (candidate === undefined) {
+    const selected = await selectAutomaticBatch(cfg, board);
+    if (selected.length >= 2) {
+      // The selection is fixed at this boundary. Arrivals during it are picked
+      // up by a later board scan, never appended to the active batch.
+      const result = await runSelected(cfg, deps, selected, { shouldStop });
+      return result.done.length > 0 || result.stoppedAt !== undefined;
+    }
     const done = new Set(board.filter((task) => task.status === "done").map((task) => task.id));
-    candidate = ready(board, done)[0];
+    candidate = selected.length === 1
+      ? board.find((task) => task.id === selected[0])
+      : ready(board, done)[0];
   }
   if (candidate === undefined) return false;
   const outcome = await runOne(
