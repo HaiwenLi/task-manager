@@ -5,10 +5,10 @@ import { join } from "node:path";
 import { runCli } from "../src/cli.js";
 import { latestNote } from "../src/handoff.js";
 import { noteModelRefusal } from "../src/model-cooldown.js";
-import { readRuntime } from "../src/runtime.js";
+import { readAttempt, readRuntime } from "../src/runtime.js";
 import { runTask, type WorkerConfig, type WorkerDeps } from "../src/worker.js";
 import type { AgentAdapter } from "../src/adapters/types.js";
-import type { ReviewResult } from "../src/review.js";
+import type { ReviewEvidence, ReviewResult } from "../src/review.js";
 import { TaskStore } from "../src/task-store.js";
 
 let root: string;
@@ -202,5 +202,57 @@ describe("review-pending recovery", () => {
     expect((await store.get("a")).status).toBe("open");
     expect((await latestNote(tasks, "a"))?.markdown).toContain("review-failed");
     expect(await readRuntime(tasks, "a", "review-pending.json")).toBeNull();
+  });
+
+  it("shows the reviewer the window of the attempt that produced the evidence, not of the recovery", async () => {
+    // 只复核的恢复是另一次、更晚的尝试。时间窗是评审员区分「任务改的」和「外部漂移」的唯一依据；
+    // 给它恢复尝试自己的窗口，等于说全部产出都发生在执行开始之前。
+    const calls: string[] = [];
+    expect((await park(calls)).outcome).toBe("blocked");
+    const pending = await readRuntime<{ window?: { startedAt: string; finishedAt: string } }>(tasks, "a", "review-pending.json");
+    expect(pending?.window).toEqual({ startedAt: (await readAttempt(tasks, "a"))?.startedAt, finishedAt: expect.any(String) });
+
+    const windows: Array<{ startedAt: string; finishedAt: string } | undefined> = [];
+    const review = vi.fn(async (evidence: ReviewEvidence) => {
+      windows.push(evidence.window);
+      return passVerdict;
+    });
+    const outcome = await runTask({ ...config(), reviewerModel: "r/two" }, {
+      store, adapter: workerAdapter(calls), acceptance: pass, review,
+    }, await store.get("a"), "review-only", { reviewOnly: true });
+
+    expect(outcome).toBe("done");
+    expect(windows).toEqual([pending?.window]);
+  });
+
+  it("keeps the first window when a recovery is parked again", async () => {
+    const calls: string[] = [];
+    expect((await park(calls)).outcome).toBe("blocked");
+    const first = (await readRuntime<{ window?: unknown }>(tasks, "a", "review-pending.json"))?.window;
+    expect(first).toEqual({ startedAt: expect.any(String), finishedAt: expect.any(String) });
+
+    const outcome = await runTask({ ...config(), reviewerModel: "r/two" }, {
+      store, adapter: workerAdapter(calls), acceptance: pass, review: async () => providerRefusal,
+    }, await store.get("a"), "review-only", { reviewOnly: true });
+
+    expect(outcome).toBe("blocked");
+    const again = await readRuntime<{ window?: unknown; refusals: unknown[] }>(tasks, "a", "review-pending.json");
+    expect(again?.refusals).toHaveLength(2);
+    expect(again?.window).toEqual(first);
+  });
+
+  it("shows the reviewer the window of the attempt whose work it reviews", async () => {
+    const windows: Array<{ startedAt: string; finishedAt: string } | undefined> = [];
+    const review = vi.fn(async (evidence: ReviewEvidence) => {
+      windows.push(evidence.window);
+      return passVerdict;
+    });
+    const calledBefore = new Date().toISOString();
+
+    expect(await runTask(config(), { store, adapter: workerAdapter([]), acceptance: pass, review }, await store.get("a"), "w1")).toBe("done");
+
+    expect(windows).toHaveLength(1);
+    expect(windows[0]?.startedAt).toBe((await readAttempt(tasks, "a"))?.startedAt);
+    expect(Date.parse(windows[0]!.startedAt)).toBeGreaterThanOrEqual(Date.parse(calledBefore));
   });
 });

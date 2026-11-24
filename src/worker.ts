@@ -130,6 +130,13 @@ type ReviewPendingRecord = {
   createdAt: string;
   updatedAt: string;
   refusals: Array<{ model: string; reason: string }>;
+  /**
+   * When the attempt that produced the preserved evidence ran. A review-only
+   * recovery is another, later attempt; the reviewer must still judge the work
+   * against the window it happened in, so the first park records it and every
+   * later park keeps it.
+   */
+  window?: { startedAt: string; finishedAt: string };
 };
 export class WorkerTimeoutError extends Error {
   constructor(message: string, readonly partialOutput?: string) { super(message); }
@@ -1052,7 +1059,7 @@ async function resumeReviewOnly(r: Run, pending: ReviewPendingRecord): Promise<"
   await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
     stage: "review", event: "review-only", detail: "resuming review on the preserved worker/acceptance evidence",
   }));
-  const outcome = await reviewStage(r);
+  const outcome = await reviewStage(r, preservedWindow(pending));
   if (outcome === "retry") {
     // A real fail verdict needs worker side effects, which a review-only claim
     // deliberately cannot perform. The judge already wrote the feedback note.
@@ -1288,8 +1295,16 @@ async function acceptRender(
  * The independent review gate. It runs in its own session, sees only written
  * evidence, and can never mark work done on its own when the task has no
  * criteria, is high risk, or asks for a human sign-off.
+ *
+ * `preserved` is the window of the attempt that produced the evidence, passed
+ * by a review-only recovery. Without it the window is the current attempt's:
+ * the reviewer is told when this execution ran, and every "was this there
+ * before the task started?" judgement rests on it.
  */
-async function reviewStage(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "awaiting-human"> {
+async function reviewStage(
+  r: Run,
+  preserved?: { startedAt: string; finishedAt: string },
+): Promise<"done" | "blocked" | "retry" | "open" | "awaiting-human"> {
   const id = r.task.id;
   if (r.task.criteria.length === 0) {
     await owned(r, () => r.deps.store.setStatus(id, "awaiting-human"));
@@ -1311,7 +1326,7 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "retry" | "open
     handoff: (await latestNote(r.cfg.tasksDir, id))?.markdown ?? null,
     journal: await journalTail(r.cfg.tasksDir, id, 30),
     changes,
-    window: { startedAt: r.record.startedAt, finishedAt: new Date().toISOString() },
+    window: preserved ?? { startedAt: r.record.startedAt, finishedAt: new Date().toISOString() },
     acceptanceLogPath: join(taskDirOf(r.cfg.tasksDir, id), "acceptance.json"),
   };
   emit(r, "reviewing");
@@ -1441,6 +1456,14 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "retry" | "open
   }
 }
 
+/** The window a parked record carries, when it is shaped like one. */
+function preservedWindow(
+  pending: ReviewPendingRecord | null,
+): { startedAt: string; finishedAt: string } | undefined {
+  const window = pending?.window;
+  return typeof window?.startedAt === "string" && typeof window.finishedAt === "string" ? window : undefined;
+}
+
 /**
  * Park only the missing review: the worker and acceptance already produced
  * valid evidence, and replaying those side effects on a later scheduler pass
@@ -1466,6 +1489,9 @@ async function parkReviewPending(
     createdAt: previous?.createdAt ?? now,
     updatedAt: now,
     refusals: [...(previous?.refusals ?? []), refusal].slice(-20),
+    // The window of the attempt whose evidence is preserved. A recovery that is
+    // parked again is a later attempt that produced nothing: it keeps the first.
+    window: preservedWindow(previous) ?? { startedAt: r.record.startedAt, finishedAt: now },
   };
   await owned(r, async () => {
     await writeRuntime(r.cfg.tasksDir, r.task.id, "review-pending.json", pending);
