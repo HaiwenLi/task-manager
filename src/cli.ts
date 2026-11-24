@@ -31,6 +31,7 @@ import { taskWorkdir } from "./scheduler.js";
 import { resolveArtifacts } from "./artifacts.js";
 import { runSelfCheck } from "./self-check.js";
 import { runBatch } from "./batch.js";
+import { stopRequestPath, watchQueue } from "./watch.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
 export type CliDeps = {
@@ -57,6 +58,8 @@ const USAGE = [
   "  taskctl approve --task <id> [--tasks-dir <dir>]",
   "  taskctl answer --task <id> --file <path> [--tasks-dir <dir>]",
   "  taskctl run [--batch <id,id,…>] [--log <file>] [--config taskctl.json]",
+  "  taskctl watch --config <file> [--resume]",
+  "  taskctl stop --tasks-dir <dir>",
   "  taskctl verify --task <id> [--viewport 1440x900,390x844] [--config taskctl.json]",
   "  taskctl done --task <id> [--tasks-dir <dir>]",
   "  taskctl check --task <id> [--tasks-dir <dir>]",
@@ -181,6 +184,12 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "run":
       checkFlags(command, flags, ["config", "log", "batch"], []);
       return runCommand(flags, deps, log);
+    case "watch":
+      checkFlags(command, flags, ["config", "resume"], ["config"]);
+      return watchCommand(flags, deps, log);
+    case "stop":
+      checkFlags(command, flags, ["tasks-dir"], ["tasks-dir"]);
+      return stopCommand(flags, log);
     case "verify":
       checkFlags(command, flags, ["task", "viewport", "tasks-dir", "config"], ["task"]);
       return verifyCommand(flags, log);
@@ -307,6 +316,41 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
       + `${result.pending.join(", ")}. Run taskctl run again to continue.`,
     );
   }
+  return 0;
+}
+
+/** `taskctl watch` — own and drain one board until its stop request appears. */
+async function watchCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
+  const cfg = await configFor(flags);
+  const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+  const store = new TaskStore(cfg.tasksDir);
+  const boardRefresh = createCoalescedRefresh(() => refreshBoardFile(cfg.tasksDir));
+  const refreshBoard = boardRefresh.request;
+  refreshBoard();
+  try {
+    await watchQueue(cfg, {
+      store,
+      adapter,
+      ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
+      ...(deps.review === undefined ? {} : { review: deps.review }),
+      onEvent: (evt) => {
+        log(`[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`);
+        refreshBoard();
+      },
+    }, { resume: flags.has("resume") });
+  } finally {
+    refreshBoard();
+    await boardRefresh.flush();
+  }
+  return 0;
+}
+
+/** `taskctl stop` — request a graceful drain; never signals a worker process. */
+async function stopCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  const path = stopRequestPath(await tasksDirFor(flags));
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${new Date().toISOString()}\n`, "utf8");
+  log(`stop requested: ${path}`);
   return 0;
 }
 
