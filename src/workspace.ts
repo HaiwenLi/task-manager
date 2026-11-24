@@ -198,7 +198,7 @@ export async function reserveWorkspace(
             try {
               const current = await lstat(lock);
               const currentMarker = await lstat(marker);
-              if (!current.isDirectory() || current.dev !== dirIdentity.dev || current.ino !== dirIdentity.ino ||
+              if (!current.isDirectory() || current.dev !== dirIdentity!.dev || current.ino !== dirIdentity!.ino ||
                   !currentMarker.isFile() || currentMarker.dev !== markerId.dev || currentMarker.ino !== markerId.ino ||
                   await readFile(marker, "utf8") !== owner) return;
               await unlink(marker);

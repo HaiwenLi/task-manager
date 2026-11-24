@@ -74,6 +74,36 @@ export function boardPath(tasksDir: string): string {
   return join(tasksDir, "..", ".taskctl", "board.md");
 }
 
+/** Coalesce bursts into one in-flight refresh and one latest trailing refresh. */
+export function createCoalescedRefresh(refresh: () => Promise<unknown>): {
+  request: () => void;
+  flush: () => Promise<void>;
+} {
+  let queued = false;
+  let job: Promise<void> | null = null;
+  const request = (): void => {
+    queued = true;
+    if (job) return;
+    job = (async () => {
+      try {
+        while (queued) {
+          queued = false;
+          await refresh().catch(() => {});
+        }
+      } finally {
+        job = null;
+        // A request arriving between the last loop check and clearing the job
+        // must still schedule its trailing state.
+        if (queued) request();
+      }
+    })();
+  };
+  return {
+    request,
+    flush: async () => { while (job) await job; },
+  };
+}
+
 /**
  * Backoff for a rename that Windows refused.
  *

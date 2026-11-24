@@ -14,7 +14,7 @@ import { appendObservation, readProfile } from "./profile.js";
 import { extractCriteria, readSpec, writeSpec } from "./spec.js";
 import { appendJournal } from "./journal.js";
 import type { AcceptanceResult } from "./acceptance.js";
-import { renderBoardMarkdown, renderBoardTable, writeBoard } from "./board.js";
+import { createCoalescedRefresh, renderBoardMarkdown, renderBoardTable, writeBoard } from "./board.js";
 import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
 import { readRuntime, readAttempt, writeRuntime } from "./runtime.js";
@@ -214,12 +214,10 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
       // A log write that cannot happen must not take the run down with it.
     });
   };
-  // The board is rewritten on every event, so a browser watching board.md sees
-  // tasks move while the run is still going. Writes are chained, never racing.
-  let boardJob: Promise<unknown> = Promise.resolve();
-  const refreshBoard = (): void => {
-    boardJob = boardJob.then(() => refreshBoardFile(cfg.tasksDir)).catch(() => {});
-  };
+  // The board tracks events without rewriting every intermediate state in a
+  // burst: one in-flight refresh and at most one trailing latest refresh.
+  const boardRefresh = createCoalescedRefresh(() => refreshBoardFile(cfg.tasksDir));
+  const refreshBoard = boardRefresh.request;
   refreshBoard();
   // Plan Task 9：逐事件打印 [task] 状态 单行日志 —— 事件发生即输出，
   // 而不是整队跑完再补一份总结
@@ -235,7 +233,7 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
     },
   });
   refreshBoard();
-  await boardJob;
+  await boardRefresh.flush();
   await logJob;
   return 0;
 }

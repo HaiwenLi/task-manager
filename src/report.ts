@@ -4,6 +4,7 @@ import { readAudits, type AuditRecord } from "./audit.js";
 import { readRuntime } from "./runtime.js";
 import { readSpec } from "./spec.js";
 import type { Task } from "./task-file.js";
+import { readUsage, summarizeUsage } from "./usage.js";
 
 type AcceptanceFile = {
   command?: string; exitCode?: number | null; passed?: boolean; output?: string;
@@ -11,7 +12,7 @@ type AcceptanceFile = {
 };
 
 type ReviewFile = {
-  verdict?: string; summary?: string; defects?: string[]; model?: string; externalChanges?: string[];
+  verdict?: string; summary?: string; defects?: string[]; model?: string; externalChanges?: string[]; reviewerSessionId?: string;
   /** The declaration the reviewer actually worked under, and the digest it belonged to. */
   tolerate?: string[]; definitionDigest?: string;
   criteria?: Array<{ id?: string; pass?: boolean; evidence?: string }>;
@@ -29,11 +30,12 @@ export async function buildReport(tasksDir: string, id: string): Promise<string[
   const review = await readRuntime<ReviewFile>(tasksDir, id, "review.json");
   const journal = await journalTail(tasksDir, id, 15);
   const audits = (await readAudits(tasksDir)).filter((record) => record.task === id);
+  const usage = summarizeUsage(await readUsage(tasksDir, id));
 
   return [
     `task ${id}: ${task.title}`,
     `status ${task.status}  retries ${task.retries}  reviewRounds ${task.reviewRounds}  sessions ${task.sessions.length}`,
-    `complexity ${task.complexity}  risk ${task.risk}  humanCheck ${task.humanCheck}`,
+    `complexity ${task.complexity}  execution ${task.execution}  risk ${task.risk}  humanCheck ${task.humanCheck}`,
     `verify ${task.verify}${task.quick ? "  (quick lane: no spec)" : ""}` +
       (task.renderTargets.length > 0 ? `  targets ${task.renderTargets.join(", ")}` : ""),
     ...(task.tolerate.length > 0 ? [`tolerate ${task.tolerate.join(", ")}`] : []),
@@ -56,6 +58,7 @@ export async function buildReport(tasksDir: string, id: string): Promise<string[
       ? ["(no reviewer verdict recorded)"]
       : [
           `verdict  ${review.verdict ?? "?"}  ${review.summary ?? ""}${review.model === undefined ? "" : `  model ${review.model}`}`,
+          ...(review.reviewerSessionId === undefined ? [] : [`reviewerSessionId ${review.reviewerSessionId}`]),
           ...declarationLines(review, task.tolerate),
           ...(review.criteria ?? []).map(
             (criterion) => `  [${criterion.pass === true ? "x" : " "}] ${criterion.id ?? "?"} ${firstLine(criterion.evidence ?? "")}`,
@@ -63,6 +66,12 @@ export async function buildReport(tasksDir: string, id: string): Promise<string[
           ...((review.defects ?? []).length > 0 ? [`defects  ${(review.defects ?? []).join("; ")}`] : []),
           ...toleratedLines(review.externalChanges ?? []),
         ]),
+    "",
+    "## usage",
+    ...(usage.length === 0 ? ["(no usage records)"] : usage.flatMap((group) => [
+      `${group.role}/${group.model}  input ${group.input}  output ${group.output}  reasoning ${group.reasoning}  cacheRead ${group.cacheRead}  cacheWrite ${group.cacheWrite}${group.cost === undefined ? "" : `  cost ${group.cost}`}`,
+      ...(group.unknown > 0 || group.resets > 0 ? [`  unknown ${group.unknown}  resets ${group.resets}`] : []),
+    ])),
     "",
     "## journal",
     ...(journal.length > 0 ? journal : ["(empty)"]),

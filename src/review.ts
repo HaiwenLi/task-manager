@@ -24,6 +24,8 @@ export type ReviewResult = {
    */
   externalChanges: string[];
   raw?: string;
+  /** The independent reviewer session, for evidence and usage joins. */
+  reviewerSessionId?: string;
   /** The backend rejected the review turn itself (quota/auth/5xx); no judging happened. */
   failure?: "provider";
 };
@@ -238,14 +240,18 @@ export function startReview(deps: ReviewDeps, evidence: ReviewEvidence): Executi
     title: `review: ${deps.title ?? evidence.task.title}`,
   };
   const finish = (result: PromptResult): ReviewResult => {
-    if (result.exitCode === 0) return parseVerdict(result.text, evidence.task.criteria);
+    if (result.exitCode === 0) {
+      return { ...parseVerdict(result.text, evidence.task.criteria), ...(result.sessionId ? { reviewerSessionId: result.sessionId } : {}) };
+    }
     const degradedResult = degraded(
       evidence.task.criteria.map((criterion) => criterion.split(/\s+/)[0]!),
       `review turn failed with exit ${result.exitCode}`,
     );
     // A backend rejection is not a verdict: the worker must retry, not ask a
     // human to judge work the reviewer never looked at.
-    return result.failure === "provider" ? { ...degradedResult, failure: "provider" } : degradedResult;
+    return result.failure === "provider"
+      ? { ...degradedResult, failure: "provider", ...(result.sessionId ? { reviewerSessionId: result.sessionId } : {}) }
+      : { ...degradedResult, ...(result.sessionId ? { reviewerSessionId: result.sessionId } : {}) };
   };
 
   if (deps.adapter.start) {

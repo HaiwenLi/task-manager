@@ -188,11 +188,22 @@ describe("sweepRoot", () => {
     await expect(readFile(join(scratchDir, "run-1.log"), "utf8")).resolves.toBe("this turn");
   });
 
+  it("returns before consulting Git when no new root candidate matches", async () => {
+    const plain = join(root, "plain-no-candidates");
+    await mkdir(plain);
+    await writeFile(join(plain, "result.m"), "deliverable", "utf8");
+    const before = await snapshotRoot(plain);
+
+    const outcome = await sweepRoot({ workdir: plain, scratchDir, before, patterns: ["*.log"], keepAtRoot: [] });
+
+    expect(outcome).toEqual({ moved: [], failures: [] });
+  });
+
   it("reports a skip instead of guessing when the workdir is not a Git repository", async () => {
     const plain = join(root, "plain");
     await mkdir(plain);
-    await writeFile(join(plain, "a.log"), "x", "utf8");
     const before = await snapshotRoot(plain);
+    await writeFile(join(plain, "a.log"), "x", "utf8");
 
     const outcome = await sweepRoot({ workdir: plain, scratchDir, before, patterns: ["*.log"], keepAtRoot: [] });
 

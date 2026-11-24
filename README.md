@@ -55,6 +55,7 @@ npx tsx src/main.ts <子命令> [参数]
 | `reviewerModelFallbacks` | string[] | `[]` | 复核会话的降级链，排在 `reviewerModel` 之后；没配 `reviewerModel` 时整条链为空 |
 | `modelChain` | string[] | 等价于 `[model]` | 整条派发链：第一个是主模型，其后是替代。设置了就替代 `model` 作为链首，`modelFallbacks` 仍追加在末尾。配额耗尽时按这条链推进（见「派发失败」） |
 | `chainCycles` | number | `0` | 模型链走到链尾后还能回绕到链首几次；`0` = 线性链，到链尾即视为耗尽。回绕是重探此前拒绝过的模型（它的配额窗口可能已经重置），退避照常；整个循环都耗尽才 `blocked` 等所有者决策。新一轮 attempt / 复核轮重新计圈，轮换位置保留 |
+| `modelCooldownMs` | number | `900000` | 某个模型被 provider 拒绝后，在整个看板内共享的冷却窗口。期间其他 Task 和后续 run 跳过它；到期重探，成功清除，显式 `chainCycles` 仍可在本任务内重探 |
 | `failureFingerprintLimit` | number | `3` | 验收连续给出**同一失败**（归一化后的指纹相同）几次后转 `blocked` 等人工，不再自动重试 |
 | `opencodeBin` | string | `opencode` | opencode 可执行文件。**Windows 下 `.cmd` shim 无法被 `shell:false` 直接启动**，应在本地配置实际 `.exe`，不要提交机器专属路径 |
 | `chromeBin` | string | 自动探测 | 渲染验收用的浏览器可执行文件；也可用环境变量 `TASKCTL_CHROME`。找不到时渲染任务 `blocked`，不会当成通过 |
@@ -90,14 +91,17 @@ retries: 0
 | `effort` | | 本任务努力档（如 `high`），覆盖配置兜底 |
 | `acceptance` | | 验收命令（完整 shell 命令行，在 `workdir` 下执行）；退出码 0 且所有权/任务定义/产物一致才进入复核。缺失但有 `criteria` 时跳过命令、由复核判定（记录 `acceptance-skipped`）；两者都缺 → `blocked` |
 | `criteria` | | 验收标准列表，`C1 …` 编号；复核逐条判定，这是复核的唯一判据 |
-| `complexity` | | `simple`（不停下等签字）或 `complex`（默认，出稿等签字） |
+| `complexity` | | `simple`（不停下等签字）或 `complex`（默认，出稿等签字）。只决定入口审批，不决定执行策略 |
+| `execution` | | `continuous` 或 `iterative`；缺省时 simple → continuous、complex → iterative。continuous 先用一个 worker 回合完成，失败/变复杂才升级；iterative 在同一工作上下文中进行有界验收与复核返工 |
+| `worker_self_check` | | worker 可选的有界自验/生成命令，只能经 `taskctl check` 执行；与控制器负责的 `acceptance` 分离 |
+| `worker_self_check_timeout_ms` | | `worker_self_check` 的超时，默认 20 分钟且不得超过 `turnTimeoutMs` |
 | `risk` | | `high` 时复核通过也要人工 `accept` |
 | `workdir` | | 本任务的工作目录（相对配置里的 `workdir`）；同一目录同时只跑一个任务 |
 | `keep_at_root` | | 根目录文件名 glob 列表，命中者**豁免回合后清扫**（如 `run.log`）。不进 `definitionDigest`：它决定杂物停哪儿，不决定"做完"是什么 |
 | `depends_on` | | 依赖的任务 id；全部 `done` 才会被领取，成环直接报错 |
 | `human_check` | | `true` 时无论风险都要人工放行 |
 | `tolerate` | | 声明**容忍的外部变更种类**：`external_cell_change`、`new_column`、`deleted_row`、`extra_file`。只写这几个值，写错直接报错（打错字不该变成"声明了但什么都没容忍"）。见下节 |
-| `quick` | | `true` 表示**没出 spec、没跑澄清会话**，意图原文就是定义。`taskctl add --quick` 写入；因为没写下任何可核对的判据，这种任务不会自己收尾（见「车道与验收方式」） |
+| `quick` | | `true` 表示**没出 spec、没跑澄清会话**，意图原文就是定义。`taskctl add --quick` 写入；有客观 `mechanical/render` 证据时可以收尾，若需要 human review 却没有 criteria，则转人工判断（见「车道与验收方式」） |
 | `verify` | | 谁来判"做完了"：`human`（默认，独立复核判）、`mechanical`（验收命令退出码判）、`render`（无头浏览器判）。进 `definitionDigest`，中途改会作废本次尝试 |
 | `render_targets` | | `verify: render` 时要打开的页面，相对 `workdir`；`verify: render` 却没有这一项会直接报错 |
 | `review_rounds` | ✓ | 复核失败次数，由 worker 维护 |
@@ -106,7 +110,7 @@ retries: 0
 
 `schema: taskctl/v1` 是显式注册：`tasks/` 目录里可以放别的 Markdown（手抄的快照、草稿、导出的旧任务），只有声明了这一行的文件才会被调度。缺这行或 frontmatter 解析不了的文件不领取、不排期，`taskctl status` 会在看板后面单独列出 `ignored` 及原因；已注册但内容坏掉的任务仍然照常报错，不会被静默忽略。`taskctl add` 生成的文件自带这一行。
 
-辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`definition.json`（领取时写下的定义快照，本次尝试的判据）、`acceptance.json`（命令、验收模式、时间、输出、身份摘要与实际使用的模型）、`acceptance-failures.json`（连续同一验收失败的指纹与次数）、`review.json`（复核判决、模型、被容忍的外部变更与实际注入的改动证据）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`done.requested`（完成请求）、`logs/`（控制器逐任务日志与 worker 的 `$TASKCTL_LOG_DIR`）、`scratch/`（回合后清扫的落点，只进不出）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
+辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`definition.json`（领取时写下的定义快照，本次尝试的判据）、`acceptance.json`（命令、验收模式、时间、输出、身份摘要与实际使用的模型）、`acceptance-failures.json`（连续同一验收失败的指纹与次数）、`review.json`（复核判决、模型、被容忍的外部变更与实际注入的改动证据）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`execution-state.json`（持久升级与最近 worker session）、`review-pending.json`（只待复核的保留现场）、`usage.jsonl`（每回合资源快照与增量）、`done.requested`（完成请求）、`logs/`（控制器逐任务日志与 worker 的 `$TASKCTL_LOG_DIR`）、`scratch/`（回合后清扫的落点，只进不出）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
 
 ## 车道与验收方式
 
@@ -131,7 +135,14 @@ retries: 0
 - 执行者在自己回合里写下 `ESCALATE: <理由>`；
 - 会话回合用尽或上下文告满需要交接（说明这事一次没干完）。
 
-触发后本次尝试**照样可以继续**，但不再能用自己产出的证据收尾——一律进复核。任务文件里的 `verify` 不改，`definitionDigest` 不变，所以升级本身不会让正在跑的尝试作废；理由记进 journal（`event: escalated`），`board`/`report` 可查。这个方向是刻意的：执行者能要求"多看一道"，不能要求"少看一道"。
+触发后本次尝试**照样可以继续**，但不再能用自己产出的证据收尾——一律进复核。任务文件里的 `verify` 不改，`definitionDigest` 不变，所以升级本身不会让正在跑的尝试作废；理由记进 journal（`event: escalated`），`board`/`report` 可查。这个方向是刻意的：执行者能要求"多看一道"，不能要求"少看一道"。升级事实也会写入 `execution-state.json`，后续 attempt 不会悄悄降回机械直通。
+
+`execution` 与 `complexity`、`verify` 分工如下：
+
+- **continuous**：先给一个完整 worker 回合（其中可有很多工具调用）。未请求完成、验收失败、Review fail、显式 `ESCALATE:` 或需要交接时才升级为 iterative；不会先空转到默认 40 回合。
+- **iterative**：验收失败会把退出码、输出尾部和失败指纹写进交接笔记；同模型时续用当前 worker session 返工，provider 切换仍强制新 session。普通 Review fail 在同一 claim 内继续，不再先回 `open` 等调度器重新认领。
+- **Reviewer 不可用**：不增加 worker retry，也不重放已成功的 worker/验收。任务以 `blocked + review-pending.json` 保留现场；换到健康 Reviewer 后执行 `taskctl retry --task <id> --review-only`，定义和产物摘要一致才只跑 Review。
+- **没有 criteria**：即使需要 Review，也不会让 reviewer 凭空判断；quick 等无判据任务仍转 `awaiting-human`。
 
 ## 复核流水线
 
@@ -157,7 +168,7 @@ taskctl template --type …   看某类任务的必答/可推/补问模板
 - **复核是独立会话**：新会话、不给执行者的对话，只给 spec、验收命令与结果、产物摘要、交接笔记、日志尾部、工作区改动清单（`git status --porcelain` 与 `git diff --stat`，各截断至 200 行、超长标注），以及本次执行的时间窗口。输出必须是 JSON；解析不了按 `unclear` 转人工，不会当成失败去重跑。实际注入的改动清单原文记在 `review.json` 的 `evidence` 字段，复盘复核误判时可以核对 reviewer 当时到底看到了什么；非 git 工作目录会显式标注「不可用」而不是中断复核。
 - **容忍的外部变更**：任务可以声明 `tolerate`，告诉复核"这些差异不是我干的"。声明之外的结构变化（删列、改表头含义等）仍按原规则判 fail；本任务自己该写的内容没写全，**不能**拿外部变更当挡箭牌；涉及交付内容（该写的行、该改对的单元格）时判不出先后的，也按本任务的问题处理。被容忍的差异不做静默处理：写进 `review.json` 的 `externalChanges`、journal 记一条 `verdict external=N`、`report` 里逐条列出，`taskctl accept` 放行前也会打印一遍（人工闸门是最后一道）。为什么需要它：真跑过的表格任务里，运行期间别人加了 1 列、删了 1 行、改了 4 个单元格，复核按"零附带改动"判 fail，白跑 20 分钟一轮。
 - **定义不能被被审对象自己改**：`tolerate`、`criteria`、`risk`、`verify`、`complexity` 等都属于任务定义，进 `definitionDigest`。执行回合里改了它（哪怕是 worker 自己 shell 出去改 frontmatter），本次验收直接作废、任务 `blocked` 等人工重新确认——否则"给自己放宽判定标准"就成了合法动作。判据是领取时写下的 `tasks/<id>/definition.json` 快照，事后改文件不会把旧证据重新判成合格。生命周期字段（`retries`、`sessions`、`status`）不在定义里：降重试数、记会话 id 不会作废正在进行的尝试。复核判决里记录的是**当时那份声明**，事后把 `tolerate` 收窄不会让旧判决看起来像是被允许过更多。
-- **返工**：复核不过会写一条 `review-failed` 笔记并回到 `open`；连续 `maxReviewRounds` 轮（默认 2）后 `blocked`。
+- **返工**：复核不过会写一条 `review-failed` 笔记，并在同一 claim 内回到 worker；同模型续用 session。超过允许的返工轮次后 `blocked`。人工 `reject` 才代表另一次调度尝试，重新打开为 `open`。
 - **人工节点**：`risk: high`、`human_check: true`、以及复核无法判定的任务停在 `awaiting-human`，只有 `accept` 能放行。
 - **归因**：`reject`/`audit` 都会记录问题出在 `clarify`（标准本身错）、`worker`（没做到）、还是 `reviewer`（漏判），`metrics` 按环节汇总。
 
@@ -215,7 +226,7 @@ npx tsx src/main.ts run [--log <file>] [--config taskctl.json]
 
   语义：相对 workdir 的路径或 glob（`*` 不跨目录、`**` 跨目录、`?` 单字符；`\` 与 `/` 等价；不支持 `[abc]` 字符类和 `!` 取反；大小写敏感）。一个只装着被忽略文件的目录整体不注册——验收命令新建 `timing/` 并写入被忽略的 JSON，摘要不变。能匹配整个工作区的模式（如 `**`）在配置处直接报错，不让 drift 检查被无声架空。**不要把源码路径放进来**：这个开关绕过的是「验收命令自己写自己」的判定，不是「任务该改的没改」的判定。
 
-- **`TASKCTL_ACCEPTANCE_MODE=generate|check`（生成/检查分离）**：taskctl 给验收命令注入这个环境变量。**门（taskctl 跑的验收）注入 `check`**——命令只读不写，`artifactBefore == artifactAfter` 自然成立；**worker（agent 干活时自跑验收命令）不注入或注入 `generate`**（默认值）——命令可以生成/刷新产物，写入发生在尝试窗口内，不进摘要比较。
+- **`TASKCTL_ACCEPTANCE_MODE=generate|check`（生成/检查分离）**：taskctl 给命令注入这个环境变量。**控制器验收门注入 `check`**——命令只读不写，`artifactBefore == artifactAfter` 自然成立；**worker 声明的 `worker_self_check` 经 `taskctl check` 执行时注入 `generate`**——命令可以生成/刷新产物，写入发生在尝试窗口内，不进摘要比较。worker 不再默认重复运行完整 `acceptance`。
 
   推荐写法：验收命令开头判断模式——
 
@@ -227,7 +238,7 @@ npx tsx src/main.ts run [--log <file>] [--config taskctl.json]
   node scripts/verify-report.js    # check：只回读校验，退出码即判决
   ```
 
-  推荐流程：worker 在会话里以 generate 自跑一次验收命令产出报告（或把产物路径进 `artifactIgnore`），再 `taskctl done`；门以 check 重放同一命令，零写入、按退出码判决。两条路子可以单独用也可以叠加：`artifactIgnore` 管「写不写都行」，`check` 管「门内不许写」。门侧的 mode 会记进 `acceptance.json`（`mode: "check"`）。
+  推荐流程：确实需要先生成产物时，在任务里声明 `worker_self_check`（必要时与 acceptance 同脚本），worker 执行 `taskctl check --task <id> --tasks-dir <dir>`，以 generate 和有界超时产出报告，再 `taskctl done`；控制器随后以 check 跑 `acceptance`，零写入、按退出码判决。自验结果与取消前输出写入 `self-check.json`，门侧结果写入 `acceptance.json`（`mode: "check"`）。普通定向测试不需要声明全量验收；产物路径也可使用 `artifactIgnore`。
 
   边界：taskctl 不验证命令在 check 模式下**真的**没写文件——写了又没进 `artifactIgnore`，照样判 drift 拦下（fail closed）。check 模式的合规是命令作者的责任。
 
@@ -251,6 +262,14 @@ taskctl done --task <id> [--tasks-dir <dir>]
 
 写 `tasks/<id>/done.requested` 标记；worker 在回合边界消费它并跑验收。**它不会直接把任务变成 `done`**。
 
+### taskctl check — 有界 worker 自验（agent 侧）
+
+```bash
+taskctl check --task <id> [--tasks-dir <dir>]
+```
+
+只允许在任务 `running` 且 attempt 活跃时执行声明过的 `worker_self_check`，以 generate 模式和任务级超时运行，结果写 `self-check.json`。它不会改变任务状态，也不能代替控制器的 `acceptance`。超时且确认停止后，取消前输出也会保留。
+
 ### taskctl note — 交接笔记（agent 侧）
 
 ```bash
@@ -267,7 +286,9 @@ npx tsx src/main.ts status [--tasks-dir <dir>]
 
 每任务一行：id、status、retries、sessions 数、最新笔记的 Status 行。没有 `schema: taskctl/v1` 的 Markdown（或 frontmatter 解析不了的文件）单独列为 `ignored`，不参与调度。
 
-看板文件 `.taskctl/board.md` 是每次 `status` 重新生成的派生视图；Windows 上杀软/索引器偶尔会短暂占用它（EPERM/EBUSY/EACCES），写入会重试，耗尽后只影响这一次看板刷新，任务状态不受影响。
+看板文件 `.taskctl/board.md` 是每次 `status` 重新生成的派生视图；Windows 上杀软/索引器偶尔会短暂占用它（EPERM/EBUSY/EACCES），写入会重试，耗尽后只影响这一次看板刷新，任务状态不受影响。运行中的事件刷新会合并突发写入，只保留正在写的一次和最后一次最新状态。
+
+`taskctl report --task <id>` 的 `usage` 节按 worker/reviewer 和模型汇总 `usage.jsonl` 的增量。基线保存在看板级 `.taskctl/usage-sessions.json`，因此多个 Task 共享 session 时不会重复计算前一段消耗；计数器重置或后端未提供数据会显示 unknown，而不是伪报零成本。`review.json` 同时记录 `reviewerSessionId`。
 
 ## ⚠️ 已知陷阱
 
@@ -291,6 +312,8 @@ taskctl retry --task <id>       # 归档旧证据后重开；仅在 attempt 已 
 
 `reconcile` 只报告不改状态，结论是 `retry-allowed` / `manual-review` / `already-terminal` 之一；归属路径无法确定时一律 `manual-review`。`retry` 会拒绝任何"还可能有执行在跑"或"归属路径不确定"的情况，并把 `attempt.json`、`acceptance.json`、`review.json`、`models.json` 移入 `tasks/<id>/archive/<时间戳>/`、重置 `retries` 与 `review_rounds`、写一条 `human retry` 日志。
 
+若任务因 Reviewer provider 全部不可用而阻塞，且存在 `review-pending.json`，`reconcile` 会建议 `taskctl retry --task <id> --review-only`。这条路径不调用 worker、不重跑验收，只在定义与产物摘要未变时恢复 Review；共享冷却仍然生效，所以通常应等窗口结束或换健康 Reviewer。普通 `retry` 仍是明确的全量重试。
+
 **taskctl 不按记录的 PID 杀进程。** PID 会被复用，`attempt.json` 里的 pid 不能证明它仍属于那次执行（ADR-0007）。需要停止执行时，由人核实进程身份后自行处理；执行停止未确认（`attempt.phase` 不是 `settled`）的任务，`retry` 一律拒绝，仍需按下面的手工流程归档证据。
 
 **worker 崩溃 / 不确定执行** —— 先核实原控制器、子进程树与后端会话均已停止，再检查产物。保留证据后，人工归档旧 `attempt.json` 和对应工作目录预留，再按需重开任务。不能仅按旧 PID 杀进程、删任务锁或改 `status` 后自动重跑。互斥目录 `.mutation.lock` 若因崩溃遗留也必须先确认原操作已停止，不能按时间强抢。
@@ -308,6 +331,8 @@ taskctl retry --task <id>       # 归档旧证据后重开；仅在 attempt 已 
 当前选中的模型记在 `tasks/<id>/models.json`，所以重试时不会又先撞那个已经打满的模型；`taskctl retry` 会把它和旧证据一起归档，回到链首（配额恢复后手动重开就从主模型重来）。链走完才算失败，链的长度由配置决定，因此仍然是有限的。
 
 `models.json` 是提示性状态不是证据：**读**不到、读坏了、或者记的位置属于另一个模型（比如主模型被改过），一律按"从链首开始"，绝不因为一个缓存文件把已结算的回合改成不确定；**写**不进去则不算换成了，按普通重试计失败——位置本身是"下次别再撞同一堵墙"的唯一凭据，没记下来就不能假装已经换过。
+
+看板级 `.taskctl/model-cooldowns.json` 还会跨 Task、跨 run 记录模型拒绝与下一可探测时间。冷却期间不再发起已知拒绝，换到不同健康模型时不做无意义退避；到期才重探，成功清除。手工 retry 不清这张表，显式 `chainCycles` 在本任务内的重探仍按原语义执行。
 
 **Windows 下 spawn opencode 失败** —— npm 全局安装的 `opencode` 是 `.cmd` shim，`shell:false` 无法启动。在 `taskctl.json` 里把 `opencodeBin` 指向真实 exe（见上文表格）。
 

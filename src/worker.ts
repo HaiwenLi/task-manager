@@ -25,6 +25,7 @@ import { collectChangeEvidence } from "./changes.js";
 import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck } from "./render.js";
 import { readExecutionState, recordEscalation, recordWorkerSession, type ExecutionState } from "./execution-state.js";
 import { clearModelCooldown, modelCooldown, nextModelCooldown, noteModelRefusal } from "./model-cooldown.js";
+import { recordUsage, type UsageRole } from "./usage.js";
 
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
 export const ACCEPTANCE_TIMEOUT_MS_DEFAULT = 10 * 60_000;
@@ -195,7 +196,8 @@ export async function runTask(
           if (active) await owned(r, async () => {
             if (r.execution !== active) return;
             const info = active.inspect();
-            r.record.pid = info.pid; r.record.sessionId = info.sessionId;
+            r.record.pid = info.pid;
+            if (info.sessionId !== undefined) r.record.sessionId = info.sessionId;
             await writeRuntime(cfg.tasksDir, task.id, "attempt.json", r.record);
           });
         }
@@ -348,7 +350,8 @@ async function controlled<T>(
       r.execution = execution;
       execution.result.catch(() => {});
       r.record.pid = execution.inspect().pid;
-      r.record.sessionId = execution.inspect().sessionId;
+      const observedSessionId = execution.inspect().sessionId;
+      if (observedSessionId !== undefined) r.record.sessionId = observedSessionId;
       await writeRuntime(r.cfg.tasksDir, r.task.id, "attempt.json", r.record);
     });
     const timeout = new Promise<never>((_, reject) => {
@@ -373,7 +376,8 @@ async function controlled<T>(
     return value;
   } catch (err) {
     if (!execution) throw err;
-    r.record.sessionId = execution.inspect().sessionId;
+    const observedSessionId = execution.inspect().sessionId;
+      if (observedSessionId !== undefined) r.record.sessionId = observedSessionId;
     if (!(err instanceof WorkerTimeoutError) && !(err instanceof OwnershipLostError) && !r.lost && execution.inspect().state === "exited") throw err;
     // Never wait indefinitely for a broken cancellation implementation. The
     // bound fits a real one: the backend stop (4s cap) runs beside the tree
@@ -480,6 +484,26 @@ async function fallBack(r: Run, role: ModelRole, reason: string): Promise<boolea
     detail: `${detail} (${reason})`,
   }));
   return true;
+}
+
+async function captureUsage(
+  r: Run, role: UsageRole, sessionId: string, model: string | undefined, durationMs: number,
+): Promise<void> {
+  if (!sessionId || !r.deps.adapter.sessionUsage) return;
+  try {
+    const snapshot = await controlled(r, "usage telemetry", 10_000,
+      () => legacyExecution(() => r.deps.adapter.sessionUsage!(sessionId)));
+    await recordUsage({
+      tasksDir: r.cfg.tasksDir, id: r.task.id, role, sessionId,
+      ...(model === undefined ? {} : { model }), durationMs, snapshot,
+    });
+  } catch (error) {
+    if (error instanceof OwnershipLostError) throw error;
+    await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
+      stage: role === "worker" ? "worker" : "review", event: "usage-unavailable",
+      detail: error instanceof Error ? error.message : String(error),
+    })).catch(() => {});
+  }
 }
 
 /**
@@ -710,6 +734,7 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       restoreSession = false;
     }
     const result = await workedTurn(r, prompt, model, sessionId);
+    await captureUsage(r, "worker", result.sessionId, model, result.durationMs);
     await owned(r, async () => {
       // A rejected turn did no work, and its session belongs to the backend that
       // refused it: recording it would both spend a session and hand the next
@@ -1176,6 +1201,7 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "retry" | "open
       throw error;
     }
     const resolvedReviewer = await r.deps.adapter.resolveModel?.(reviewerModel, r.cfg.reviewerEffort);
+    const reviewStarted = Date.now();
     const result = await controlled(r, "review", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT, () =>
       r.deps.review
         ? legacyExecution(() => r.deps.review!(evidence))
@@ -1188,6 +1214,9 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "retry" | "open
           }, evidence),
       (review) => review.failure === "provider",
     );
+    if (result.reviewerSessionId) {
+      await captureUsage(r, "reviewer", result.reviewerSessionId, reviewerModel, Date.now() - reviewStarted);
+    }
     await owned(r, async () => {
       // Which model judged is part of the evidence: work passed by a fallback is
       // not the same claim as work passed by the model the operator chose. So is

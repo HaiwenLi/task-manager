@@ -152,10 +152,6 @@ export async function sweepRoot(opts: {
   keepAtRoot: string[];
 }): Promise<SweepOutcome> {
   const outcome: SweepOutcome = { moved: [], failures: [] };
-  const untracked = await untrackedRootNames(opts.workdir);
-  if (untracked === null) {
-    return { ...outcome, skipped: "git unavailable (not a repository or git missing); sweep stayed inert" };
-  }
   let names: string[];
   try {
     names = (await readdir(opts.workdir)).sort();
@@ -164,9 +160,18 @@ export async function sweepRoot(opts: {
   }
   const litter = opts.patterns.map((pattern) => ignorePatternRegExp(pattern));
   const keep = opts.keepAtRoot.map((pattern) => ignorePatternRegExp(pattern));
+  const candidates = names.filter((name) => !opts.before.has(name)
+    && litter.some((regexp) => regexp.test(name))
+    && !keep.some((regexp) => regexp.test(name)));
+  // No candidate means no Git process and no scratch directory: most turns do
+  // not create root litter, so this is the common path.
+  if (candidates.length === 0) return outcome;
+  const untracked = await untrackedRootNames(opts.workdir);
+  if (untracked === null) {
+    return { ...outcome, skipped: "git unavailable (not a repository or git missing); sweep stayed inert" };
+  }
   await mkdir(opts.scratchDir, { recursive: true });
-  for (const name of names) {
-    if (opts.before.has(name)) continue;
+  for (const name of candidates) {
     if (!untracked.has(name)) continue;
     const from = join(opts.workdir, name);
     let entry;
