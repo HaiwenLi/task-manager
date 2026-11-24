@@ -185,6 +185,8 @@ describe("resolveConfig", () => {
     expect(() => resolveConfig({ memory: { minSimilarity: 1.5 } }, "taskctl.json")).toThrow(/memory/);
     expect(() => resolveConfig({ memory: { maxItems: 0 } }, "taskctl.json")).toThrow(/memory/);
     expect(() => resolveConfig({ memory: { command: [] } }, "taskctl.json")).toThrow(/memory/);
+    // No room allowed means every hit is filtered out: recall would answer "no hits" forever without saying why.
+    expect(() => resolveConfig({ memory: { rooms: [] } }, "taskctl.json")).toThrow(/memory/);
   });
 
   it("rejects every other malformed memory block, naming the setting each time", () => {

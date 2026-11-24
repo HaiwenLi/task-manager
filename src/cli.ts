@@ -1570,7 +1570,8 @@ function memorySettings(raw: unknown, path: string): WorkerConfig["memory"] {
   const excludeWings = record.excludeWings === undefined ? [] : record.excludeWings;
   if (!stringList(excludeWings)) refuse("excludeWings", "an array of non-empty strings");
   const rooms = record.rooms === undefined ? ["pitfall", "pattern", "decision"] : record.rooms;
-  if (!stringList(rooms)) refuse("rooms", "an array of non-empty strings");
+  // Not empty: with no room allowed, every hit is filtered out and recall would answer "no hits" forever without saying why.
+  if (!stringList(rooms) || rooms.length === 0) refuse("rooms", "a non-empty array of non-empty strings");
   // Its own check: `number` insists on a positive value, and 0 is a setting here — keep everything.
   const minSimilarity = record.minSimilarity === undefined ? 0.55 : record.minSimilarity;
   if (typeof minSimilarity !== "number" || !(minSimilarity >= 0 && minSimilarity <= 1)) refuse("minSimilarity", "a number from 0 to 1");
