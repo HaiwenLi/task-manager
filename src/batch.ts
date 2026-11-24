@@ -1,9 +1,9 @@
 import { lockLive } from "./claim.js";
 import { draftAncestor } from "./eligibility.js";
-import { readAttempt } from "./runtime.js";
-import { assertAcyclic, taskWorkdir } from "./scheduler.js";
+import { definitionDigest, readAttempt } from "./runtime.js";
+import { assertAcyclic, passBudget, taskWorkdir } from "./scheduler.js";
 import type { Task } from "./task-file.js";
-import type { WorkerConfig } from "./worker.js";
+import { runTask, type TaskOutcome, type WorkerConfig, type WorkerDeps } from "./worker.js";
 
 /** Every reason an explicitly requested batch cannot start, in selection order. */
 export class BatchValidationError extends Error {
@@ -107,4 +107,102 @@ export async function validateBatchSelection(
 
   if (issues.length > 0) throw new BatchValidationError(issues);
   return selected;
+}
+
+export type BatchResult = {
+  done: string[];
+  stoppedAt?: string;
+  outcome?: TaskOutcome | "stop-requested";
+  /** Selected ids that were never claimed. */
+  pending: string[];
+};
+
+export type BatchRunOptions = {
+  /** Test seam, equivalent to the scheduler's `options.run`. */
+  run?: typeof runTask;
+  /** Checked before every attempt; an active attempt is never interrupted. */
+  shouldStop?: () => Promise<boolean>;
+};
+
+/**
+ * Execute an explicit selection in order. Each task still goes through the
+ * ordinary claim/acceptance path. Only the current task's `open` outcome is
+ * retried; a later task is never used to make progress past a stopped one.
+ */
+export async function runBatch(
+  cfg: WorkerConfig,
+  deps: WorkerDeps,
+  ids: string[],
+  options: BatchRunOptions = {},
+): Promise<BatchResult> {
+  const selected = await validateBatchSelection(cfg, ids, await deps.store.list());
+  const originals = new Map(selected.map((task) => [task.id, {
+    digest: definitionDigest(task),
+    workdir: taskWorkdir(cfg.workdir, task),
+  }]));
+  const runOne = options.run ?? runTask;
+  const shouldStop = options.shouldStop ?? (async () => false);
+  const done: string[] = [];
+
+  for (const [index, selectedTask] of selected.entries()) {
+    const original = originals.get(selectedTask.id)!;
+    for (let attempt = 1; ; attempt++) {
+      if (await shouldStop()) {
+        return {
+          done,
+          stoppedAt: selectedTask.id,
+          outcome: "stop-requested",
+          pending: selected.slice(index).map((task) => task.id),
+        };
+      }
+
+      // Selection-time approval is not authority to claim a later task. Compare
+      // against the originally selected definition on every attempt, including
+      // reviewer-driven retries of the current task.
+      const board = await deps.store.list();
+      assertAcyclic(board);
+      const current = board.find((task) => task.id === selectedTask.id);
+      const issues: string[] = [];
+      if (current === undefined) {
+        issues.push(`task ${selectedTask.id}: selected task is no longer on the board`);
+      } else {
+        if (definitionDigest(current) !== original.digest) {
+          issues.push(`task ${selectedTask.id}: definition changed before its batch claim`);
+        }
+        const workdir = taskWorkdir(cfg.workdir, current);
+        if (workdir !== original.workdir) {
+          issues.push(`task ${selectedTask.id}: workdir ${workdir} changed from selected workdir ${original.workdir}`);
+        }
+      }
+      if (issues.length > 0) throw new BatchValidationError(issues);
+
+      const outcome = await runOne(
+        { ...cfg, workdir: original.workdir },
+        deps,
+        current!,
+        `batch-${process.pid}-${selectedTask.id}`,
+      );
+      if (outcome === "done") {
+        done.push(selectedTask.id);
+        break;
+      }
+      if (outcome !== "open") {
+        return {
+          done,
+          stoppedAt: selectedTask.id,
+          outcome,
+          pending: selected.slice(index + 1).map((task) => task.id),
+        };
+      }
+      if (attempt >= passBudget(1, cfg)) {
+        return {
+          done,
+          stoppedAt: selectedTask.id,
+          outcome,
+          pending: selected.slice(index + 1).map((task) => task.id),
+        };
+      }
+    }
+  }
+  return { done, stoppedAt: undefined, outcome: undefined, pending: [] };
 }

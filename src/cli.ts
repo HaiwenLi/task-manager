@@ -30,6 +30,7 @@ import { checkRender, describeFailures, RenderUnavailableError, DEFAULT_VIEWPORT
 import { taskWorkdir } from "./scheduler.js";
 import { resolveArtifacts } from "./artifacts.js";
 import { runSelfCheck } from "./self-check.js";
+import { runBatch } from "./batch.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
 export type CliDeps = {
@@ -55,7 +56,7 @@ const USAGE = [
   "  taskctl split --task <id> [--apply] [--tasks-dir <dir>] [--config taskctl.json]",
   "  taskctl approve --task <id> [--tasks-dir <dir>]",
   "  taskctl answer --task <id> --file <path> [--tasks-dir <dir>]",
-  "  taskctl run [--log <file>] [--config taskctl.json]",
+  "  taskctl run [--batch <id,id,…>] [--log <file>] [--config taskctl.json]",
   "  taskctl verify --task <id> [--viewport 1440x900,390x844] [--config taskctl.json]",
   "  taskctl done --task <id> [--tasks-dir <dir>]",
   "  taskctl check --task <id> [--tasks-dir <dir>]",
@@ -178,7 +179,7 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
       checkFlags(command, flags, ["task", "apply", "tasks-dir", "config"], ["task"]);
       return splitCommand(flags, deps, log);
     case "run":
-      checkFlags(command, flags, ["config", "log"], []);
+      checkFlags(command, flags, ["config", "log", "batch"], []);
       return runCommand(flags, deps, log);
     case "verify":
       checkFlags(command, flags, ["task", "viewport", "tasks-dir", "config"], ["task"]);
@@ -272,7 +273,7 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   refreshBoard();
   // Plan Task 9：逐事件打印 [task] 状态 单行日志 —— 事件发生即输出，
   // 而不是整队跑完再补一份总结
-  const result = await runScheduler(cfg, {
+  const workerDeps: WorkerDeps = {
     store,
     adapter,
     ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
@@ -282,12 +283,25 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
       writeLogLine(evt.taskId, line);
       refreshBoard();
     },
-  });
-  refreshBoard();
-  await boardRefresh.flush();
-  await logJob;
-  // Work left in `open` with no explanation reads as "nothing to do". It is not.
-  if (result.pending.length > 0) {
+  };
+  const batch = flags.get("batch");
+  const result = await (async () => {
+    try {
+      return batch === undefined
+        ? await runScheduler(cfg, workerDeps)
+        : await runBatch(cfg, workerDeps, batch.split(","));
+    } finally {
+      // Validation can fail before any event. Still settle the trailing board
+      // refresh and queued log writes before the CLI returns or throws.
+      refreshBoard();
+      await boardRefresh.flush();
+      await logJob;
+    }
+  })();
+  if (batch !== undefined && "stoppedAt" in result && result.stoppedAt !== undefined) {
+    log(`[batch] stopped at ${result.stoppedAt} (${result.outcome}); unclaimed: ${result.pending.join(", ") || "none"}`);
+  } else if (result.pending.length > 0) {
+    // Work left in `open` with no explanation reads as "nothing to do". It is not.
     log(
       `[scheduler] stopped at the pass budget with ${result.pending.length} ready task(s) not started: `
       + `${result.pending.join(", ")}. Run taskctl run again to continue.`,
