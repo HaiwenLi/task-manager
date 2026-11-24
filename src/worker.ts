@@ -119,6 +119,16 @@ export type WorkerConfig = {
    * `taskctl.json`.
    */
   memory?: MemorySettings;
+  /**
+   * The budget guard's policy, each key optional and absent by default. With
+   * all four absent only a model the backend reports as free may run, so a
+   * config written before the keys existed means exactly that. What each key
+   * allows is in `src/budget.ts`.
+   */
+  allowedProviders?: string[];
+  allowedModels?: string[];
+  allowPaidModels?: boolean;
+  maxCostPerMillion?: number;
 };
 export type WorkerStore = Pick<TaskStore, "list" | "setStatus" | "appendSession" | "incRetries" | "readDoneMarker" | "clearDoneMarker" | "incReviewRounds">;
 export type WorkerDeps = {
