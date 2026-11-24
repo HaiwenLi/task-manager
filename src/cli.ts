@@ -31,7 +31,7 @@ import { taskWorkdir } from "./scheduler.js";
 import { resolveArtifacts } from "./artifacts.js";
 import { runSelfCheck } from "./self-check.js";
 import { runBatch } from "./batch.js";
-import { judgeRefs, policyOf, renderVerdicts, type ModelVerdict } from "./budget.js";
+import { judgeRefs, policyOf, renderVerdicts, reviewerModels, workerModels, type ModelVerdict } from "./budget.js";
 import { stopRequestPath, watchQueue, type WatchOptions } from "./watch.js";
 import { createMempalaceBackend, runRecall, type MemoryBackend, type RecallInput, type RecallRecord } from "./memory.js";
 
@@ -165,6 +165,7 @@ const USAGE = [
   "  taskctl audit --task <id> --verdict pass|fail [--stage …] [--note \"…\"] [--tasks-dir <dir>]",
   "  taskctl metrics [--tasks-dir <dir>]",
   "  taskctl recall (--task <id> | --query <text>) [--config taskctl.json]",
+  "  taskctl models [--config taskctl.json]",
   "  taskctl reconcile --task <id> [--tasks-dir <dir>]",
   "  taskctl retry --task <id> [--review-only] [--tasks-dir <dir>]",
   "  taskctl findings --task <id> [--out <file>] [--tasks-dir <dir>]",
@@ -326,6 +327,9 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "recall":
       checkFlags(command, flags, ["config", "task", "query"], []);
       return recallCommand(flags, deps, log, err);
+    case "models":
+      checkFlags(command, flags, ["config"], []);
+      return modelsCommand(flags, deps, log);
     case "learn":
       checkFlags(command, flags, ["note", "tasks-dir", "config"], ["note"]);
       return learnCommand(flags, log);
@@ -498,6 +502,63 @@ async function recallCommand(
     err(`recall unavailable: ${record.outcome}${record.detail === undefined ? "" : `: ${record.detail}`}`);
   }
   return record.outcome === "ok" || record.outcome === "no-hits" ? 0 : 1;
+}
+
+/**
+ * `taskctl models [--config taskctl.json]` — what the budget guard will
+ * allow, seen before anything is offered: one line per model this
+ * configuration can run a task on, with the guard's verdict.
+ *
+ * Read-only. The backend is asked only for its catalogue and its default
+ * model, never for a session. A line comes from the verdict's own fields
+ * (`renderVerdicts`): a catalogue entry carries credentials, so nothing else
+ * of it is here to print.
+ *
+ * The models are the lists the guard judges before a claim (`checkModels`
+ * in `./budget.ts`), in this order: the worker's chain, the reviewer's
+ * chain, the `model` of every task on the board that is not `done`, and —
+ * where a chain is empty — the backend's default, which is what that role
+ * then runs on. Each list is judged once, on its own; a model that already
+ * has a line is not listed again.
+ *
+ * Exit 1 when any line is refused: that is what `run` would refuse too. An
+ * adapter that cannot list models is not guarded at all; that is said, and
+ * is no failure. It takes no `--tasks-dir`: the board is the one the
+ * configuration names, as it is for `run`.
+ */
+async function modelsCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
+  const cfg = await configFor(flags);
+  const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+  // What makes `catalogueOf` answer `null` in `./budget.ts`, and the guard
+  // stand aside. Asked of the adapter itself, not of a read of the backend:
+  // a catalogue that cannot be read is no "no catalogue", it is the refusal
+  // every line below then carries.
+  if (typeof adapter.modelCatalog !== "function") {
+    log("此适配器不提供模型目录，护栏不生效");
+    return 0;
+  }
+  const board = await new TaskStore(cfg.tasksDir).list();
+  const policy = policyOf(cfg);
+  const lists: readonly (readonly string[])[] = [
+    // The configuration's own chain: what a task without a model of its own runs on.
+    workerModels(cfg, { model: undefined } as Task),
+    reviewerModels(cfg),
+    ...board.flatMap((task) => task.status !== "done" && task.model !== undefined ? [[task.model]] : []),
+  ];
+  // Asked together: every list reads the same catalogue, so a backend that is slow or down is asked once.
+  const judged = await Promise.all(lists.map((refs) => judgeRefs(refs, policy, adapter)));
+  const verdicts: ModelVerdict[] = [];
+  for (const list of judged) {
+    for (const verdict of list) {
+      if (!verdicts.some((listed) => listed.ref === verdict.ref)) verdicts.push(verdict);
+    }
+  }
+  log("模型与护栏判定：");
+  const lines = renderVerdicts(verdicts);
+  if (lines.length > 0) {
+    for (const line of lines.split("\n")) log(line);
+  }
+  return verdicts.some((verdict) => !verdict.allowed) ? 1 : 0;
 }
 
 /** `taskctl stop` — request a graceful drain; never signals a worker process. */
