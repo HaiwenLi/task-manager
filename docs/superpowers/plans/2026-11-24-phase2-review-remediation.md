@@ -205,7 +205,7 @@ Use FixedPoint `6906383`, the new HEAD, the same spec sources, and `README.md + 
 
 Any surviving runtime/evidence finding returns to the owning task. Only an offline-clean review may be called offline acceptance; real OpenCode reuse/probe/usage remains explicitly unverified until separately authorized.
 
-- [ ] **Step 4: Record the verified outcome**
+- [x] **Step 4: Record the verified outcome**
 
 Update this plan with test counts, gate results, review verdict and report path. File the durable outcome in MemPalace and read it back. Ask separately before any bounded Live run, push, handoff commit or `.gitignore` decision.
 
@@ -223,3 +223,12 @@ Update this plan with test counts, gate results, review verdict and report path.
 - First remediation re-review (`6906383...09e5f7d`): **CHANGES REQUESTED**, 0 Blockers, 0 Majors, 3 Nits. Report: `~/.xg-reviews\task-manager\20261124T091401Z\code_review_report.md`.
 - Its A1/A2 duplicates were closed by `83c7442` and `25d970e`; its A3 evidence contradiction was closed by `4fec2a4`.
 - Post-Nit offline gates at `4fec2a4`: 70 focused batch/watch tests passed; `npm test` 615 passed / 1 skipped across 63 files; `npx tsc --noEmit` clean; `git diff --check` clean; `scripts/smoke.ps1` without `-Live` passed. No live backend was run.
+
+### Final review closure and accepted stopping rule
+
+- The third re-review found a real Major: automatic batches re-entered after an exhausted `open` result. Fixed by `984f90f`; regression `waits after an exhausted open batch` failed before the fix, the reversed mapping was killed, and the restored control passed.
+- Its companion readiness duplication and the fourth review's fixture duplication were closed by `984f90f` and `4675495`.
+- Fifth review (`6906383...4675495`): Spec lens passed with zero findings across 23 traced requirements. Standards lens returned two Nit-only test-organization findings, both survived falsification.
+- Owner stopping rule recorded 2026-11-24: Blockers and Majors gate offline acceptance; Nit-only standards findings are accepted quality debt and do not force another review round. Protocol verdict remains **CHANGES REQUESTED**, offline acceptance under the amended gate is **accepted**.
+- Final review report: `~/.xg-reviews\task-manager\20261124T095854Z\code_review_report.md`.
+- Final offline gates at `4675495`: 71 focused batch/watch tests passed; `npm test` 616 passed / 1 skipped across 63 files; `npx tsc --noEmit` clean; `git diff --check` clean; `scripts/smoke.ps1` without `-Live` passed. Real OpenCode reuse/probe/usage remains unverified.
