@@ -35,6 +35,22 @@ export type SessionUsageSnapshot = {
 
 export type SessionReuseStatus = "reusable" | "active" | "unavailable";
 
+/** What a backend reports for a model's price, per million tokens. */
+export type CatalogueCost = { input: number; output: number };
+
+/**
+ * One model of the backend's model catalogue (`opencode api model.list`),
+ * rebuilt from named fields only: a list entry also carries credentials
+ * (`settings.apiKey`, `headers`), so nothing else of it is kept or passed on.
+ *
+ * - `ref` is `providerID/id`; `modelID` is the upstream name, the same as `id`
+ *   for most models.
+ * - `cost` holds only the rows that report two finite numbers. Empty means
+ *   "this model does not say what it costs"; all-zero means free.
+ * - `enabled` is what the backend says, and `true` when it says nothing.
+ */
+export type CatalogueModel = { ref: string; providerID: string; id: string; modelID: string; variants: string[]; cost: CatalogueCost[]; enabled: boolean };
+
 export interface AgentAdapter {
   prompt(args: {
     sessionId?: string;
@@ -70,4 +86,17 @@ export interface AgentAdapter {
   sessionUsage?(sessionId: string): Promise<SessionUsageSnapshot>;
   /** Best-effort proof that a persisted session is idle and safe to continue. */
   canResumeSession?(sessionId: string, expected: { model: string; cwd: string }): Promise<SessionReuseStatus>;
+  /**
+   * Every model the backend lists with the cost it reports: one entry per
+   * `providerID/id`, sorted by ref. Rejects when the call fails and when the
+   * answer holds no models — neither is a truth about the backend — and
+   * remembers neither. Optional: an adapter without it is not budget-guarded,
+   * so the fakes that never list models stay as they are.
+   */
+  modelCatalog?(): Promise<CatalogueModel[]>;
+  /**
+   * The backend's default model as `providerID/id`, `null` when it has none.
+   * Rejects when the answer cannot be read, and remembers nothing.
+   */
+  defaultModelRef?(): Promise<string | null>;
 }

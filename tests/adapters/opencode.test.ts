@@ -35,6 +35,9 @@ afterEach(async () => {
   delete process.env.FAKE_SESSION_MODEL_IN_GET;
   delete process.env.FAKE_MESSAGE_LIST_FAILS;
   delete process.env.FAKE_MODEL_LIST_FAILS_ONCE;
+  delete process.env.FAKE_MODEL_LIST_EMPTY_ONCE;
+  delete process.env.FAKE_MODEL_DEFAULT_FAILS_ONCE;
+  delete process.env.FAKE_MODEL_DEFAULT_NONE;
   await rm(cwd, { recursive: true, force: true });
 });
 
@@ -351,5 +354,152 @@ describe("OpenCodeAdapter session status and usage", () => {
 
     await expect(adapter.sessionUsage("ses_fake123")).resolves.toMatchObject({ input: 1000, output: 200 });
     await expect(adapter.canResumeSession("ses_fake123", { model: "anthropic/sonnet", cwd })).resolves.toBe("unavailable");
+  });
+});
+
+/**
+ * An adapter whose `api <operation>` answers one fixed envelope, for shapes
+ * the shared fake does not have. Like the fake, it is `node` itself with the
+ * script riding in `binArgsPrefix` (`node -e <script> api <operation>`).
+ */
+function answering(operation: string, data: string): OpenCodeAdapter {
+  const script = `if (process.argv.includes(${JSON.stringify(operation)})) process.stdout.write(JSON.stringify({ location: { directory: "." }, data: ${data} })); else process.exitCode = 2;`;
+  return new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: ["-e", script] });
+}
+
+describe("OpenCodeAdapter.modelCatalog", () => {
+  it("tells an empty cost list from a zero cost", async () => {
+    const adapter = makeAdapter();
+    const catalogue = await adapter.modelCatalog!();
+    expect(catalogue.find((m) => m.ref === "anthropic/sonnet")).toMatchObject({ cost: [{ input: 0, output: 0 }], enabled: true, variants: [] });
+    expect(catalogue.find((m) => m.ref === "anthropic/opus")).toMatchObject({ cost: [{ input: 15, output: 75 }] });
+    expect(catalogue.find((m) => m.ref === "ollama/local-model")?.cost).toEqual([]);
+    expect(catalogue.find((m) => m.ref === "openai/gpt")?.variants).toEqual(["low", "high"]);
+  });
+
+  it("keys the catalogue by provider and id and keeps the modelID", async () => {
+    const adapter = makeAdapter();
+    const ofP = (await adapter.modelCatalog!()).filter((m) => m.providerID === "p");
+    expect(ofP).toHaveLength(1);
+    expect(ofP[0]).toMatchObject({ ref: "p/k", id: "k", modelID: "k-alias" });
+  });
+
+  it("never exposes credentials from the catalogue", async () => {
+    const adapter = makeAdapter();
+    const text = JSON.stringify(await adapter.modelCatalog!());
+    expect(text).not.toMatch(/apiKey|headers|sk-/);
+  });
+
+  it("rejects when the fetch fails, remembers nothing, and recovers", async () => {
+    // FAKE_MODEL_LIST_FAILS_ONCE naming a fresh marker file, as the failed-fetch test above does
+    process.env.FAKE_MODEL_LIST_FAILS_ONCE = join(cwd, "model-list-failed.once");
+    const adapter = makeAdapter();
+    await expect(adapter.modelCatalog!()).rejects.toThrow(/service unreachable/);
+    expect((await adapter.modelCatalog!()).length).toBeGreaterThan(0);
+  });
+
+  it("treats an answer with no models as a failure and asks again", async () => {
+    // FAKE_MODEL_LIST_EMPTY_ONCE naming a fresh marker file
+    process.env.FAKE_MODEL_LIST_EMPTY_ONCE = join(cwd, "model-list-empty.once");
+    const adapter = makeAdapter();
+    await expect(adapter.modelCatalog!()).rejects.toThrow(/no models/);
+    expect((await adapter.modelCatalog!()).length).toBeGreaterThan(0);
+  });
+
+  // Beyond the plan's five catalogue tests: shapes it states for the two
+  // methods that the shared fake cannot show by itself.
+
+  it("answers one entry per provider and id, sorted by ref, built from the named fields only", async () => {
+    const catalogue = await makeAdapter().modelCatalog!();
+    expect(catalogue.map((m) => m.ref)).toEqual(["anthropic/opus", "anthropic/sonnet", "ollama/local-model", "openai/gpt", "p/k"]);
+    // local-model names no modelID, no enabled and no variants: modelID is its id (as for most models), enabled is true, variants and cost are empty.
+    expect(catalogue.find((m) => m.ref === "ollama/local-model")).toStrictEqual({
+      ref: "ollama/local-model", providerID: "ollama", id: "local-model", modelID: "local-model", variants: [], cost: [], enabled: true,
+    });
+    for (const model of catalogue) {
+      expect(Object.keys(model).sort()).toEqual(["cost", "enabled", "id", "modelID", "providerID", "ref", "variants"]);
+    }
+  });
+
+  it("reads the same memoised model.list as the context and variant lookups", async () => {
+    const log = join(cwd, "api-calls.log");
+    process.env.FAKE_API_LOG = log;
+    const adapter = makeAdapter();
+
+    await expect(adapter.contextLimit("openai/gpt")).resolves.toBe(128000);
+    await adapter.resolveModel("anthropic/sonnet", "high");
+    expect((await adapter.modelCatalog!()).length).toBeGreaterThan(0);
+    expect((await adapter.modelCatalog!()).length).toBeGreaterThan(0);
+
+    const calls = (await readFile(log, "utf8")).trim().split(/\r?\n/);
+    expect(calls.filter((line) => line === "api model.list")).toHaveLength(1);
+  });
+
+  it("rejects when model.list answers something that is not a list of models", async () => {
+    await expect(answering("model.list", JSON.stringify({ id: "x" })).modelCatalog!()).rejects.toThrow(/no models/);
+    await expect(answering("model.list", "null").modelCatalog!()).rejects.toThrow(/no models/);
+  });
+
+  it("keeps a disabled model disabled and keeps only the cost rows that carry two finite numbers", async () => {
+    // A cache object on a cost row is ignored (the real service has it); a row
+    // without two finite prices is no row.
+    const data = JSON.stringify([{
+      id: "x", providerID: "p", enabled: false,
+      settings: { apiKey: "sk-FAKE-not-a-real-key" }, headers: { authorization: "Bearer FAKE-not-a-real-token" },
+      cost: [{ input: 1, output: 2, cache: { read: 0.1 } }, { input: "1", output: 2 }, { input: 3 }, null],
+    }]);
+    const catalogue = await answering("model.list", data).modelCatalog!();
+    expect(catalogue).toStrictEqual([
+      { ref: "p/x", providerID: "p", id: "x", modelID: "x", variants: [], cost: [{ input: 1, output: 2 }], enabled: false },
+    ]);
+  });
+
+  it("answers an empty map to a lookup that saw an empty answer, and asks again", async () => {
+    // The private lookup keeps what it does for a failed fetch: the call that
+    // saw the empty answer finds nothing, and the next one asks the service
+    // again instead of keeping the empty answer for the life of the adapter.
+    const log = join(cwd, "api-calls.log");
+    process.env.FAKE_API_LOG = log;
+    process.env.FAKE_MODEL_LIST_EMPTY_ONCE = join(cwd, "model-list-empty.once");
+    const adapter = makeAdapter();
+
+    await expect(adapter.contextLimit("anthropic/sonnet")).rejects.toThrow(/unknown/i);
+    await expect(adapter.contextLimit("anthropic/sonnet")).resolves.toBe(200000);
+
+    expect((await readFile(log, "utf8")).trim().split(/\r?\n/)).toEqual(["api model.list", "api model.list"]);
+  });
+});
+
+describe("OpenCodeAdapter.defaultModelRef", () => {
+  it("reports the backend default model", async () => {
+    expect(await makeAdapter().defaultModelRef!()).toBe("anthropic/sonnet");
+  });
+
+  it("answers null when the backend has no default model", async () => {
+    process.env.FAKE_MODEL_DEFAULT_NONE = "1";
+    await expect(makeAdapter().defaultModelRef!()).resolves.toBeNull();
+  });
+
+  it("rejects when the default cannot be read, remembers nothing, and recovers", async () => {
+    const log = join(cwd, "api-calls.log");
+    process.env.FAKE_API_LOG = log;
+    process.env.FAKE_MODEL_DEFAULT_FAILS_ONCE = join(cwd, "model-default-failed.once");
+    const adapter = makeAdapter();
+
+    await expect(adapter.defaultModelRef!()).rejects.toThrow(/service unreachable/);
+    await expect(adapter.defaultModelRef!()).resolves.toBe("anthropic/sonnet");
+
+    // Asked twice: the failure was not remembered.
+    expect((await readFile(log, "utf8")).trim().split(/\r?\n/)).toEqual(["api model.default", "api model.default"]);
+  });
+
+  it("rejects, without quoting the answer, when the default is not a model record", async () => {
+    for (const data of ['{ "settings": { "apiKey": "sk-FAKE-not-a-real-key" } }', '"sonnet"', "undefined"]) {
+      const error = await answering("model.default", data).defaultModelRef!().catch((err: unknown) => err);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/model\.default/);
+      // A record carries credentials like a list entry, so the rejection never quotes it.
+      expect((error as Error).message).not.toMatch(/apiKey|sk-/);
+    }
   });
 });

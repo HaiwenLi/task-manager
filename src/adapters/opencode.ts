@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { resolve } from "node:path";
-import type { AgentAdapter, SessionReuseStatus, SessionUsageSnapshot } from "./types.js";
+import type { AgentAdapter, CatalogueCost, CatalogueModel, SessionReuseStatus, SessionUsageSnapshot } from "./types.js";
 import { processExecution, type Execution } from "../execution.js";
 
 /** One prompt() turn — the execution-plane call and its result. */
@@ -30,6 +30,18 @@ type ApiEnvelope = { data?: unknown };
 type JsonObject = Record<string, unknown>;
 
 /**
+ * What one answered `model.list` holds, built from named fields only: the
+ * lookup behind variants and context limits, and the catalogue the budget
+ * guard reads.
+ */
+type ModelListing = {
+  /** Keyed by `providerID/id` and by `providerID/modelID`: what the variant and context lookups search. */
+  lookup: Map<string, { variants: Set<string>; context?: number }>;
+  /** One entry per `providerID/id`, sorted by ref. */
+  catalogue: CatalogueModel[];
+};
+
+/**
  * The v0.1 agent: OpenCode, driven through its two CLI planes.
  *
  * - Execution plane: `opencode run --format json … --auto <message>` streams
@@ -54,8 +66,8 @@ type JsonObject = Record<string, unknown>;
 export class OpenCodeAdapter implements AgentAdapter {
   private readonly bin: string;
   private readonly binArgsPrefix: string[];
-  /** Model metadata for variant/context lookups; fetched once per adapter. */
-  private modelList?: Promise<Map<string, { variants: Set<string>; context?: number }>>;
+  /** The model listing behind variant/context lookups and the cost catalogue; fetched once per adapter. */
+  private modelList?: Promise<ModelListing>;
 
   constructor(opts: { bin?: string; binArgsPrefix?: string[] } = {}) {
     this.bin = opts.bin ?? "opencode";
@@ -99,41 +111,114 @@ export class OpenCodeAdapter implements AgentAdapter {
   }
 
   /**
-   * `opencode api model.list`, fetched once and kept while it holds. Only an
-   * answered fetch is kept: a failed one answers "nothing known" to the call
-   * that saw it, but it must not disable variant and context lookups for the
-   * life of a long-lived watcher — the next call asks the service again.
+   * `opencode api model.list`, fetched once and kept while it holds an
+   * answer. A failed fetch, and one that holds no models, is not kept: the
+   * `catch` below clears the memo, so the next call asks the service again.
+   * A long-lived watcher must neither lose its variant and context lookups
+   * for the life of the process nor keep an empty catalogue: on 2026-11-25 one
+   * probe of the real service saw no entries where three later probes saw 124
+   * each.
+   *
+   * Only named fields are read out of an entry. The service's entries carry
+   * credentials (`settings.apiKey`, `headers`), so nothing else is kept and
+   * nothing else reaches a caller.
    */
-  private modelCatalogue(): Promise<Map<string, { variants: Set<string>; context?: number }>> {
-    const fetched = (this.modelList ??= this.api("model.list").then((envelope) => {
-      const catalogue = new Map<string, { variants: Set<string>; context?: number }>();
-      if (Array.isArray(envelope.data)) {
-        for (const entry of envelope.data) {
-          const object = asObject(entry);
-          const providerID = object?.providerID;
-          const id = object?.id;
-          const modelID = object?.modelID;
-          const variants = Array.isArray(object?.variants)
-            ? object.variants.flatMap((variant) => {
-                const name = asObject(variant)?.id;
-                return typeof name === "string" ? [name] : [];
-              })
-            : [];
-          const rawContext = asObject(object?.limit)?.context;
-          const context = typeof rawContext === "number" && Number.isFinite(rawContext) ? rawContext : undefined;
-          const names = [id, modelID].filter((name): name is string => typeof name === "string");
-          for (const name of names) {
-            const key = typeof providerID === "string" ? `${providerID}/${name}` : name;
-            if (!catalogue.has(key)) catalogue.set(key, { variants: new Set(variants), ...(context === undefined ? {} : { context }) });
-          }
+  private modelListing(): Promise<ModelListing> {
+    const fetched = (this.modelList ??= this.api("model.list").then((envelope): ModelListing => {
+      if (!Array.isArray(envelope.data) || envelope.data.length === 0) {
+        throw new Error("opencode api model.list answered no models");
+      }
+      const lookup = new Map<string, { variants: Set<string>; context?: number }>();
+      const entries = new Map<string, CatalogueModel>();
+      for (const entry of envelope.data) {
+        const object = asObject(entry);
+        const providerID = object?.providerID;
+        const id = object?.id;
+        const modelID = object?.modelID;
+        const variants = Array.isArray(object?.variants)
+          ? object.variants.flatMap((variant) => {
+              const name = asObject(variant)?.id;
+              return typeof name === "string" ? [name] : [];
+            })
+          : [];
+        const rawContext = asObject(object?.limit)?.context;
+        const context = typeof rawContext === "number" && Number.isFinite(rawContext) ? rawContext : undefined;
+        const names = [id, modelID].filter((name): name is string => typeof name === "string");
+        for (const name of names) {
+          const key = typeof providerID === "string" ? `${providerID}/${name}` : name;
+          if (!lookup.has(key)) lookup.set(key, { variants: new Set(variants), ...(context === undefined ? {} : { context }) });
+        }
+        // One entry per `providerID/id`: a model the list also names by its
+        // upstream name stays one entry, and that name is its `modelID`.
+        if (typeof providerID === "string" && typeof id === "string" && !entries.has(`${providerID}/${id}`)) {
+          entries.set(`${providerID}/${id}`, {
+            ref: `${providerID}/${id}`,
+            providerID,
+            id,
+            modelID: typeof modelID === "string" ? modelID : id,
+            variants,
+            // Only a row with two finite prices counts; a `cache` object on it is not a price.
+            cost: Array.isArray(object?.cost)
+              ? object.cost.flatMap((row): CatalogueCost[] => {
+                  const input = asObject(row)?.input;
+                  const output = asObject(row)?.output;
+                  return typeof input === "number" && Number.isFinite(input) && typeof output === "number" && Number.isFinite(output)
+                    ? [{ input, output }]
+                    : [];
+                })
+              : [],
+            enabled: object?.enabled !== false,
+          });
         }
       }
-      return catalogue;
+      return { lookup, catalogue: [...entries.values()].sort((a, b) => (a.ref < b.ref ? -1 : a.ref > b.ref ? 1 : 0)) };
     }));
     void fetched.catch(() => {
       if (this.modelList === fetched) this.modelList = undefined;
     });
-    return fetched.catch(() => new Map<string, { variants: Set<string>; context?: number }>());
+    return fetched;
+  }
+
+  /**
+   * The lookup behind variant and context limits. A failed fetch — and an
+   * empty answer, which the fetch treats as one — answers "nothing known" to
+   * the call that saw it, so an unknown model is still an error there; the
+   * next call asks the service again.
+   */
+  private modelCatalogue(): Promise<Map<string, { variants: Set<string>; context?: number }>> {
+    return this.modelListing().then(
+      (listing) => listing.lookup,
+      () => new Map<string, { variants: Set<string>; context?: number }>(),
+    );
+  }
+
+  /**
+   * Every model the backend lists, as `providerID/id` with the cost it
+   * reports. Unlike the private lookup this rejects when the call fails and
+   * when the answer holds no models: the budget guard must not take either for
+   * truth, and neither is remembered.
+   */
+  modelCatalog(): Promise<CatalogueModel[]> {
+    return this.modelListing().then((listing) => listing.catalogue);
+  }
+
+  /**
+   * The backend's default model as `providerID/id`, from one `opencode api
+   * model.default` call: `null` when the backend has none. Anything else
+   * rejects — a failed call, or an answer that is not a model record — and is
+   * not remembered. The record carries the same credentials as a list entry,
+   * so the rejection never quotes it.
+   */
+  async defaultModelRef(): Promise<string | null> {
+    const data = asObject(await this.api("model.default"))?.data;
+    if (data === null) return null;
+    const record = asObject(data);
+    const providerID = record?.providerID;
+    const id = record?.id;
+    if (typeof providerID !== "string" || providerID.length === 0 || typeof id !== "string" || id.length === 0) {
+      throw new Error("opencode api model.default answered no providerID/id");
+    }
+    return `${providerID}/${id}`;
   }
 
   /** Run one agent turn and collect the session id, final text and exit code. */
