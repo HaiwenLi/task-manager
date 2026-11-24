@@ -55,8 +55,14 @@ export async function noteModelRefusal(
   return entry;
 }
 
-/** A successful dispatch clears only that model's old refusal. */
+/**
+ * A successful dispatch clears only that model's old refusal. Almost every
+ * successful dispatch has nothing to clear, and then nothing is written: no
+ * lock and no rewrite of the table. An unreadable table reads as empty here,
+ * exactly as it does for every other reader of it.
+ */
 export async function clearModelCooldown(tasksDir: string, model: string): Promise<void> {
+  if ((await readStore(tasksDir)).models[model] === undefined) return;
   await mutate(tasksDir, (store) => {
     delete store.models[model];
     return store;

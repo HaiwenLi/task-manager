@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clearModelCooldown, modelCooldown, noteModelRefusal } from "../src/model-cooldown.js";
@@ -92,5 +93,31 @@ describe("shared model cooldown", () => {
     };
     expect(await runTask(cfg, { store, adapter: second, acceptance, review }, await store.get("b"), "b-run")).toBe("done");
     expect(seen).toEqual(["q/two"]);
+  });
+
+  it("writes nothing when there is no refusal to clear", async () => {
+    // Every successful dispatch calls this for the model that just worked, and
+    // almost always there is nothing to clear.
+    await clearModelCooldown(tasks, "q/one");
+    expect(existsSync(join(root, ".taskctl"))).toBe(false);
+
+    // Another model's refusal is not this model's: the table is left as it is.
+    await noteModelRefusal(tasks, "q/two", { reason: "weekly limit", cooldownMs: 900_000 });
+    const file = join(root, ".taskctl", "model-cooldowns.json");
+    const before = await readFile(file, "utf8");
+    const identity = await stat(file);
+    await clearModelCooldown(tasks, "q/one");
+    expect(await readFile(file, "utf8")).toBe(before);
+    // The same file, not a copy written over it.
+    expect(await stat(file)).toMatchObject({ ino: identity.ino, mtimeMs: identity.mtimeMs });
+    expect(await modelCooldown(tasks, "q/two")).not.toBeNull();
+  });
+
+  it("clears only the model that succeeded, leaving every other refusal", async () => {
+    await noteModelRefusal(tasks, "q/one", { reason: "weekly limit", cooldownMs: 900_000 });
+    await noteModelRefusal(tasks, "q/two", { reason: "rate limited", cooldownMs: 900_000 });
+    await clearModelCooldown(tasks, "q/one");
+    expect(await modelCooldown(tasks, "q/one")).toBeNull();
+    expect(await modelCooldown(tasks, "q/two")).toMatchObject({ reason: "rate limited" });
   });
 });
