@@ -128,6 +128,40 @@ describe("buildReviewPrompt × change evidence (C3)", () => {
   });
 });
 
+describe("buildReviewPrompt × clipped acceptance log", () => {
+  const base = {
+    task,
+    spec: "",
+    handoff: null,
+    journal: [],
+    window: { startedAt: "2026-11-24T00:00:00.000Z", finishedAt: "2026-11-24T00:20:00.000Z" },
+  };
+  // Longer than the prompt carries: only its head and tail ride along.
+  const long = `${"[PASS] head_case\n".repeat(900)}[tol] MIDDLE-EVIDENCE 1e-7\n${"[PASS] tail_case\n".repeat(900)}`;
+
+  it("points the reviewer at the complete log when the clipped one is long and its path is known", () => {
+    const prompt = buildReviewPrompt({ ...base, acceptanceMarkdown: long, acceptanceLogPath: "tasks/a/acceptance.json" });
+    expect(prompt).toContain("tasks/a/acceptance.json");
+    expect(prompt).toContain("先用你的工具读取这个文件");
+    expect(prompt).toContain("13. 验收输出很长时");
+    // The middle is still not in the prompt itself; the reviewer must go and read it.
+    expect(prompt).not.toContain("MIDDLE-EVIDENCE");
+  });
+
+  it("says plainly that the middle is missing when no path is known", () => {
+    const prompt = buildReviewPrompt({ ...base, acceptanceMarkdown: long });
+    expect(prompt).toContain("taskctl 截断");
+    expect(prompt).toContain("中段未展示");
+    expect(prompt).not.toContain("完整验收输出在这个文件");
+  });
+
+  it("adds nothing for a short log", () => {
+    const prompt = buildReviewPrompt({ ...base, acceptanceMarkdown: "[PASS] all", acceptanceLogPath: "tasks/a/acceptance.json" });
+    expect(prompt).toContain("[PASS] all");
+    expect(prompt).not.toContain("tasks/a/acceptance.json");
+  });
+});
+
 describe("review.json records what the reviewer saw (C3, worker level)", () => {
   it("writes the injected change list and diffstat next to the verdict", async () => {
     await git("init");

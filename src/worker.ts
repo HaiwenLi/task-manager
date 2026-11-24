@@ -956,6 +956,7 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "open" | "await
     journal: await journalTail(r.cfg.tasksDir, id, 30),
     changes,
     window: { startedAt: r.record.startedAt, finishedAt: new Date().toISOString() },
+    acceptanceLogPath: join(taskDirOf(r.cfg.tasksDir, id), "acceptance.json"),
   };
   emit(r, "reviewing");
   await owned(r, async () => {

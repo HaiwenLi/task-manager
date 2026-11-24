@@ -47,7 +47,19 @@ export type ReviewEvidence = {
    * "this was never done": the first is drift, the second is a defect.
    */
   window: { startedAt: string; finishedAt: string };
+  /**
+   * Where the complete acceptance record lives (a JSON file whose `output`
+   * field holds the whole log). The prompt can only carry a clipped view of
+   * a long log; with this path the reviewer reads the omitted middle with its
+   * own tools instead of returning `unclear` for evidence it was never shown
+   * (2026-11-24: a 126k-character log lost 108k in the middle, and four of
+   * five criteria came back "cannot decide" for exactly that reason).
+   */
+  acceptanceLogPath?: string;
 };
+
+/** How much of the acceptance log rides in the prompt (head and tail). */
+const ACCEPTANCE_CLIP_CHARS = 18_000;
 
 /**
  * Long evidence must not ride the agent argv unbounded: Windows caps a spawn
@@ -62,6 +74,22 @@ function clip(text: string, maxChars: number): string {
   const head = Math.floor(maxChars * 0.7);
   const tail = maxChars - head;
   return `${text.slice(0, head)}\n\n[…taskctl 截断：原文 ${text.length} 字符，此处省略 ${text.length - maxChars} 字符（保留开头与结尾）…]\n\n${text.slice(text.length - tail)}`;
+}
+
+/**
+ * What to tell the reviewer about the part of a long acceptance log the
+ * prompt cannot carry.
+ */
+function acceptanceClipNote(evidence: ReviewEvidence): string[] {
+  if (evidence.acceptanceMarkdown.trim().length <= ACCEPTANCE_CLIP_CHARS) return [];
+  if (evidence.acceptanceLogPath === undefined) {
+    return ["", "（上面的验收输出被截断，中段未展示；判据若依赖中段的证据，如实判 unclear，并在 evidence 里写明是哪一段看不到。）"];
+  }
+  return [
+    "",
+    `上面只是开头与结尾。完整验收输出在这个文件的 output 字段里：${evidence.acceptanceLogPath}`,
+    "判据所需的证据落在被省略的中段时，先用你的工具读取这个文件（文件很大时按关键字搜索，如用例名或 [tol]），读到再判；不要因为证据不在上面的片段里就判 unclear。只有读过完整输出仍找不到证据，才判 unclear。",
+  ];
 }
 
 /**
@@ -83,7 +111,8 @@ export function buildReviewPrompt(evidence: ReviewEvidence): string {
     evidence.spec.trim(),
     "",
     "## 验收命令与结果",
-    clip(evidence.acceptanceMarkdown.trim(), 18_000) || "(没有验收记录)",
+    clip(evidence.acceptanceMarkdown.trim(), ACCEPTANCE_CLIP_CHARS) || "(没有验收记录)",
+    ...acceptanceClipNote(evidence),
     "",
     "## 工作区改动清单（git status --porcelain）",
     evidence.changes?.status.trim() || "(未收集)",
@@ -119,6 +148,7 @@ export function buildReviewPrompt(evidence: ReviewEvidence): string {
     "10. 每个 defects 条目用严重级前缀开头：🔴 是必须返工才能过、🟡 是明显缺陷、🟢 是无关痛痒的挑剔。只有 🔴 或 🟡 可以当作 fail 的理由；如果只有 🟢，不要 fail。",
     "11. summary 先写你对本任务和验收标准的复述（我要求它做什么、做到什么算过），再写结论。如果你连任务和判据都复述不清楚，或者复述和上面给出的标准对不上，判 unclear——那不是产物的问题，是判据本身没写清楚。",
     "12. 「工作区改动清单／改动统计」是执行足迹的线索，不是验收依据：不在清单里的差异可能是被容忍的外部变更（按容忍规则归因），在清单里也不等于符合标准；结论仍以产物本身为准。清单标注「不可用」或「截断」时，按信息缺失处理，不要猜。",
+    "13. 验收输出很长时上面只给了开头与结尾，完整输出的文件路径写在那一节里；判据依赖中段证据时先用工具读那个文件再判，这不属于「要求额外材料」。",
     "",
     "JSON 形状：",
     `{"verdict":"pass|fail|unclear","criteria":[{"id":"C1","pass":true,"evidence":"读了 <文件>，看到 <事实>"}],"externalChanges":["归因为外部变更的差异"],"defects":["🔴 必须修的点 / 🟢 挑剔项"],"summary":"一句话复述你怎么理解本任务与判据，再给结论"}`,
