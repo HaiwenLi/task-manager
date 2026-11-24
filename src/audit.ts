@@ -54,8 +54,12 @@ export async function readAudits(tasksDir: string): Promise<AuditRecord[]> {
 /**
  * Which stage keeps failing. This is the learning signal: a reviewer that keeps
  * being overruled, or a worker that keeps needing rework, is the thing to fix.
+ *
+ * Rework is deliberately not summarised here. An audit records what a human
+ * judged, and that says nothing about how often taskctl sent work back on its
+ * own; `metrics.ts` keeps the two apart instead of reporting one number.
  */
-export function summarizeAudits(records: AuditRecord[], tasks: Array<{ reviewRounds: number }>): string[] {
+export function summarizeAudits(records: AuditRecord[]): string[] {
   const stages: AuditStage[] = ["clarify", "worker", "reviewer", "none"];
   const counts = new Map(stages.map((stage) => [stage, { fail: 0, total: 0 }]));
   for (const record of records) {
@@ -64,8 +68,6 @@ export function summarizeAudits(records: AuditRecord[], tasks: Array<{ reviewRou
     if (record.verdict === "fail") bucket.fail += 1;
   }
   const highlighted = records.filter((record) => record.verdict === "pass" && record.highlight === true).length;
-  const reworked = tasks.filter((task) => task.reviewRounds > 0).length;
-  const rate = tasks.length === 0 ? 0 : Math.round((reworked / tasks.length) * 100);
   return [
     `audits  ${records.length}`,
     ...stages.map((stage) => {
@@ -73,6 +75,5 @@ export function summarizeAudits(records: AuditRecord[], tasks: Array<{ reviewRou
       return `${stage}  ${bucket.fail} fail / ${bucket.total}`;
     }),
     `highlight  ${highlighted}`,
-    `返工率  ${rate}%  (${reworked}/${tasks.length})`,
   ];
 }

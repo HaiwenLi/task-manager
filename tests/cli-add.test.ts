@@ -119,6 +119,17 @@ describe("taskctl add", () => {
     expect(questions).not.toContain("Q4");
   });
 
+  it("records an unusable model lane as taskctl's own escalation", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
+    const adapter = fakeAdapter(assessedSpec("tiny"));
+    const code = await runCli(["add", "修 README 错字", "--tasks-dir", dir, "--id", "bad-lane"], { ...silent, adapter });
+
+    expect(code).toBe(0);
+    expect(await new TaskStore(dir).get("bad-lane")).toMatchObject({ status: "draft", complexity: "complex", execution: "iterative" });
+    expect(JSON.parse(await readFile(join(dir, "bad-lane", "classification.json"), "utf8")))
+      .toMatchObject({ lane: "complex", proposedLane: null, laneEscalated: true });
+  });
+
   it("lets an explicit operator lane override model classification", async () => {
     const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
     const adapter = fakeAdapter(assessedSpec("complex"));

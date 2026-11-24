@@ -18,6 +18,7 @@ import { createCoalescedRefresh, renderBoardMarkdown, renderBoardTable, writeBoa
 import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
 import { readRelevantFeedback, recordTaskFeedback, type FeedbackEvent } from "./feedback.js";
+import { readFlow } from "./metrics.js";
 import { clearQuestions, questionsPath, readQuestions, writeQuestions } from "./questions.js";
 import { readRuntime, readAttempt, writeRuntime } from "./runtime.js";
 import { reconcileTask, retryTask } from "./reconcile.js";
@@ -463,7 +464,8 @@ async function addCommand(
     : selectedComplexity === "simple" ? "continuous" : "iterative";
   await store.updateFields(id, { criteria, complexity: selectedComplexity, execution: selectedExecution });
   await writeRuntime(tasksDir, id, "classification.json", {
-    lane, proposedLane: assessment.lane, sufficiency: assessment.sufficiency,
+    lane, proposedLane: assessment.laneEscalated ? null : assessment.lane, laneEscalated: assessment.laneEscalated,
+    sufficiency: assessment.sufficiency,
     reason: assessment.reason, model: cfg.model ?? "(backend-default)", type, at: new Date().toISOString(),
   });
   if (assessment.sufficiency === "needs-information") {
@@ -866,11 +868,11 @@ async function auditCommand(flags: Map<string, string>, log: (line: string) => v
   return 0;
 }
 
-/** `taskctl metrics` — which stage keeps failing. */
+/** `taskctl metrics` — which stage a human keeps failing, and how often work comes back, and whose doing it was. */
 async function metricsCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
   const tasksDir = await tasksDirFor(flags);
   const tasks = await new TaskStore(tasksDir).list();
-  for (const line of summarizeAudits(await readAudits(tasksDir), tasks)) {
+  for (const line of [...summarizeAudits(await readAudits(tasksDir)), ...await readFlow(tasksDir, tasks)]) {
     log(line);
   }
   return 0;

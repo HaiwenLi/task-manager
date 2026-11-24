@@ -51,9 +51,14 @@ describe("parseIntakeAssessment", () => {
   });
 
   it("falls back conservatively on missing or contradictory assessments", () => {
-    expect(parseIntakeAssessment("## 目标\n旧格式", "complex")).toMatchObject({ lane: "complex", sufficiency: "clear" });
-    expect(parseIntakeAssessment(spec("tiny", "clear"), "complex").lane).toBe("complex");
-    expect(parseIntakeAssessment(spec("simple", "perhaps"), "complex").sufficiency).toBe("needs-information");
+    // A spec from before these sections existed keeps the lane it was added
+    // with: nothing was escalated, so nothing is reported as one.
+    expect(parseIntakeAssessment("## 目标\n旧格式", "complex")).toMatchObject({ lane: "complex", sufficiency: "clear", laneEscalated: false });
+    expect(parseIntakeAssessment("## 目标\n旧格式", "simple")).toMatchObject({ lane: "simple", laneEscalated: false });
+    // An unusable lane becomes complex whatever the fallback was, and is
+    // recorded as taskctl's own decision rather than the model's.
+    expect(parseIntakeAssessment(spec("tiny", "clear"), "simple")).toMatchObject({ lane: "complex", laneEscalated: true });
+    expect(parseIntakeAssessment(spec("simple", "perhaps"), "complex")).toMatchObject({ lane: "simple", sufficiency: "needs-information", laneEscalated: false });
   });
 
   it("keeps only three outcome-changing questions", () => {

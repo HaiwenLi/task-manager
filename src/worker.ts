@@ -917,6 +917,11 @@ async function resumeReviewOnly(r: Run, pending: ReviewPendingRecord): Promise<"
   if (pending.artifactDigest !== artifactNow) {
     throw new ReviewRequiredError("review-only recovery refused: artifacts changed after the preserved worker/acceptance evidence");
   }
+  // Only the review runs from here. Recorded as its own event so a later
+  // reader can tell a review-only recovery from an ordinary review round.
+  await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
+    stage: "review", event: "review-only", detail: "resuming review on the preserved worker/acceptance evidence",
+  }));
   const outcome = await reviewStage(r);
   if (outcome === "retry") {
     // A real fail verdict needs worker side effects, which a review-only claim
@@ -1047,6 +1052,14 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
       found: `fingerprint: ${streak.fingerprint} (${streak.count}/${limit})\n${(result.output ?? "").slice(-4_000)}`,
       next: "根据上面的控制器验收输出修复；先做有界定向自验，不要无意义重复全量验收。",
       files: [],
+    });
+    // The explicit record of an automatic rework round. The metrics that keep
+    // "the controller sent it back" apart from "a person sent it back" count
+    // these events; they never infer a round from the lines around it.
+    await appendJournal(r.cfg.tasksDir, r.task.id, {
+      stage: "worker",
+      event: "rework",
+      detail: `acceptance failed (exit ${result.exitCode ?? "null"}); the worker resumes with the failure output`,
     });
     return "retry";
   });

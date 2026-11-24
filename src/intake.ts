@@ -6,6 +6,8 @@ export type ManagementLane = "quick" | "simple" | "complex";
 export type InformationSufficiency = "clear" | "assumptions" | "needs-information";
 export type IntakeAssessment = {
   lane: ManagementLane;
+  /** True when `lane` is taskctl's conservative fallback, not the model's own classification. */
+  laneEscalated: boolean;
   sufficiency: InformationSufficiency;
   reason: string;
   questions: string[];
@@ -16,20 +18,41 @@ export function parseIntakeAssessment(
   markdown: string,
   fallback: "simple" | "complex",
 ): IntakeAssessment {
-  const laneText = section(markdown, "管理分类").trim().split(/\s+/)[0] ?? "";
-  const sufficiencyText = section(markdown, "信息充分性").trim().split(/\s+/)[0] ?? "";
-  const hasAssessment = laneText.length > 0 || sufficiencyText.length > 0;
-  const lane: ManagementLane = laneText === "" && !hasAssessment
-    ? fallback
-    : laneText === "quick" || laneText === "simple" || laneText === "complex" ? laneText : "complex";
-  const sufficiency: InformationSufficiency = sufficiencyText === "" && !hasAssessment || sufficiencyText === "clear" || sufficiencyText === "assumptions"
-    ? sufficiencyText === "assumptions" ? "assumptions" : "clear"
-    : sufficiencyText === "needs-information" ? "needs-information" : "needs-information";
+  const laneText = firstWord(section(markdown, "管理分类"));
+  const sufficiencyText = firstWord(section(markdown, "信息充分性"));
+  // A spec written before these sections existed is not a failed assessment:
+  // it keeps the lane the task was added with.
+  const assessed = laneText !== "" || sufficiencyText !== "";
+  const proposed = isLane(laneText) ? laneText : null;
+  const lane: ManagementLane = proposed ?? (assessed ? "complex" : fallback);
+  const sufficiency: InformationSufficiency = isSufficiency(sufficiencyText)
+    ? sufficiencyText
+    : assessed ? "needs-information" : "clear";
   const questions = section(markdown, "补问").split(/\r?\n/)
     .map((line) => /^\s*[-*]\s+(.+)$/.exec(line)?.[1]?.trim() ?? "")
     .filter((line) => line.length > 0 && line !== "无" && line !== "（无）")
     .slice(0, 3);
-  return { lane, sufficiency, reason: section(markdown, "分类理由").trim().slice(0, 1_000), questions };
+  return {
+    lane,
+    sufficiency,
+    // The model gave no usable lane, so taskctl chose the conservative one
+    // itself. That is a classification escalation and is measured as one.
+    laneEscalated: assessed && proposed === null,
+    reason: section(markdown, "分类理由").trim().slice(0, 1_000),
+    questions,
+  };
+}
+
+function firstWord(text: string): string {
+  return text.trim().split(/\s+/)[0] ?? "";
+}
+
+function isLane(value: string): value is ManagementLane {
+  return value === "quick" || value === "simple" || value === "complex";
+}
+
+function isSufficiency(value: string): value is InformationSufficiency {
+  return value === "clear" || value === "assumptions" || value === "needs-information";
 }
 
 function section(markdown: string, title: string): string {

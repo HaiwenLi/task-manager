@@ -4,6 +4,9 @@ import { join } from "node:path";
 /** One journal entry: which stage did what, with an optional one-line detail. */
 export type JournalEntry = { stage: string; event: string; detail?: string };
 
+/** One journal line, split into its parts; `detail` is empty when the line has none. */
+export type JournalLine = { at: string; stage: string; event: string; detail: string };
+
 /** Longest detail we keep on one line; longer text is truncated, not wrapped. */
 const DETAIL_LIMIT = 500;
 
@@ -21,6 +24,23 @@ export async function appendJournal(tasksDir: string, id: string, entry: Journal
 
 /** The last `n` non-empty journal lines, oldest first; a missing journal reads as empty. */
 export async function journalTail(tasksDir: string, id: string, n: number): Promise<string[]> {
+  const lines = await journalLines(tasksDir, id);
+  return lines.slice(Math.max(0, lines.length - n));
+}
+
+/**
+ * The whole journal, oldest first, with each line split into time, stage,
+ * event and detail. Metrics read these: they count what the orchestrator
+ * recorded that it did, which is not something the task file keeps.
+ */
+export async function readJournal(tasksDir: string, id: string): Promise<JournalLine[]> {
+  return (await journalLines(tasksDir, id)).map((raw) => {
+    const [at = "", stage = "", event = "", ...rest] = raw.split(/\s{2,}/);
+    return { at, stage, event, detail: rest.join("  ") };
+  });
+}
+
+async function journalLines(tasksDir: string, id: string): Promise<string[]> {
   let raw: string;
   try {
     raw = await readFile(join(tasksDir, id, "journal.md"), "utf8");
@@ -30,8 +50,7 @@ export async function journalTail(tasksDir: string, id: string, n: number): Prom
     }
     throw err;
   }
-  const lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
-  return lines.slice(Math.max(0, lines.length - n));
+  return raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
 }
 
 /**

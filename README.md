@@ -110,7 +110,7 @@ retries: 0
 
 `schema: taskctl/v1` 是显式注册：`tasks/` 目录里可以放别的 Markdown（手抄的快照、草稿、导出的旧任务），只有声明了这一行的文件才会被调度。缺这行或 frontmatter 解析不了的文件不领取、不排期，`taskctl status` 会在看板后面单独列出 `ignored` 及原因；已注册但内容坏掉的任务仍然照常报错，不会被静默忽略。`taskctl add` 生成的文件自带这一行。
 
-辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`definition.json`（领取时写下的定义快照，本次尝试的判据）、`acceptance.json`（命令、验收模式、时间、输出、身份摘要与实际使用的模型）、`acceptance-failures.json`（连续同一验收失败的指纹与次数）、`review.json`（复核判决、模型、被容忍的外部变更与实际注入的改动证据）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`execution-state.json`（持久升级与最近 worker session）、`review-pending.json`（只待复核的保留现场）、`usage.jsonl`（每回合资源快照与增量）、`done.requested`（完成请求）、`logs/`（控制器逐任务日志与 worker 的 `$TASKCTL_LOG_DIR`）、`scratch/`（回合后清扫的落点，只进不出）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
+辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`definition.json`（领取时写下的定义快照，本次尝试的判据）、`acceptance.json`（命令、验收模式、时间、输出、身份摘要与实际使用的模型）、`acceptance-failures.json`（连续同一验收失败的指纹与次数）、`review.json`（复核判决、模型、被容忍的外部变更与实际注入的改动证据）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`execution-state.json`（持久升级与最近 worker session）、`review-pending.json`（只待复核的保留现场）、`classification.json`（接入分类：实际/建议车道、是否兜底升级、信息充分性、理由）、`questions.md`（待回答的问题；存在期间不能 approve）、`usage.jsonl`（每回合资源快照与增量）、`done.requested`（完成请求）、`logs/`（控制器逐任务日志与 worker 的 `$TASKCTL_LOG_DIR`）、`scratch/`（回合后清扫的落点，只进不出）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
 
 ## 车道与验收方式
 
@@ -121,6 +121,26 @@ retries: 0
 | 标准 | `add "<意图>"` | `draft`，澄清会话出 spec + criteria，等人签字 | 一次模型调用 + 一次签字 |
 | 简单 | `add --simple` 或意图里说「简单任务」 | `open`，仍出 spec | 符号少一次签字 |
 | 快速 | `add --quick` | `open`，**不出 spec、不跑澄清**，意图原文就是定义 | 没有写下来的判据，所以它不会自己收尾 |
+
+### 接入分类：这件事该管多细，信息够不够
+
+走标准道的 `taskctl add` 在**同一个澄清回合**里顺带回答两个问题，不另外花一次模型调用（`--quick` 仍然零模型调用）：
+
+- **管理分类** `quick` / `simple` / `complex`，只决定管理强度：quick 是极轻量单步；simple 是一次 Worker 后最终 Review；complex 需要拆子任务和/或 Worker→Review→Worker 迭代。它**不能**降低 `risk`、去掉 `human_check`、放宽 `criteria` 或把人工复核改成机械验证——那些只能由你在已批准的任务定义里显式声明。
+- **信息充分性** `clear` / `assumptions` / `needs-information`：只有当缺的信息会改变交付物、验收、禁区或风险时才允许 `needs-information`，并且最多一次问 3 条。能从仓库推出来的事不问。
+
+结果写在 `tasks/<id>/classification.json`：实际车道、模型建议、是否由 taskctl 兜底升级、信息充分性、理由、模型。
+
+保守兜底：模型没给、给错或自相矛盾时，一律按 `complex` 处理并停在 `draft`，绝不会默认变成 quick；这种兜底记为 `laneEscalated: true`，`metrics` 单独统计。`--simple` / `--quick` / `--execution` 是你的显式选择，优先于模型分类。
+
+`needs-information` 的任务停在 `draft`，并写一份 `tasks/<id>/questions.md`（`add` 会打印它的路径，`status` / `board` 显示「待回答问题 N 条」）。**这份文件存在期间 `approve` 会被拒绝**——把没人知道的事签成"已批准"正是要避免的：
+
+```bash
+taskctl answer --task <id> --file <answers.md>   # 把回答追加进定义，清掉 questions.md
+taskctl approve --task <id>                      # 修订后的定义要重新签字
+```
+
+回答原文同时追加到 `spec.md`（复核读的）和任务正文（worker 读的）。只写前者的话，执行者会被一条它从没见过的约束判定。两处都是定义文本，所以修订后的任务有新的 `definitionDigest`。
 
 三条道都必须能被人或机器判"做完了"，判据由 `verify` 指定：
 
@@ -149,28 +169,30 @@ retries: 0
 一条任务从想法到可信结果的完整路径（设计见 [ADR-0008](docs/adr/0008-review-stage-and-human-attribution.md)）：
 
 ```
-taskctl add "<意图>"        澄清会话出 spec + criteria；complex 停在 draft 等签字
+taskctl add "<意图>"        澄清会话出 spec + criteria，并给出管理分类；complex 停在 draft 等签字
 taskctl spec --task <id>    看稿
+taskctl answer --task <id> --file <answers.md>   回答 questions.md（needs-information 时）
 taskctl approve --task <id> 签字 → open
 taskctl run                 并发执行 → 验收命令 → 独立复核 → done / 返工 / 等放行
 taskctl board               总台账（同时重写 .taskctl/board.md，可用浏览器打开）
 taskctl report --task <id>  单任务证据页
-taskctl accept|reject       人工放行或打回（reject 要说明是哪个环节的问题）
+taskctl accept [--note "…"] 人工放行，可附一条给下次的备注
+taskctl reject --stage …    人工打回，要说明是哪个环节的问题（clarify → 退回 draft）
 taskctl audit --verdict …   抽查已完成的
-taskctl metrics             哪个环节在拖后腿
+taskctl metrics             哪个环节在拖后腿、工作被谁退回来
 taskctl learn --note "…"    记一条偏好（原话 → 改法），下次澄清会读到
 taskctl template --type …   看某类任务的必答/可推/补问模板
 ```
 
 要点：
 
-- **复杂度**：意图里明说「简单任务」或加 `--simple` 才会跳过签字；不说就按复杂处理。简单任务同样出 spec，只是不等签字。
+- **复杂度**：意图里明说「简单任务」或加 `--simple` 会跳过签字；其余由接入分类决定（见「接入分类」）。模型没说清、说错或没提，一律按复杂处理。简单任务同样出 spec，只是不等签字。
 - **复核是独立会话**：新会话、不给执行者的对话，只给 spec、验收命令与结果、产物摘要、交接笔记、日志尾部、工作区改动清单（`git status --porcelain` 与 `git diff --stat`，各截断至 200 行、超长标注），以及本次执行的时间窗口。输出必须是 JSON；解析不了按 `unclear` 转人工，不会当成失败去重跑。实际注入的改动清单原文记在 `review.json` 的 `evidence` 字段，复盘复核误判时可以核对 reviewer 当时到底看到了什么；非 git 工作目录会显式标注「不可用」而不是中断复核。
 - **容忍的外部变更**：任务可以声明 `tolerate`，告诉复核"这些差异不是我干的"。声明之外的结构变化（删列、改表头含义等）仍按原规则判 fail；本任务自己该写的内容没写全，**不能**拿外部变更当挡箭牌；涉及交付内容（该写的行、该改对的单元格）时判不出先后的，也按本任务的问题处理。被容忍的差异不做静默处理：写进 `review.json` 的 `externalChanges`、journal 记一条 `verdict external=N`、`report` 里逐条列出，`taskctl accept` 放行前也会打印一遍（人工闸门是最后一道）。为什么需要它：真跑过的表格任务里，运行期间别人加了 1 列、删了 1 行、改了 4 个单元格，复核按"零附带改动"判 fail，白跑 20 分钟一轮。
 - **定义不能被被审对象自己改**：`tolerate`、`criteria`、`risk`、`verify`、`complexity` 等都属于任务定义，进 `definitionDigest`。执行回合里改了它（哪怕是 worker 自己 shell 出去改 frontmatter），本次验收直接作废、任务 `blocked` 等人工重新确认——否则"给自己放宽判定标准"就成了合法动作。判据是领取时写下的 `tasks/<id>/definition.json` 快照，事后改文件不会把旧证据重新判成合格。生命周期字段（`retries`、`sessions`、`status`）不在定义里：降重试数、记会话 id 不会作废正在进行的尝试。复核判决里记录的是**当时那份声明**，事后把 `tolerate` 收窄不会让旧判决看起来像是被允许过更多。
-- **返工**：复核不过会写一条 `review-failed` 笔记，并在同一 claim 内回到 worker；同模型续用 session。超过允许的返工轮次后 `blocked`。人工 `reject` 才代表另一次调度尝试，重新打开为 `open`。
+- **返工**：复核不过会写一条 `review-failed` 笔记，并在同一 claim 内回到 worker；同模型续用 session。超过允许的返工轮次后 `blocked`。人工 `reject` 才代表另一次调度尝试，重新打开为 `open`——除非归因是 `clarify`，见下。
 - **人工节点**：`risk: high`、`human_check: true`、以及复核无法判定的任务停在 `awaiting-human`，只有 `accept` 能放行。
-- **归因**：`reject`/`audit` 都会记录问题出在 `clarify`（标准本身错）、`worker`（没做到）、还是 `reviewer`（漏判），`metrics` 按环节汇总。
+- **归因**：`reject`/`audit` 都会记录问题出在 `clarify`（标准本身错）、`worker`（没做到）、还是 `reviewer`（漏判），`metrics` 按环节汇总。归到 `clarify` 的 `reject` 会把任务退回 `draft` 而不是 `open`：规格本身错了，再跑一遍 worker 只是在执行一份已被否定的定义。原因作为待答问题写进 `questions.md`，`taskctl answer` 之后重新 `approve` 才会再次执行；worker/reviewer 归因保持原有返工行为。
 
 ### 偏好档案
 
@@ -182,6 +204,29 @@ taskctl template --type …   看某类任务的必答/可推/补问模板
 ```
 
 `taskctl learn --note "原话 → 改法"` 追加一条；`taskctl add` 会把它整段注入澄清提示词。它不是模型训练，是「把规则写下来，下次先按它走」；写错了直接删那一行。
+
+### 人工反馈历史
+
+`.taskctl/feedback.jsonl` 逐条记录**人**写下的纠正：`reject` 的原因、`audit` 的备注、`accept --note` 的备注，以及 `answer` 对澄清问题的回答——每条带任务 id、标题、归因环节、任务类型和时间。它只由这几个命令写入：模型输出永远不会修改它或偏好档案；没有任何备注的通过（普通的 `accept`、不带 `--note` 的 `audit`）不产生条目——没有纠正内容的"通过"不该变成一条偏好。
+
+下次 `taskctl add` 时，同任务类型的条目按与新意图的**字面关键词重合度**排序（并列时新的在前），取前 8 条、总计不超过 3000 字注入澄清提示词。历史里已有同类问题的回答或纠正时，模型被要求直接采用、不再重问；只有本次意图与之冲突才提出来。不做 embedding，不额外调用模型。文件最多保留最新 200 条，每条备注最多 600 字，都可以手工删改；读写失败只打一行提示，不影响澄清或人工决定本身。
+
+### taskctl metrics — 谁在把工作退回来
+
+上半部分来自 `audits.jsonl`，是**人**的判断：每个环节多少次 fail。下半部分来自各任务的 `journal.md` 与 `classification.json`，是流程本身的事实：
+
+| 行 | 含义 |
+| --- | --- |
+| 首轮通过率 | 已 `done` 的任务里，从没被人工 `reject` 过的比例。抽查 fail 不算——它不要求返工 |
+| 自动返工 | taskctl 自己送回 worker 的轮数与涉及任务数：验收失败后带着输出返工（验收），复核 fail 后返工（复核），都不需要人介入 |
+| 人工打回 | 被人 `reject` 过至少一次的任务数 |
+| 接入信息 | 有分类记录的任务里 `needs-information`（及 `assumptions`）各多少 |
+| 分类升级 | 模型没给出可用车道、由 taskctl 兜底到 `complex`，或实际车道比模型建议更保守的任务数 |
+| 复核保留 / 只复核恢复 | reviewer 不可用而保留现场的次数，以及随后只跑复核恢复的次数 |
+
+要看的趋势是**首轮通过率上升、人工打回减少**，而不是复核调用变少。两种返工必须分开：一个是工具按设计在自助（便宜、预期内），一个是人不得不介入（这正是要消除的重复）。轮数由 journal 里记录"决定返工"的事件（`worker rework`、`review rework`）统计，不用会被 `retry` 重置的计数器，也不从相邻行推断；分母为 0 时显示 `-` 而不是 `0%`。
+
+旧的 `返工率` 行已移除：它把复核过的任务数除以全部任务（含从未执行的），和这里的口径并排会给出两个互相矛盾的"返工"数字。
 
 ## 运行
 

@@ -82,18 +82,15 @@ describe("taskctl audit", () => {
 });
 
 describe("summarizeAudits", () => {
-  it("counts failures per stage and highlights, and reports the rework rate", async () => {
+  it("counts failures per stage and highlights, and leaves rework to the flow metrics", async () => {
     const { tasksDir } = await setup();
     await appendAudit(tasksDir, { task: "001-a", at: "2026-11-16T00:00:00Z", verdict: "fail", stage: "reviewer" });
     await appendAudit(tasksDir, { task: "001-a", at: "2026-11-16T00:01:00Z", verdict: "pass", stage: "none", highlight: true });
     await appendAudit(tasksDir, { task: "002-b", at: "2026-11-16T00:02:00Z", verdict: "fail", stage: "reviewer" });
-    const tasks = [
-      buildTaskFile({ id: "001-a", status: "done", reviewRounds: 2 }),
-      buildTaskFile({ id: "002-b", status: "open", reviewRounds: 0 }),
-    ];
-    const text = summarizeAudits(await readAudits(tasksDir), tasks).join("\n");
+    const text = summarizeAudits(await readAudits(tasksDir)).join("\n");
     expect(text).toMatch(/reviewer\s+2/);
     expect(text).toMatch(/highlight\s+1/);
-    expect(text).toMatch(/返工率\s+50%/);
+    // A human's verdict says nothing about who sent the work back.
+    expect(text).not.toMatch(/返工/);
   });
 });

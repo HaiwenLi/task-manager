@@ -96,6 +96,16 @@ describe("review-pending recovery", () => {
     expect(acceptance).toHaveBeenCalledTimes(1);
     expect((await store.get("a")).status).toBe("done");
     expect(await readRuntime(tasks, "a", "review-pending.json")).toBeNull();
+
+    // One park, one recovery, and neither is a rework round: the worker and
+    // the acceptance gate still ran exactly once each.
+    const lines: string[] = [];
+    expect(await runCli(["metrics", "--tasks-dir", tasks], { log: (line) => lines.push(line) })).toBe(0);
+    const metrics = lines.join("\n");
+    expect(metrics).toMatch(/复核保留\s+1/);
+    expect(metrics).toMatch(/只复核恢复\s+1/);
+    expect(metrics).toMatch(/自动返工\s+0 个任务/);
+    expect(metrics).toMatch(/首轮通过率\s+100%\s+\(1\/1\)/);
   });
 
   it("rejects review-only recovery when the artifact changed", async () => {

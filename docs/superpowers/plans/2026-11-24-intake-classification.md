@@ -66,6 +66,26 @@ Implementation notes the plan did not fix:
 
 **Files:** `src/audit.ts`, `src/cli.ts`, `README.md`, relevant metrics tests
 
-- [ ] Add failing assertions for first-pass user acceptance, automatic worker rework and needs-information counts.
-- [ ] Implement metrics without conflating human and automatic rework; document lane behavior and answer/feedback records.
-- [ ] Run `npm test`, `npx tsc --noEmit`, and `git diff --check`; commit `feat(metrics): measure first-pass user acceptance`.
+- [x] Add failing assertions for first-pass user acceptance, automatic worker rework and needs-information counts.
+- [x] Implement metrics without conflating human and automatic rework; document lane behavior and answer/feedback records.
+- [x] Run `npm test`, `npx tsc --noEmit`, and `git diff --check`; commit `feat(metrics): measure first-pass user acceptance`.
+
+**Evidence (2026-11-24):** `tests/metrics.test.ts` 8 tests plus one CLI assertion each in `cli-add`, `review-pending`;
+full suite 478 passed / 1 skipped; `npx tsc --noEmit` clean (it caught one real error the test run did not: an
+under-typed `readFlow` parameter). Mutation check, control clean and restored clean: the `worker rework` event,
+the `review review-only` event, first-pass excluding human rejections, counting the resume decision rather than
+acceptance outcomes, the `-` for an empty denominator, the classified-only intake denominator, and both parser
+guards (`laneEscalated`, unusable lane → complex) were each killed by the test named for them.
+
+Implementation notes the plan did not fix:
+
+- Rounds are counted from explicit journal events. `accept()` wrote no event when it decided to resume the
+  worker after a failed gate, and a review-only claim looked identical to an ordinary review round, so both
+  now record one (`worker rework`, `review review-only`). Counters such as `review_rounds` are reset by
+  `retry` and cannot serve as history.
+- The old `返工率` line was removed from `summarizeAudits`. It divided tasks with `review_rounds > 0` by *all*
+  tasks, including ones that never ran, and next to the new lines would have shown two contradictory
+  "rework" numbers. `summarizeAudits` now takes the audit records only.
+- `classification.json` gained `laneEscalated` and records `proposedLane: null` when the model's lane was
+  unusable, so "the model said complex" and "taskctl had to choose complex" are distinguishable.
+- A task with a torn `classification.json` is excluded from intake denominators rather than guessed at.
