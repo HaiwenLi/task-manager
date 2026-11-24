@@ -166,6 +166,8 @@ type Run = {
   dispatchFailures: Map<string, string>;
   /** What each dependency produced; computed once per attempt (see `dependenciesOf`). */
   dependencies?: string | null;
+  /** The context budget was already reported as unreadable for this attempt. */
+  budgetUnavailableNoted: boolean;
 };
 const emit = (r: Run, type: WorkerEventType, detail?: string) => r.deps.onEvent?.({ type, taskId: r.task.id, detail });
 const owned = <T>(r: Run, fn: () => Promise<T>) => withOwnership(r.cfg.tasksDir, r.task.id, r.owner, fn);
@@ -193,7 +195,7 @@ export async function runTask(
   let notifyLost!: () => void;
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
   const now = new Date().toISOString();
-  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, batch: options.batch, previousSettled: false, sweepSkipNoted: false,
+  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, batch: options.batch, previousSettled: false, sweepSkipNoted: false, budgetUnavailableNoted: false,
     dispatchFailures: new Map(),
     record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing" } };
   let reservation: WorkspaceReservation | null = null;
@@ -1578,6 +1580,15 @@ async function overBudget(r: Run, sessionId: string | undefined, model: string |
     return usage;
   } catch (err) {
     if (err instanceof OwnershipLostError || err instanceof UncertainExecutionError) throw err;
+    // A silent "not over budget" reads as a measured answer. Say once that the
+    // check could not run, so a control plane that stopped answering is visible.
+    if (!r.budgetUnavailableNoted) {
+      r.budgetUnavailableNoted = true;
+      await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
+        stage: "worker", event: "context-budget-unavailable",
+        detail: err instanceof Error ? err.message : String(err),
+      })).catch(() => {});
+    }
     return false;
   }
 }

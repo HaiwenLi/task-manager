@@ -13,8 +13,8 @@ import { runScheduler } from "../src/scheduler.js";
 import { TaskStore } from "../src/task-store.js";
 import { runTask, type WorkerConfig, type WorkerDeps, type WorkerEvent } from "../src/worker.js";
 import { reserveWorkspace } from "../src/workspace.js";
-import { buildContinuousTask as task } from "./helpers/task-fixture.js";
-import { doneAdapter, passAcceptance, seedTaskFile, workerConfigFixture, writeBatchConfig } from "./helpers/watch-fixture.js";
+import { buildContinuousTask as task, buildTaskFile } from "./helpers/task-fixture.js";
+import { doneAdapter, markDoneTask, passAcceptance, seedTaskFile, workerConfigFixture, writeBatchConfig } from "./helpers/watch-fixture.js";
 
 let root: string;
 let tasks: string;
@@ -151,6 +151,31 @@ describe("a failure confined to one task", () => {
     expect((await readJournal(tasks, "a")).some((line) => line.event === "controller-error" && /disk full/.test(line.detail)))
       .toBe(true);
     expect(await workspaceFree()).toBe(true);
+  });
+
+  it("says once when the context budget cannot be checked", async () => {
+    await seedTaskFile(tasks, buildTaskFile({
+      id: "a", complexity: "complex", verify: "mechanical", criteria: ["C1 ok"], acceptance: "check", model: "w/one",
+    }));
+    let turns = 0;
+    const blindLimit: AgentAdapter = {
+      prompt: async (args) => {
+        turns++;
+        if (turns >= 3) await markDoneTask(args.text, tasks);
+        return { sessionId: "s-a", exitCode: 0, text: "working" };
+      },
+      contextUsage: async () => 0,
+      contextLimit: async () => { throw new Error("unknown model w/one"); },
+    };
+
+    const outcome = await runTask(cfg, deps(blindLimit), await store.get("a"), "w1");
+
+    expect(outcome).toBe("done");
+    expect(turns).toBe(3);
+    // 静默的「没超预算」读起来像一个测出来的答案；控制面不回答时要在 journal 里看得见，且只说一次。
+    const lines = (await readJournal(tasks, "a")).filter((line) => line.event === "context-budget-unavailable");
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.detail).toContain("unknown model");
   });
 
   it("taskctl run drains the rest of the board and exits 1 when a task hit a controller error", async () => {
