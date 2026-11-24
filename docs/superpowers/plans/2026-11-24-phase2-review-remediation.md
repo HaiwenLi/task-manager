@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript, Node.js 22+, Vitest, existing `runCli`/`watchQueue` test seams.
 
-**Spec:** `docs/superpowers/specs/2026-11-24-adaptive-execution-design.md` §13 and §15.1 items 11/15; `docs/superpowers/plans/2026-11-24-watch-batch.md`; X-Goldfish report `~/.xg-reviews\task-manager\20261124T071920Z\code_review_report.md`.
+**Spec:** `docs/superpowers/specs/2026-11-24-adaptive-execution-design.md` §13 and §15.1 items 11/15; `docs/superpowers/plans/2026-11-24-watch-batch.md`; X-Goldfish report `~/.xg-reviews/task-manager/20261124T071920Z/code_review_report.md`.
 
 ## Global Constraints
 
@@ -212,7 +212,7 @@ Update this plan with test counts, gate results, review verdict and report path.
 ## Evidence (2026-11-24, offline only)
 
 - Commits: `3ded6c7` A1; `a984e99` A2; `b070a58` A3; `635303f` A4; `80050da` A5/A6/A7.
-- A1–A4 mutation checks were each run against one reversed guard and killed; the clean controls were rerun after restore. Private report: `<local temp>/opencode\phase2-review-remediation-mutations.json`.
+- A1–A4 mutation checks were each run against one reversed guard and killed; the clean controls were rerun after restore. Private report: `<local temp>/opencode/phase2-review-remediation-mutations.json`.
 - Real-CLI matrix status: §15.1 item 11 is covered through `run --batch --config` for safe sharing, independent acceptance, blocked and awaiting-human stop, model mismatch, initial mixed-workdir rejection, and mid-batch workdir rejection. §15.1 item 15 is covered through `watch --config` and/or real `stop --tasks-dir` for discovery, idle silence, burst coalescing, second-watcher refusal, graceful active-turn drain, eligible grouping with an ineligible head, and boundary arrival.
 - The real-CLI idle test records `prompt`, `start`, `resolveModel`, `contextUsage`, `contextLimit`, `sessionUsage`, and `canResumeSession`, observes multiple scheduling scans, and asserts the entire adapter call log is empty.
 - Final pre-review offline gates: `npm test` 615 passed / 1 skipped across 63 files; `npx tsc --noEmit` clean; `git diff --check` clean; `scripts/smoke.ps1` without `-Live` passed.
@@ -220,7 +220,7 @@ Update this plan with test counts, gate results, review verdict and report path.
 
 ### First re-review and Nit closure
 
-- First remediation re-review (`6906383...09e5f7d`): **CHANGES REQUESTED**, 0 Blockers, 0 Majors, 3 Nits. Report: `~/.xg-reviews\task-manager\20261124T091401Z\code_review_report.md`.
+- First remediation re-review (`6906383...09e5f7d`): **CHANGES REQUESTED**, 0 Blockers, 0 Majors, 3 Nits. Report: `~/.xg-reviews/task-manager/20261124T091401Z/code_review_report.md`.
 - Its A1/A2 duplicates were closed by `83c7442` and `25d970e`; its A3 evidence contradiction was closed by `4fec2a4`.
 - Post-Nit offline gates at `4fec2a4`: 70 focused batch/watch tests passed; `npm test` 615 passed / 1 skipped across 63 files; `npx tsc --noEmit` clean; `git diff --check` clean; `scripts/smoke.ps1` without `-Live` passed. No live backend was run.
 
@@ -230,5 +230,5 @@ Update this plan with test counts, gate results, review verdict and report path.
 - Its companion readiness duplication and the fourth review's fixture duplication were closed by `984f90f` and `4675495`.
 - Fifth review (`6906383...4675495`): Spec lens passed with zero findings across 23 traced requirements. Standards lens returned two Nit-only test-organization findings, both survived falsification.
 - Owner stopping rule recorded 2026-11-24: Blockers and Majors gate offline acceptance; Nit-only standards findings are accepted quality debt and do not force another review round. Protocol verdict remains **CHANGES REQUESTED**, offline acceptance under the amended gate is **accepted**.
-- Final review report: `~/.xg-reviews\task-manager\20261124T095854Z\code_review_report.md`.
+- Final review report: `~/.xg-reviews/task-manager/20261124T095854Z/code_review_report.md`.
 - Final offline gates at `4675495`: 71 focused batch/watch tests passed; `npm test` 616 passed / 1 skipped across 63 files; `npx tsc --noEmit` clean; `git diff --check` clean; `scripts/smoke.ps1` without `-Live` passed. Real OpenCode reuse/probe/usage remains unverified.
