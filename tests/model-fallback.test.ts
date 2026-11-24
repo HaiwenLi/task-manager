@@ -184,7 +184,7 @@ describe("worker model fallback", () => {
     await run(adapter(dead, models), [], { modelFallbacks: ["w/two"], modelCooldownMs: 0 });
     await store.updateFields("a", { retries: 0 });
     await store.setStatus("a", "open");
-    const healthy = { turns: { "w/one": "done", "w/two": "done" }, reviews: { "(default)": PASS_VERDICT } };
+    const healthy = { turns: { "w/one": "done", "w/two": "done" }, reviews: { "(default)": PASS_VERDICT } } satisfies Parameters<typeof adapter>[0];
     await run(adapter(healthy, models), [], { modelFallbacks: ["w/two"], modelCooldownMs: 0 });
 
     expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one", "w/two", "w/two"]);

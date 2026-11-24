@@ -69,8 +69,11 @@ async function run(deps: { acceptance: () => Promise<AcceptanceResult> }, overri
   return runTask(config(overrides), { store, adapter: adapter(), ...deps, review: passingReview }, await store.get("a"), "w1");
 }
 
-/** What the harness prints: same failure, different clock, checkout and duration. */
-const sameFailure = (attempt: number, root: string): string => [
+/**
+ * What the harness prints: same failure, different clock, checkout and duration.
+ * `root` is optional: the breaker cases below pass none.
+ */
+const sameFailure = (attempt: number, root?: string): string => [
   `[2026-11-17T0${attempt}:12:${String(10 + attempt).padStart(2, "0")}.489Z] bio-check starting`,
   `$ ${root}\\tests\\run_bio.m`,
   "FAIL bio similarity 0.41 below the 0.90 gate",

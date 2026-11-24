@@ -190,6 +190,11 @@ describe("records that a later decision depends on", () => {
     const seen: Array<string | undefined> = [];
     let cutOff = true;
     const backend: AgentAdapter = {
+      // Required by the interface. Every turn goes through `start`, which the
+      // worker and the reviewer both prefer when a backend has one.
+      prompt: async () => {
+        throw new Error("must not use the legacy prompt path");
+      },
       start: (args): Execution<PromptResult> => {
         seen.push(args.sessionId);
         let state: "running" | "exited" = "running";

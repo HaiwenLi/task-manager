@@ -451,7 +451,7 @@ taskctl retry --task <id>       # 归档旧证据后重开；仅在 attempt 已 
 
 ```bash
 npm test                # 全部单元/集成测试（不碰真实 opencode）
-npx tsc --noEmit         # TypeScript 检查
+npm run typecheck       # TypeScript 检查：src、tests、scripts 和 vitest.config.ts
 TASKCTL_E2E=1 npx vitest run tests/e2e.smoke.test.ts   # E2E 冒烟（真实 opencode）
 ```
 

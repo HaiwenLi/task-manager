@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { assert, describe, expect, it, beforeEach, afterEach } from "vitest";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +22,7 @@ describe("runAcceptance", () => {
     const result = await runAcceptance("echo gate-ok", cwd);
 
     expect(result).toMatchObject({ passed: true, exitCode: 0, skipped: false });
+    assert(!result.skipped); // the gate ran, so there is output to inspect
     expect(result.output).toContain("gate-ok");
   });
 
@@ -38,6 +39,7 @@ describe("runAcceptance", () => {
     const result = await runAcceptance(command, cwd);
 
     expect(result.passed).toBe(false);
+    assert(!result.skipped); // failed rather than skipped: only a skipped gate has no output
     expect(result.output).toContain("boom");
   });
 

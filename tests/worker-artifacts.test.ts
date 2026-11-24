@@ -76,6 +76,7 @@ function task(overrides: Partial<Task> = {}): Task {
     status: "open",
     criteria: ["C1 fixture"],
     complexity: "complex",
+    execution: "iterative",
     risk: "normal",
     dependsOn: [],
     humanCheck: false,

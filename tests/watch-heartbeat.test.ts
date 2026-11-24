@@ -43,7 +43,7 @@ const errno = (code: string): NodeJS.ErrnoException => Object.assign(new Error(`
 
 let root: string;
 let tasks: string;
-let store: TaskStore;
+let store: InstanceType<typeof TaskStore>;
 let cfg: WorkerConfig;
 let listeners: Map<string, () => void>;
 let watchFs: NonNullable<WatchOptions["watchFs"]>;

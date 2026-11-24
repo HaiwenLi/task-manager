@@ -55,6 +55,10 @@ class FakeStore {
     this.markers.delete(id);
   }
 
+  async incReviewRounds(id: string): Promise<number> {
+    return ++this.tasks.get(id)!.reviewRounds;
+  }
+
   /** 测试助手：模拟 agent 运行 taskctl done。 */
   requestDone(id: string): void {
     this.markers.add(id);

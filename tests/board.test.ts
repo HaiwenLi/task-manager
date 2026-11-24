@@ -10,7 +10,7 @@ import { runCli } from "../src/cli.js";
 
 const now = new Date("2026-11-16T02:50:00Z");
 
-function task(overrides: Parameters<typeof buildTaskFile>[0] = {}) {
+function task(overrides: Partial<Parameters<typeof buildTaskFile>[0]> = {}) {
   return buildTaskFile({ id: "001", title: "任务", ...overrides });
 }
 

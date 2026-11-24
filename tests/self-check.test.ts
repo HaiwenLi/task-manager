@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, assert, beforeEach, describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,12 +32,14 @@ describe("worker self-check", () => {
   it("runs in generate mode and captures the result", async () => {
     const result = await runSelfCheck({ command: nodePrint("self-check-ok"), cwd: work, timeoutMs: 2_000 });
     expect(result).toMatchObject({ passed: true, exitCode: 0, skipped: false });
+    assert(!result.skipped); // the check ran, so there is output to inspect
     expect(result.output).toContain("self-check-ok");
   });
 
   it("retains partial output after a bounded timeout and confirmed stop", async () => {
     const result = await runSelfCheck({ command: nodePrintAndHang("before-self-check-timeout"), cwd: work, timeoutMs: 25 });
     expect(result.passed).toBe(false);
+    assert(!result.skipped); // timed out rather than skipped: exit code and output exist
     expect(result.exitCode).toBeNull();
     expect(result.output).toContain("timed out");
     expect(result.output).toContain("before-self-check-timeout");
