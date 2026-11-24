@@ -98,19 +98,42 @@ Implementation notes the plan did not fix:
 
 **Files:** `src/split.ts` (new), `src/review.ts`; test `tests/split.test.ts`
 
-- [ ] Write failing tests for id allocation, key-to-id mapping, and every rejection: unknown/self/cyclic
+- [x] Write failing tests for id allocation, key-to-id mapping, and every rejection: unknown/self/cyclic
       references, missing criteria, `mechanical` without a command, `render` without targets, duplicate or
       malformed keys, dropped parent criteria, nested split, non-JSON output.
-- [ ] Implement the planner prompt, parser and validation; record the plan with the parent's definition digest.
+- [x] Implement the planner prompt, parser and validation; record the plan with the parent's definition digest.
 
 ### Task 5: Idempotent publication
 
 **Files:** `src/split.ts`; test `tests/split.test.ts`
 
-- [ ] Write failing tests for publication order, gating after publication, resume after a crash before the parent
+- [x] Write failing tests for publication order, gating after publication, resume after a crash before the parent
       link, byte-identical re-apply after it, and refusal on a non-draft parent, a stale digest, a differing
       existing child, or a colliding unrelated task.
-- [ ] Implement `applySplitPlan`.
+- [x] Implement `applySplitPlan`.
+
+**Evidence (2026-11-24), Tasks 4–5:** `tests/split-plan.test.ts` 36 tests (17 of them the rejection table); full
+suite 534 passed / 1 skipped; `npx tsc --noEmit` clean. Mutation check, control and restore clean, 16 reversals:
+stale parent digest, forgotten link record, differing child, unrelated task on a planned id, non-draft parent,
+orphaned child, dropped final criterion, criteria taken from the plan instead of the parent, child cycles,
+`mechanical` without a command, dependency outside the plan, lowered risk, dropped human gate, child published
+without `parent_id`, nested split, and an unreadable plan read as "none" were each killed by the test named
+for them.
+
+Implementation notes the plan did not fix:
+
+- The planner names children by a `key`; taskctl allocates ids after the board's highest number and stores them
+  in the plan. An "id already taken" branch in the allocator turned out to be unreachable by construction and
+  was removed rather than left as untested code; the real protection is at apply time, where an existing id can
+  be told apart from a matching child.
+- `validateSplitPlan` is the one judge of what a plan must satisfy, used for a fresh plan and for one read back
+  from disk. Parsing is lenient on purpose, so a hand-edited plan is held to exactly the rules a model's is.
+- The parent's final criteria are kept by construction at apply time: they are copied from the parent, never
+  from the plan. A hand-edited plan therefore cannot drop one, however it was edited.
+- Re-applying after the parent was hand-edited is a no-op, not a refusal. The link record identifies the
+  plan; past that point the parent is the person's to edit before signing.
+- Three write sites needed their directory created: `writeRuntime` does not, and a draft parent can be a bare
+  file with no task directory yet.
 
 ### Task 6: Command, visibility, end-to-end proof, documentation
 

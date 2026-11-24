@@ -291,7 +291,7 @@ function degraded(ids: string[], reason: string): ReviewResult {
 }
 
 /** Try the fenced block first, then the outermost braces; null when neither parses. */
-function extractJson(text: string): Record<string, unknown> | null {
+export function extractJson(text: string): Record<string, unknown> | null {
   const candidates: string[] = [];
   const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
   if (fenced?.[1]) candidates.push(fenced[1]);
