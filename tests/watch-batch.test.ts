@@ -12,8 +12,8 @@ import { watchQueue } from "../src/watch.js";
 import type { WorkerConfig, WorkerDeps, WorkerEvent } from "../src/worker.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
 import {
-  createWatchEventSeam, markDoneTask, passAcceptance, requestStopThroughFile,
-  runWatchCli, waitForConditionAsync,
+  createWatchEventSeam, doneAdapter, passAcceptance, requestStopThroughFile,
+  runWatchCli, waitForConditionAsync, workerConfigFixture,
 } from "./helpers/watch-fixture.js";
 
 let root: string;
@@ -35,20 +35,18 @@ async function seed(definition: Task): Promise<void> {
 }
 
 function adapter(): AgentAdapter {
-  return {
+  return doneAdapter({
+    tasksDir: tasks,
+    sessionId: (id, args) => args.sessionId ?? `ses-${id}`,
+    beforeResult: async (args, id) => {
+      turns.push({ id, sessionId: args.sessionId, text: args.text });
+      await onTurn?.(id);
+    },
     canResumeSession: async (sessionId) => {
       probeCalls.push(sessionId);
       return "reusable";
     },
-    prompt: async (args) => {
-      const id = await markDoneTask(args.text, tasks);
-      turns.push({ id, sessionId: args.sessionId, text: args.text });
-      await onTurn?.(id);
-      return { sessionId: args.sessionId ?? `ses-${id}`, exitCode: 0, text: "done" };
-    },
-    contextUsage: async () => 0,
-    contextLimit: async () => 100,
-  };
+  });
 }
 
 const reviewFor: NonNullable<WorkerDeps["review"]> = async (evidence) => {
@@ -102,16 +100,7 @@ beforeEach(async () => {
   await mkdir(work);
   store = new TaskStore(tasks);
   ({ listeners, watchFs } = createWatchEventSeam());
-  cfg = {
-    tasksDir: tasks,
-    workdir: work,
-    agent: "fixture",
-    model: "w/one",
-    contextThreshold: 0.8,
-    retryLimit: 1,
-    lockTtlMs: 5_000,
-    heartbeatMs: 20,
-  };
+  cfg = workerConfigFixture({ tasksDir: tasks, workdir: work, lockTtlMs: 5_000, heartbeatMs: 20 });
   turns = [];
   probeCalls = [];
   reviewed = [];

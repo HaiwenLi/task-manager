@@ -8,7 +8,7 @@ import { readRuntime } from "../src/runtime.js";
 import { serializeTaskFile, type Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
-import { markDoneTask, passAcceptance } from "./helpers/watch-fixture.js";
+import { doneAdapter, passAcceptance, writeBatchConfig } from "./helpers/watch-fixture.js";
 
 let root: string;
 let tasks: string;
@@ -23,16 +23,14 @@ async function seed(definition: Task): Promise<void> {
 }
 
 function adapter(onTurn?: (id: string) => Promise<void>): AgentAdapter {
-  return {
-    prompt: async (args) => {
-      const id = await markDoneTask(args.text, tasks);
+  return doneAdapter({
+    tasksDir: tasks,
+    sessionId: (id) => `s-${id}`,
+    beforeResult: async (_args, id) => {
       turns.push(id);
       await onTurn?.(id);
-      return { sessionId: `s-${id}`, exitCode: 0, text: "done" };
     },
-    contextUsage: async () => 0,
-    contextLimit: async () => 100,
-  };
+  });
 }
 
 const acceptance = passAcceptance;
@@ -53,15 +51,7 @@ beforeEach(async () => {
   await mkdir(tasks);
   await mkdir(work);
   store = new TaskStore(tasks);
-  configPath = join(root, "taskctl.json");
-  await writeFile(configPath, JSON.stringify({
-    tasksDir: tasks,
-    workdir: work,
-    model: "w/one",
-    retryLimit: 1,
-    lockTtlMs: 20_000,
-    heartbeatMs: 1_000,
-  }), "utf8");
+  configPath = await writeBatchConfig(root, { tasksDir: tasks, workdir: work });
   turns = [];
   errors = [];
   await seed(task("a"));

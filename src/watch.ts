@@ -169,7 +169,6 @@ async function scheduleOnce(
         ? "worked"
         : "wait";
     }
-    const done = new Set(board.filter((task) => task.status === "done").map((task) => task.id));
     candidate = selected.length === 1
       ? board.find((task) => task.id === selected[0])
       : readyTasks(board)[0];

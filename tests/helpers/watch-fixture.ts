@@ -3,8 +3,70 @@ import { join } from "node:path";
 import type { AgentAdapter } from "../../src/adapters/types.js";
 import type { AcceptanceResult } from "../../src/acceptance.js";
 import { runCli, type CliDeps } from "../../src/cli.js";
+import { controlDir } from "../../src/watch-lock.js";
 import { stopRequestPath, type WatchFs, type WatchOptions } from "../../src/watch.js";
-import type { WorkerDeps } from "../../src/worker.js";
+import type { WorkerConfig, WorkerDeps } from "../../src/worker.js";
+
+/** The shared fake worker turn: same protocol, done marker, result shape and context stubs. */
+export type DoneAdapterOptions = {
+  tasksDir: string;
+  /** Session identity is intentionally suite-specific (reuse vs fresh). */
+  sessionId: (id: string, args: Parameters<AgentAdapter["prompt"]>[0]) => string;
+  /** Suite-specific observation/hooks before the shared successful result resolves. */
+  beforeResult?: (args: Parameters<AgentAdapter["prompt"]>[0], id: string) => Promise<void>;
+  canResumeSession?: NonNullable<AgentAdapter["canResumeSession"]>;
+  sessionUsage?: NonNullable<AgentAdapter["sessionUsage"]>;
+};
+
+export function doneAdapter({
+  tasksDir, sessionId, beforeResult, canResumeSession, sessionUsage,
+}: DoneAdapterOptions): AgentAdapter {
+  return {
+    ...(canResumeSession === undefined ? {} : { canResumeSession }),
+    prompt: async (args) => {
+      const id = await markDoneTask(args.text, tasksDir);
+      await beforeResult?.(args, id);
+      return { sessionId: sessionId(id, args), exitCode: 0, text: "done" };
+    },
+    ...(sessionUsage === undefined ? {} : { sessionUsage }),
+    contextUsage: async () => 0,
+    contextLimit: async () => 100,
+  };
+}
+
+/** The WorkerConfig shape shared by batch/watch tests; timing remains explicit. */
+export function workerConfigFixture({
+  tasksDir, workdir, lockTtlMs = 20_000, heartbeatMs = 1_000,
+}: { tasksDir: string; workdir: string; lockTtlMs?: number; heartbeatMs?: number }): WorkerConfig {
+  return {
+    tasksDir,
+    workdir,
+    agent: "fixture",
+    model: "w/one",
+    contextThreshold: 0.8,
+    retryLimit: 1,
+    lockTtlMs,
+    heartbeatMs,
+  };
+}
+
+/** The taskctl.json shape shared by real-CLI batch/watch tests. */
+export async function writeBatchConfig(
+  root: string,
+  { tasksDir, workdir, lockTtlMs = 20_000, heartbeatMs = 1_000 }: {
+    tasksDir: string; workdir: string; lockTtlMs?: number; heartbeatMs?: number;
+  },
+): Promise<string> {
+  const configPath = join(root, "taskctl.json");
+  await writeFile(configPath, JSON.stringify({
+    tasksDir,
+    workdir,
+    model: "w/one",
+    lockTtlMs,
+    heartbeatMs,
+  }), "utf8");
+  return configPath;
+}
 
 /** Deterministic filesystem-event seam shared by the watch suites. */
 export function createWatchEventSeam(): { listeners: Map<string, () => void>; watchFs: WatchFs } {
@@ -47,6 +109,7 @@ export async function waitForConditionAsync(check: () => Promise<boolean>, timeo
 
 /** Durable stop request plus the deterministic control-directory wakeup. */
 export async function requestStopThroughFile(tasksDir: string, wakeControl?: () => void): Promise<void> {
+  await mkdir(controlDir(tasksDir), { recursive: true });
   await writeFile(stopRequestPath(tasksDir), new Date().toISOString(), "utf8");
   wakeControl?.();
 }
@@ -75,14 +138,9 @@ export type WatchCliFixture = {
 export async function runWatchCli({
   root, tasksDir, workdir, agent, acceptance, watch, review, store, log, err,
 }: WatchCliFixture): Promise<number> {
-  const configPath = join(root, "taskctl.json");
-  await writeFile(configPath, JSON.stringify({
-    tasksDir,
-    workdir,
-    model: "w/one",
-    lockTtlMs: 5_000,
-    heartbeatMs: 20,
-  }), "utf8");
+  const configPath = await writeBatchConfig(root, {
+    tasksDir, workdir, lockTtlMs: 5_000, heartbeatMs: 20,
+  });
   return runCli(["watch", "--config", configPath], {
     adapter: agent,
     acceptance,

@@ -17,8 +17,8 @@ import { stopRequestPath, watchQueue } from "../src/watch.js";
 import type { WorkerConfig, WorkerDeps } from "../src/worker.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
 import {
-  createWatchEventSeam, markDoneTask, passAcceptance, requestStopThroughCli,
-  requestStopThroughFile, runWatchCli, waitForCondition,
+  createWatchEventSeam, doneAdapter, passAcceptance, requestStopThroughCli,
+  requestStopThroughFile, runWatchCli, waitForCondition, workerConfigFixture,
 } from "./helpers/watch-fixture.js";
 
 let root: string;
@@ -39,19 +39,17 @@ async function seed(definition: Task): Promise<void> {
 }
 
 function adapter(): AgentAdapter {
-  return {
-    prompt: async (args) => {
-      const id = await markDoneTask(args.text, tasks);
+  return doneAdapter({
+    tasksDir: tasks,
+    sessionId: (id) => `s-${id}`,
+    beforeResult: async (_args, id) => {
       turns.push(id);
       if (id === "a" && activeStarted !== undefined) {
         activeStarted();
         await new Promise<void>((resolve) => { releaseActive = resolve; });
       }
-      return { sessionId: `s-${id}`, exitCode: 0, text: "done" };
     },
-    contextUsage: async () => 0,
-    contextLimit: async () => 100,
-  };
+  });
 }
 
 /** Every adapter surface is loud: idle proof must show this log stays empty. */
@@ -115,16 +113,7 @@ beforeEach(async () => {
   await mkdir(work);
   store = new TaskStore(tasks);
   ({ listeners, watchFs } = createWatchEventSeam());
-  cfg = {
-    tasksDir: tasks,
-    workdir: work,
-    agent: "fixture",
-    model: "w/one",
-    contextThreshold: 0.8,
-    retryLimit: 1,
-    lockTtlMs: 5_000,
-    heartbeatMs: 20,
-  };
+  cfg = workerConfigFixture({ tasksDir: tasks, workdir: work, lockTtlMs: 5_000, heartbeatMs: 20 });
   turns = [];
   releaseActive = undefined;
   activeStarted = undefined;

@@ -13,7 +13,9 @@ import { TaskStore } from "../src/task-store.js";
 import { readUsage } from "../src/usage.js";
 import { runTask, type WorkerConfig, type WorkerDeps } from "../src/worker.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
-import { markDoneTask, passAcceptance } from "./helpers/watch-fixture.js";
+import {
+  doneAdapter, passAcceptance, workerConfigFixture, writeBatchConfig,
+} from "./helpers/watch-fixture.js";
 
 type Turn = {
   id: string;
@@ -42,19 +44,15 @@ async function seed(...definitions: Task[]): Promise<void> {
 }
 
 function adapter(): AgentAdapter {
-  return {
+  return doneAdapter({
+    tasksDir: tasks,
+    sessionId: (id, args) => args.sessionId ?? (id === "a" ? "ses-shared" : `fresh-${id}`),
+    beforeResult: async (args, id) => {
+      turns.push({ id, sessionId: args.sessionId, cwd: args.cwd, env: args.env, text: args.text });
+    },
     canResumeSession: async (sessionId, expected) => {
       probeCalls.push({ sessionId, expected });
       return probeStatus;
-    },
-    prompt: async (args) => {
-      const id = await markDoneTask(args.text, tasks);
-      turns.push({ id, sessionId: args.sessionId, cwd: args.cwd, env: args.env, text: args.text });
-      return {
-        sessionId: args.sessionId ?? (id === "a" ? "ses-shared" : `fresh-${id}`),
-        exitCode: 0,
-        text: "done",
-      };
     },
     sessionUsage: async () => {
       usageTurns++;
@@ -66,9 +64,7 @@ function adapter(): AgentAdapter {
         cacheWrite: 0,
       };
     },
-    contextUsage: async () => 0,
-    contextLimit: async () => 100,
-  };
+  });
 }
 
 function deps(agent: AgentAdapter = adapter()): WorkerDeps {
@@ -95,26 +91,9 @@ beforeEach(async () => {
   await mkdir(tasks);
   await mkdir(work);
   store = new TaskStore(tasks);
-  configPath = join(root, "taskctl.json");
-  await writeFile(configPath, JSON.stringify({
-    tasksDir: tasks,
-    workdir: work,
-    model: "w/one",
-    retryLimit: 1,
-    lockTtlMs: 20_000,
-    heartbeatMs: 1_000,
-  }), "utf8");
+  configPath = await writeBatchConfig(root, { tasksDir: tasks, workdir: work });
   cliLines = [];
-  cfg = {
-    tasksDir: tasks,
-    workdir: work,
-    agent: "fixture",
-    model: "w/one",
-    contextThreshold: 0.8,
-    retryLimit: 1,
-    lockTtlMs: 20_000,
-    heartbeatMs: 1_000,
-  };
+  cfg = workerConfigFixture({ tasksDir: tasks, workdir: work });
   turns = [];
   probeCalls = [];
   probeStatus = "reusable";
