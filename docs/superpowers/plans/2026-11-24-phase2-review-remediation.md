@@ -197,11 +197,11 @@ Commit the evidence/fixture changes with a `test(phase2)` message. Include the c
 
 Run `npm test`, `npx tsc --noEmit`, `git diff --check`, and `scripts/smoke.ps1` without `-Live`. Confirm `.codegraph/` and the handoff remain uncommitted.
 
-- [ ] **Step 2: Run the complete X-Goldfish workflow**
+- [x] **Step 2: Run the complete X-Goldfish workflow**
 
 Use FixedPoint `6906383`, the new HEAD, the same spec sources, and `README.md + docs/adr/*.md` as standards. Run fresh standards and spec reviewers, then drop-only falsification; write all reports under a new `~/.xg-reviews/task-manager/<utc>/` directory.
 
-- [ ] **Step 3: Close or report findings**
+- [x] **Step 3: Close or report findings**
 
 Any surviving runtime/evidence finding returns to the owning task. Only an offline-clean review may be called offline acceptance; real OpenCode reuse/probe/usage remains explicitly unverified until separately authorized.
 
@@ -217,3 +217,9 @@ Update this plan with test counts, gate results, review verdict and report path.
 - The real-CLI idle test records `prompt`, `start`, `resolveModel`, `contextUsage`, `contextLimit`, `sessionUsage`, and `canResumeSession`, observes multiple scheduling scans, and asserts the entire adapter call log is empty.
 - Final pre-review offline gates: `npm test` 615 passed / 1 skipped across 63 files; `npx tsc --noEmit` clean; `git diff --check` clean; `scripts/smoke.ps1` without `-Live` passed.
 - No live backend, provider, or `-Live` verification was run. This evidence is offline only.
+
+### First re-review and Nit closure
+
+- First remediation re-review (`6906383...09e5f7d`): **CHANGES REQUESTED**, 0 Blockers, 0 Majors, 3 Nits. Report: `~/.xg-reviews\task-manager\20261124T091401Z\code_review_report.md`.
+- Its A1/A2 duplicates were closed by `83c7442` and `25d970e`; its A3 evidence contradiction was closed by `4fec2a4`.
+- Post-Nit offline gates at `4fec2a4`: 70 focused batch/watch tests passed; `npm test` 615 passed / 1 skipped across 63 files; `npx tsc --noEmit` clean; `git diff --check` clean; `scripts/smoke.ps1` without `-Live` passed. No live backend was run.
