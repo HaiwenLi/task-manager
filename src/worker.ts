@@ -3,6 +3,7 @@ import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { claim, heartbeat, lockLive, release, withOwnership, OwnershipLostError } from "./claim.js";
 import { waitReason } from "./eligibility.js";
+import { dependencySummary } from "./dependencies.js";
 import { latestNote, writeNote, type HandoffNote } from "./handoff.js";
 import { startAcceptance, type AcceptanceResult } from "./acceptance.js";
 import { buildWorkerPrompt } from "./protocol.js";
@@ -153,6 +154,8 @@ type Run = {
   sweepSkipNoted: boolean;
   /** Why each model on the dispatch chain refused this attempt, in order. */
   dispatchFailures: Map<string, string>;
+  /** What each dependency produced; computed once per attempt (see `dependenciesOf`). */
+  dependencies?: string | null;
 };
 const emit = (r: Run, type: WorkerEventType, detail?: string) => r.deps.onEvent?.({ type, taskId: r.task.id, detail });
 const owned = <T>(r: Run, fn: () => Promise<T>) => withOwnership(r.cfg.tasksDir, r.task.id, r.owner, fn);
@@ -707,6 +710,20 @@ async function restoreWorkerSession(r: Run, model: string | undefined): Promise<
   return undefined;
 }
 
+/**
+ * Bounded facts about what each dependency produced, for whoever integrates
+ * them. The worker's prompt and the reviewer's evidence share one copy: it is
+ * read once per attempt, because a dependency is `done` before the claim and
+ * cannot change under it.
+ */
+async function dependenciesOf(r: Run): Promise<string | null> {
+  if (r.dependencies === undefined) {
+    const board = await owned(r, async () => r.deps.store.list());
+    r.dependencies = await dependencySummary(r.cfg.tasksDir, r.task, board);
+  }
+  return r.dependencies;
+}
+
 async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
   let sessionId: string | undefined;
   let recordedSession = "", sessionsUsed = r.task.sessions.length, turns = 0;
@@ -722,11 +739,15 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
   // models that refused, but the chain may wrap around to them again.
   await resetChainCycles(r.cfg.tasksDir, r.task.id, "worker");
   let restoreSession = true;
+  // Dependencies are done before the claim and cannot change under it, so
+  // their summary is read once for the whole attempt, not once per turn.
+  const dependencies = await dependenciesOf(r);
   for (;;) {
     const note = await latestNote(r.cfg.tasksDir, r.task.id);
     const prompt = buildWorkerPrompt(r.task, {
       handoff: note?.markdown, workdir: r.cfg.workdir, tasksDir: r.cfg.tasksDir,
       taskDir: taskDirOf(r.cfg.tasksDir, r.task.id), logDir: logDirOf(r.cfg.tasksDir, r.task.id),
+      ...(dependencies === null ? {} : { dependencies }),
     });
     let model: string | undefined;
     try {
@@ -1177,9 +1198,11 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "retry" | "open
   // a non-Git workdir yields explicit unavailable notes instead of blocking
   // the review.
   const changes = await collectChangeEvidence(r.cfg.workdir);
+  const dependencies = await dependenciesOf(r);
   const evidence: ReviewEvidence = {
     task: r.task,
     spec: (await readSpec(r.cfg.tasksDir, id)) ?? "",
+    ...(dependencies === null ? {} : { dependencies }),
     acceptanceMarkdown: acceptance === null ? "" : renderAcceptance(acceptance),
     handoff: (await latestNote(r.cfg.tasksDir, id))?.markdown ?? null,
     journal: await journalTail(r.cfg.tasksDir, id, 30),

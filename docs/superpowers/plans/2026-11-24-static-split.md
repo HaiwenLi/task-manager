@@ -76,9 +76,23 @@ Implementation notes the plan did not fix:
 
 **Files:** `src/dependencies.ts` (new), `src/protocol.ts`, `src/review.ts`, `src/worker.ts`; test `tests/dependencies.test.ts`
 
-- [ ] Write failing tests showing a task with dependencies receives a bounded summary (id, title, verdict,
+- [x] Write failing tests showing a task with dependencies receives a bounded summary (id, title, verdict,
       handoff status, artifact paths, evidence location) and a task without dependencies receives none.
-- [ ] Implement the summary builder and inject it into the worker prompt and the review evidence.
+- [x] Implement the summary builder and inject it into the worker prompt and the review evidence.
+
+**Evidence (2026-11-24), Task 3:** `tests/dependencies.test.ts` 8 tests; full suite 498 passed / 1 skipped;
+`npx tsc --noEmit` clean. Mutation check, control and restore clean: the worker injection, the review-evidence
+injection, the total bound, the missing-id guard, "status line only, not the handoff's findings", and the
+no-dependency render of the verbatim protocol were each killed by the test named for them.
+
+Implementation notes the plan did not fix:
+
+- The protocol copy is spec-fixed and pinned verbatim by `tests/protocol.test.ts`. A first attempt put the
+  conditional on its own line inside the template, which left one extra blank line for every task; the pinned
+  test caught it. The expression now sits at the end of the preceding line, so a task without dependencies
+  renders byte-for-byte as before.
+- The summary carries a dependency's status line and file list, not its findings or next steps: those are the
+  predecessor's working notes, and replaying them invites the integrator to inherit stale plans.
 
 ### Task 4: Planning
 

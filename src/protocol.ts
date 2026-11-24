@@ -16,6 +16,13 @@ export type WorkerPromptContext = {
   taskDir: string;
   /** Absolute path the worker must write logs and temp files to (= `$TASKCTL_LOG_DIR`). */
   logDir: string;
+  /**
+   * What each dependency produced before this task became ready: id, title,
+   * final state, the status line of its latest handoff, the files that
+   * handoff names, and where its evidence is. Absent when the task depends on
+   * nothing.
+   */
+  dependencies?: string;
 };
 
 /** Shown instead of a handoff note when the task is on its first session. */
@@ -45,7 +52,11 @@ ${task.description}
 - 若任务声明了 worker_self_check，用 taskctl check --task ${task.id} --tasks-dir "${ctx.tasksDir}" 执行，不要用 shell 绕过超时
 - 若任务实际比声明更复杂，单独输出一行 ESCALATE: <原因>；只能升级管理强度，不能自行降低验收标准
 - 若收到"上下文预算告急"的收尾指令：立即运行一次 taskctl note（尽量详尽，同上参数），然后只回复 HANDOFF_READY
-
+${ctx.dependencies === undefined ? "" : `
+## 依赖任务的结果（已完成的前置任务；只给结论与出处，不含它们的对话）
+${ctx.dependencies}
+不要重做这些任务，也不要改它们的定义或任务文件；需要细节时读上面列出的产物和证据文件。
+`}
 ## 上一段会话的交接笔记
 ${handoff}
 `;

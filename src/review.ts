@@ -58,6 +58,13 @@ export type ReviewEvidence = {
    * five criteria came back "cannot decide" for exactly that reason).
    */
   acceptanceLogPath?: string;
+  /**
+   * What the tasks this one builds on produced (see `dependencySummary`).
+   * Present only for a task with dependencies: an integrating task is judged
+   * on how it put the parts together, so the reviewer is told what the parts
+   * were and where their evidence lives, instead of re-judging them.
+   */
+  dependencies?: string;
 };
 
 /** How much of the acceptance log rides in the prompt (head and tail). */
@@ -111,6 +118,12 @@ export function buildReviewPrompt(evidence: ReviewEvidence): string {
     "",
     "## spec",
     evidence.spec.trim(),
+    ...(evidence.dependencies === undefined ? [] : [
+      "",
+      "## 依赖任务的结果（本任务所整合的前置任务；只列结论与出处）",
+      evidence.dependencies,
+      "这些任务已各自验收；本条复核判断的是整合，不是重判它们。",
+    ]),
     "",
     "## 验收命令与结果",
     clip(evidence.acceptanceMarkdown.trim(), ACCEPTANCE_CLIP_CHARS) || "(没有验收记录)",
