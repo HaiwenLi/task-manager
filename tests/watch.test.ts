@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -461,19 +461,10 @@ describe("watch and stop CLI parsing", () => {
   });
 
   it("discovers work through the real watch CLI and drains through the real stop CLI", async () => {
-    const configPath = join(root, "taskctl.json");
-    await writeFile(configPath, JSON.stringify({
-      tasksDir: tasks,
-      workdir: work,
-      model: "w/one",
-      lockTtlMs: 5_000,
-      heartbeatMs: 20,
-    }), "utf8");
     const errors: string[] = [];
-    const running = runCli(["watch", "--config", configPath], {
-      adapter: adapter(),
-      acceptance: async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" }),
-      log: () => {},
+    const running = runWatchCli({
+      root, tasksDir: tasks, workdir: work, agent: adapter(),
+      acceptance: passAcceptance,
       err: (line) => { errors.push(line); },
       watch: { watchFs, fallbackMs: 1_000, debounceMs: 5 },
     });
@@ -487,5 +478,11 @@ describe("watch and stop CLI parsing", () => {
     expect(errors).toEqual([]);
     expect(turns).toEqual(["a"]);
     expect((await store.get("a")).status).toBe("done");
+    const logsDir = join(tasks, "a", "logs");
+    const logs = (await readdir(logsDir)).filter((name) => /^run-.+\.log$/.test(name));
+    expect(logs).toHaveLength(1);
+    const events = await readFile(join(logsDir, logs[0]!), "utf8");
+    expect(events).toContain("[a] claimed");
+    expect(events).toContain("[a] done");
   });
 });

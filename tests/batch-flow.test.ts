@@ -35,13 +35,26 @@ function adapter(onTurn?: (id: string) => Promise<void>): AgentAdapter {
 
 const acceptance = passAcceptance;
 
-async function cli(args: string[], agent: AgentAdapter): Promise<number> {
-  return runCli(args, {
+async function cli(
+  args: string[],
+  agent: AgentAdapter,
+  review?: () => Promise<void>,
+): Promise<{ code: number; reviews: number }> {
+  let reviews = 0;
+  const code = await runCli(args, {
     adapter: agent,
     acceptance,
+    review: async () => {
+      reviews++;
+      if (review === undefined) {
+        throw new Error("unexpected review for a mechanical continuous batch task");
+      }
+      await review();
+    },
     log: () => {},
     err: (line) => { errors.push(line); },
   });
+  return { code, reviews };
 }
 
 beforeEach(async () => {
@@ -65,9 +78,10 @@ afterEach(async () => {
 
 describe("taskctl run --batch", () => {
   it("runs two tasks with independent acceptance records and leaves an unselected task open", async () => {
-    const code = await cli(["run", "--batch", "a,b", "--config", configPath], adapter());
+    const { code, reviews } = await cli(["run", "--batch", "a,b", "--config", configPath], adapter());
 
     expect(code).toBe(0);
+    expect(reviews).toBe(0);
     expect(turns).toEqual(["a", "b"]);
     expect((await store.get("a")).status).toBe("done");
     expect((await store.get("b")).status).toBe("done");
@@ -80,7 +94,7 @@ describe("taskctl run --batch", () => {
   it("rejects the whole selection before spending a worker turn", async () => {
     await seed(task("b", { execution: "iterative" }));
 
-    const code = await cli(["run", "--batch", "a,b", "--config", configPath], adapter());
+    const { code } = await cli(["run", "--batch", "a,b", "--config", configPath], adapter());
 
     expect(code).toBe(1);
     expect(turns).toEqual([]);
@@ -92,7 +106,7 @@ describe("taskctl run --batch", () => {
   it("rejects an initially mixed-workdir selection before spending a worker turn", async () => {
     await seed(task("b", { workdir: "elsewhere" }));
 
-    const code = await cli(["run", "--batch", "a,b", "--config", configPath], adapter());
+    const { code } = await cli(["run", "--batch", "a,b", "--config", configPath], adapter());
 
     expect(code).toBe(1);
     expect(turns).toEqual([]);
@@ -107,7 +121,7 @@ describe("taskctl run --batch", () => {
       await seed(task("b", { workdir: "elsewhere" }));
     });
 
-    const code = await cli(["run", "--batch", "a,b,c", "--config", configPath], agent);
+    const { code } = await cli(["run", "--batch", "a,b,c", "--config", configPath], agent);
 
     expect(code).toBe(1);
     expect(turns).toEqual(["a"]);
@@ -119,7 +133,7 @@ describe("taskctl run --batch", () => {
   });
 
   it("does not fall through to the ordinary scheduler after the selection finishes", async () => {
-    const code = await cli(["run", "--batch", "a", "--config", configPath], adapter());
+    const { code } = await cli(["run", "--batch", "a", "--config", configPath], adapter());
 
     expect(code).toBe(0);
     expect(turns).toEqual(["a"]);

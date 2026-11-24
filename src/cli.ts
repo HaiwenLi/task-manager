@@ -3,7 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import { LOCK_TTL_MS_DEFAULT } from "./claim.js";
 import { latestNote, writeNote } from "./handoff.js";
 import { TaskStore } from "./task-store.js";
-import { runTask, runWorker, type WorkerConfig, type WorkerDeps } from "./worker.js";
+import { runTask, runWorker, type WorkerConfig, type WorkerDeps, type WorkerEvent } from "./worker.js";
 import { runScheduler } from "./scheduler.js";
 import { OpenCodeAdapter } from "./adapters/opencode.js";
 import type { AgentAdapter } from "./adapters/types.js";
@@ -50,6 +50,69 @@ export type CliDeps = {
 
 /** Resolved `taskctl.json` — a WorkerConfig plus the adapter's binary name. */
 type ResolvedConfig = WorkerConfig & { opencodeBin?: string };
+
+/**
+ * Evidence plumbing shared by every long-running controller. `run` and `watch`
+ * must produce the same per-task event lines and board lifecycle; only the
+ * controller behind the deps differs.
+ */
+type ControllerTelemetry = {
+  refreshBoard: () => void;
+  writeLogLine: (taskId: string, line: string) => void;
+  /** Settle the trailing board refresh and queued log writes. */
+  flush: () => Promise<void>;
+};
+
+function workerEventLine(evt: WorkerEvent): string {
+  return `[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`;
+}
+
+async function createControllerTelemetry(cfg: ResolvedConfig, teeTarget?: string): Promise<ControllerTelemetry> {
+  const runStamp = new Date().toISOString().replaceAll(":", "-");
+  if (teeTarget !== undefined) {
+    await mkdir(dirname(teeTarget), { recursive: true });
+    await writeFile(teeTarget, "", { flag: "a" });
+  }
+  const boardRefresh = createCoalescedRefresh(() => refreshBoardFile(cfg.tasksDir));
+  let logJob: Promise<unknown> = Promise.resolve();
+  return {
+    refreshBoard: boardRefresh.request,
+    writeLogLine: (taskId, line) => {
+      const target = teeTarget ?? join(cfg.tasksDir, taskId, "logs", `run-${runStamp}.log`);
+      logJob = logJob.then(async () => {
+        await mkdir(dirname(target), { recursive: true });
+        await appendFile(target, `${new Date().toISOString()}  ${line}\n`, "utf8");
+      }).catch(() => {
+        // A log write that cannot happen must not take the controller down.
+      });
+    },
+    flush: async () => {
+      boardRefresh.request();
+      await boardRefresh.flush();
+      await logJob;
+    },
+  };
+}
+
+function createWorkerDeps({
+  deps, adapter, store, telemetry, log, review = false,
+}: {
+  deps: CliDeps; adapter: AgentAdapter; store: TaskStore;
+  telemetry: ControllerTelemetry; log: (line: string) => void; review?: boolean;
+}): WorkerDeps {
+  return {
+    store,
+    adapter,
+    ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
+    ...(review && deps.review !== undefined ? { review: deps.review } : {}),
+    onEvent: (evt) => {
+      const line = workerEventLine(evt);
+      log(line);
+      telemetry.writeLogLine(evt.taskId, line);
+      telemetry.refreshBoard();
+    },
+  };
+}
 
 /** Usage problem (unknown command/flag, missing value): exit code 2. */
 class UsageError extends Error {}
@@ -263,40 +326,10 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   // file; by default each task's lines land in its own task dir under logs/.
   // This replaces the external `Tee-Object` into the workspace root that
   // motivated task 006 — the controller now keeps its own hygiene.
-  const runStamp = new Date().toISOString().replaceAll(":", "-");
   const teeTarget = flags.get("log") !== undefined ? resolve(flags.get("log")!) : undefined;
-  if (teeTarget !== undefined) {
-    await mkdir(dirname(teeTarget), { recursive: true });
-    await writeFile(teeTarget, "", { flag: "a" });
-  }
-  let logJob: Promise<unknown> = Promise.resolve();
-  const writeLogLine = (taskId: string, line: string): void => {
-    const target = teeTarget ?? join(cfg.tasksDir, taskId, "logs", `run-${runStamp}.log`);
-    logJob = logJob.then(async () => {
-      await mkdir(dirname(target), { recursive: true });
-      await appendFile(target, `${new Date().toISOString()}  ${line}\n`, "utf8");
-    }).catch(() => {
-      // A log write that cannot happen must not take the run down with it.
-    });
-  };
-  // The board tracks events without rewriting every intermediate state in a
-  // burst: one in-flight refresh and at most one trailing latest refresh.
-  const boardRefresh = createCoalescedRefresh(() => refreshBoardFile(cfg.tasksDir));
-  const refreshBoard = boardRefresh.request;
-  refreshBoard();
-  // Plan Task 9：逐事件打印 [task] 状态 单行日志 —— 事件发生即输出，
-  // 而不是整队跑完再补一份总结
-  const workerDeps: WorkerDeps = {
-    store,
-    adapter,
-    ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
-    onEvent: (evt) => {
-      const line = `[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`;
-      log(line);
-      writeLogLine(evt.taskId, line);
-      refreshBoard();
-    },
-  };
+  const telemetry = await createControllerTelemetry(cfg, teeTarget);
+  telemetry.refreshBoard();
+  const workerDeps = createWorkerDeps({ deps, adapter, store, telemetry, log });
   const batch = flags.get("batch");
   const result = await (async () => {
     try {
@@ -306,9 +339,7 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
     } finally {
       // Validation can fail before any event. Still settle the trailing board
       // refresh and queued log writes before the CLI returns or throws.
-      refreshBoard();
-      await boardRefresh.flush();
-      await logJob;
+      await telemetry.flush();
     }
   })();
   if (batch !== undefined && "stoppedAt" in result && result.stoppedAt !== undefined) {
@@ -328,23 +359,13 @@ async function watchCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
   const cfg = await configFor(flags);
   const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
   const store = deps.store ?? new TaskStore(cfg.tasksDir);
-  const boardRefresh = createCoalescedRefresh(() => refreshBoardFile(cfg.tasksDir));
-  const refreshBoard = boardRefresh.request;
-  refreshBoard();
+  const telemetry = await createControllerTelemetry(cfg);
+  telemetry.refreshBoard();
   try {
-    await watchQueue(cfg, {
-      store,
-      adapter,
-      ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
-      ...(deps.review === undefined ? {} : { review: deps.review }),
-      onEvent: (evt) => {
-        log(`[${evt.taskId}] ${evt.type}${evt.detail ? ` ${evt.detail}` : ""}`);
-        refreshBoard();
-      },
-    }, { ...deps.watch, resume: flags.has("resume") });
+    await watchQueue(cfg, createWorkerDeps({ deps, adapter, store, telemetry, log, review: true }),
+      { ...deps.watch, resume: flags.has("resume") });
   } finally {
-    refreshBoard();
-    await boardRefresh.flush();
+    await telemetry.flush();
   }
   return 0;
 }
