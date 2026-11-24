@@ -95,7 +95,7 @@ retries: 0
 | `complexity` | | `simple`（不停下等签字）或 `complex`（默认，出稿等签字）。只决定入口审批，不决定执行策略 |
 | `execution` | | `continuous` 或 `iterative`；缺省时 simple → continuous、complex → iterative。continuous 先用一个 worker 回合完成，失败/变复杂才升级；iterative 在同一工作上下文中进行有界验收与复核返工 |
 | `worker_self_check` | | worker 可选的有界自验/生成命令，只能经 `taskctl check` 执行；与控制器负责的 `acceptance` 分离 |
-| `worker_self_check_timeout_ms` | | `worker_self_check` 的超时；未声明时取 min(20 分钟, 回合上限)。声明值不得超过回合上限——以领取时写进 `attempt.json` 的 `turnTimeoutMs` 为准 |
+| `worker_self_check_timeout_ms` | | `worker_self_check` 的超时；未声明时取 min(20 分钟, 回合上限)。声明值不得超过回合上限——以领取时写进 `attempt.json` 的 `turnTimeoutMs` 为准；超限的声明值在解析和领取时都会被接受，直到 worker 调用 `taskctl check` 才被拒绝 |
 | `risk` | | `high` 时复核通过也要人工 `accept` |
 | `workdir` | | 本任务的工作目录（相对配置里的 `workdir`）；同一目录同时只跑一个任务 |
 | `keep_at_root` | | 根目录文件名 glob 列表，命中者**豁免回合后清扫**（如 `run.log`）。不进 `definitionDigest`：它决定杂物停哪儿，不决定"做完"是什么 |
@@ -163,7 +163,7 @@ taskctl approve --task <id>                      # 修订后的定义要重新�
 
 - **continuous**：先给一个完整 worker 回合（其中可有很多工具调用）。未请求完成、验收失败、Review fail、显式 `ESCALATE:` 或需要交接时才升级为 iterative；不会先空转到默认 40 回合。
 - **iterative**：验收失败会把退出码、输出尾部和失败指纹写进交接笔记；同模型时续用当前 worker session 返工，provider 切换仍强制新 session。普通 Review fail 在同一 claim 内继续，不再先回 `open` 等调度器重新认领。
-- **Reviewer 不可用**：不增加 worker retry，也不重放已成功的 worker/验收。任务以 `blocked + review-pending.json` 保留现场；换到健康 Reviewer 后执行 `taskctl retry --task <id> --review-only`，定义和产物摘要一致才只跑 Review。
+- **Reviewer 不可用**：不增加 worker retry，也不重放已成功的 worker/验收。任务以 `blocked + review-pending.json` 保留现场；换到健康 Reviewer 后执行 `taskctl retry --task <id> --review-only`，定义和产物摘要一致才只跑 Review。恢复时评审员看到的时间窗是**产出这些证据的那次尝试**的时间窗（第一次保留现场时记进 `review-pending.json`），不是恢复这次尝试的。
 - **没有 criteria**：即使需要 Review，也不会让 reviewer 凭空判断；quick 等无判据任务仍转 `awaiting-human`。
 
 ## 复核流水线
@@ -397,7 +397,7 @@ npx tsx src/main.ts status [--tasks-dir <dir>]
 
 每任务一行：id、status、retries、sessions 数、最新笔记的 Status 行。没有 `schema: taskctl/v1` 的 Markdown（或 frontmatter 解析不了的文件）单独列为 `ignored`，不参与调度。
 
-看板文件 `.taskctl/board.md` 是每次 `status` 重新生成的派生视图；Windows 上杀软/索引器偶尔会短暂占用它（EPERM/EBUSY/EACCES），写入会重试，耗尽后只影响这一次看板刷新，任务状态不受影响。运行中的事件刷新会合并突发写入，只保留正在写的一次和最后一次最新状态。
+所有「写临时文件、再改名覆盖」的落盘——任务文件、`attempt.json` 等运行记录、任务锁与 watch 锁的心跳、模型轮转、共享冷却表、usage、看板——都走同一个带重试的改名（`src/replace.ts`）：Windows 上杀软/索引器偶尔会短暂占用目标文件（EPERM/EBUSY/EACCES），重试耗尽才报错。心跳写失败**不等于**所有权丢失：只有锁记录不再属于自己（`heartbeat` 返回 false，或受保护写入前的所有权检查失败）才结束尝试或 watcher；写不进去不会被当成丢锁：任务尝试记一条 `heartbeat-write-failed` 日志（每个尝试一条），watch 报告一次（每次 watch 一条），下一个心跳周期重试。看板文件 `.taskctl/board.md` 是每次 `status` 重新生成的派生视图，重试耗尽也只影响这一次看板刷新。运行中的事件刷新会合并突发写入，只保留正在写的一次和最后一次最新状态。
 
 `taskctl report --task <id>` 的 `usage` 节按 worker/reviewer 和模型汇总 `usage.jsonl` 的增量。基线保存在看板级 `.taskctl/usage-sessions.json`，因此多个 Task 共享 session 时不会重复计算前一段消耗；计数器重置或后端未提供数据会显示 unknown，而不是伪报零成本。`review.json` 同时记录 `reviewerSessionId`。
 
@@ -485,4 +485,4 @@ Phase 2 的有界真实验证（两任务批次共用一个 session、逐任务 
 
 见 `docs/adr/`（任务存储与文件锁、独立编排器、会话链交接、TypeScript 薄编排器、验收门、车道与验收方式等决策记录）。
 
-**有意没做的事、以及已交付功能的边界**单独记在 [docs/backlog.md](docs/backlog.md)：`tsc` 在本机为何跑不了、`tolerate` 词表缺哪些、降级链没有退避、`retry` 的会话死循环等。做新功能前先看那份——避免把"没做"当成"忘了"，也避免把当前实现信得比实际更足。
+**有意没做的事、以及已交付功能的边界**单独记在 [docs/backlog.md](docs/backlog.md)：`tolerate` 词表缺哪些、降级链没有退避、`retry` 的会话死循环等。那份文件其余部分停在 2026-11-17，开头有一节 2026-11-24 的对账，列出已核实不再成立的条目。做新功能前先看那份——避免把"没做"当成"忘了"，也避免把当前实现信得比实际更足。

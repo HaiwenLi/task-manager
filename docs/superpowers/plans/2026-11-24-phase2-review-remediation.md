@@ -257,3 +257,57 @@ Update this plan with test counts, gate results, review verdict and report path.
 - The same batch evidence was observed on `zhipuai-coding-plan/glm-5.3-flash`: one shared session, a at input 14,472 / cacheRead 27,584 and b at input 771 / cacheRead 44,288.
 - Observed, not asserted: reuse trades input tokens for cache-read tokens, so its saving depends on cache pricing, and the backend reports `cost: 0` for both plan models, so `usage.jsonl` cannot show the saving in currency. A running session reports only `time.busy`; a finished one stamps `time.idle` (probed live at no model cost).
 - Still not verified live: backend cancellation and interrupted-execution recovery, process signals, and a reviewer timeout on a real backend.
+
+### EGM review (2026-11-24)
+
+The owner asked for an Elephant-Goldfish review of the current implementation: the design document and the watch-batch plan, with the README and the source checked against both, through the five review stages with no checkpoint pauses. The reports live outside the repository, in the review's run directory under the session temp folder (private): `consolidated_review_report.md`, one report per stage, and the reviewers' output verbatim. Recorded here is the outcome and its evidence.
+
+- **190 raw findings from 11 completed dispatches over 8 reviewer roles.** Two first dispatches returned an account rate limit and were retried once. Stage 8 was dispatched twice: the first could not open the earlier stage reports, so its re-verification table was empty; the retry, given copies inside the working directory, completed it. The findings consolidate into 38 action items: 12 fixed in code, 1 corrected in documentation, 13 that need an owner decision, 12 of engineering backlog. The mapping was checked by script — every id in the raw reports belongs to at least one action item.
+- **Reviewers read; they did not run.** Every failure trace in a raw report is derived by reading. Each finding below that led to a change was reproduced first.
+- Stages 5, 6, 7 and 9 read the code at `7be83f2`–`d0d5fe3`; fixes were fast-forwarded into `main` between 21:04 and 21:37 while the last reviewers were finishing. Stage 8 read `d3b6172` and re-verified the Stage 5 findings against it: of their 19 Blockers and Majors, 2 resolved, 6 partially resolved, 11 still open, 9 of those owner decisions.
+
+**Fixed from Stages 5, 7 and 9** — each with a regression that failed before it and directed mutations that its tests kill:
+
+| Commit | What was wrong |
+| --- | --- |
+| `4083375` | A controller error inside one task (a reviewer timeout with a confirmed shutdown, a cooldown beginning at acceptance, a backend that cannot be spawned) aborted `run`/`watch` and left a false `uncertain` record with the workspace reservation leaked. It is now confined to the task; `run` drains the board and exits 1. |
+| `dbb9127` | `resume` was missing from `BOOLEAN_FLAGS`, so the documented `watch --resume` exited 2. The production `fs.watch` had no `error` listener. |
+| `05f9e96` | The reuse probe failed open on an unrecognised reply, and a failed `model.list` was cached for the life of the process. |
+| `d118b76` | An unreadable context budget was reported as a silent `false`. |
+| `a031a48` | A timed-out turn left the session recorded as clean; the cooldown note and the parked reviewer model were untruthful; the self-check default could exceed the turn bound. |
+| `9f1e51a` | `taskctl check` read the workspace and the bound from the caller's cwd; review-only recovery ignored the task's `workdir` and wrote no per-task log. |
+| `ab2d015` | A malformed task file, a mid-flight validation error or a lost race ended the watcher. |
+| `d3b6172` | README and plans corrected against the code. |
+
+**Fixed from Stage 8:**
+
+| Commit | What was wrong | How it was known |
+| --- | --- | --- |
+| `fd6507e` | `modelFor` removed the cooling models from the chain and then indexed what was left with an index into the full chain. With three or more models, a partially expired cooldown sent the task back to a model it had been refused on, and the next refusal blocked it as quota-exhausted while a model was healthy. | Derived by reading in the review, then confirmed by regressions that ended `blocked` before the fix. No existing test could see it. |
+| `4dc22c8` | Review-only recovery showed the reviewer the recovery attempt's window, so all of the work read as older than the execution. | Regressions red before the fix. |
+| `2a52084` | Ten file replaces used a bare rename, and both heartbeat loops read a failed write as ownership loss: a refused rename cancelled the running turn and spent a retry, or blocked the task as quota-exhausted. | Not only read. Observed on this machine — `EPERM` on `lock.json.tmp -> lock.json` — with one test file failing 3 of 45 runs; 0 of 45 after the fix. |
+| `ca8760e` | The cooldown note written by `a031a48` claimed an exhausted retry budget on every path, none of which exhausts it. | Caught by the Stage 8 retry; the pinning test's own numbers were the counter-example. |
+
+**Twice a mutation survived its first run** (`4dc22c8`, `2a52084`). Both times the fault was in the new regression — one could not say which of the two heartbeat sites had been refused, one did not pin that a lost lock still ends the attempt — and it was rewritten until each mutation is killed by the test written for it. The 42 mutation records for the fixes of this review are kept in the private file beside those of the earlier rounds.
+
+**Gates at `ca8760e`:** `npm test` **657 passed / 1 skipped** over 67 files; `npx tsc --noEmit` exit 0; `git diff --check` clean; `scripts/smoke.ps1` and `scripts/live-phase2.ps1` in offline mode passing. `tests/` is outside the `tsconfig` include, so `tsc` does not type-check the tests.
+
+**Live rerun on the merged code** (the same two scripts, the same free model, no quota): `scripts/smoke.ps1 -Live` PASS in 40 s; `scripts/live-phase2.ps1 -Live` 15/15 PASS in 171 s. The Stage 8 fixes change paths that every dispatch takes, which is why the matrix was rerun. Not covered live: any refusal or cooldown path, so `fd6507e` rests on offline evidence.
+
+**Left for the owner, in order** (options and detail: the consolidated report, section 5; the current list: `2026-11-24-handoff.md`):
+
+1. The shared cooldown policy — the review's one Blocker that is not a defect: any provider refusal parks the task after one failed turn and the board for 15 minutes.
+2. Escalation and render feedback never reach the worker.
+3. §16 lane classification reverses ADR-0008/0009 with no supersession.
+4. Blocked tasks are never revisited by watch.
+5. `stop` granularity and process signals.
+6. The batch `active` probe.
+7. The worker never sees the spec or the criteria.
+8. The context budget before a restored or shared dispatch.
+9. A cooldown switching the model mid-session.
+10. Automatic grouping on by default without evidence of a saving.
+11. Where the self-check bound is enforced.
+12. `reject` under watch.
+13. The design document.
+
+**Corrections this round made to its own record:** two count errors in the Stage 9 report, a false sentence in a note written by an earlier fix (`ca8760e`), and the claim in `docs/backlog.md` that `tsc` never ran here.
