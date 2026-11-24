@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { AgentAdapter, CatalogueModel } from "../src/adapters/types.js";
 import {
   baseRef, CATALOGUE_TIMEOUT_MS, catalogueOf, checkModels, classify, defaultRefOf, judgeRefs,
-  newGuardState, policyOf, renderVerdicts, resetGuardState, reviewerModels, workerModels,
+  newGuardState, noteReported, policyOf, renderVerdicts, resetGuardState, reviewerModels, workerModels,
 } from "../src/budget.js";
 import type { Task } from "../src/task-file.js";
 import type { WorkerConfig } from "../src/worker.js";
@@ -142,6 +142,27 @@ describe("budget guard", () => {
     state.reported.add("a\n[]");
     resetGuardState(state);
     expect(state.reported.size).toBe(0);
+  });
+
+  it("notes a reported refusal once per task and refs, until the state is reset", () => {
+    const state = newGuardState(1_000);
+    expect(noteReported("a", ["zen/p"], state)).toBe(true);
+    expect(noteReported("a", ["zen/p"], state)).toBe(false);
+    expect(noteReported("a", ["zen/p"], state)).toBe(false);
+    // Another refusal of the same task, and the same refs of another task, are each reported once too.
+    expect(noteReported("a", ["kimi/k"], state)).toBe(true);
+    expect(noteReported("b", ["zen/p"], state)).toBe(true);
+    expect(noteReported("a", ["kimi/k", "zen/p"], state)).toBe(true);     // the refs are the key's order as given
+    resetGuardState(state);
+    expect(noteReported("a", ["zen/p"], state)).toBe(true);
+
+    // With no state it is the module's own, so `resetGuardState()` is what forgets it.
+    expect(noteReported("a", ["zen/p"])).toBe(true);
+    expect(noteReported("a", ["zen/p"])).toBe(false);
+    expect(noteReported("a", ["kimi/k"])).toBe(true);
+    expect(noteReported("b", ["zen/p"])).toBe(true);
+    resetGuardState();
+    expect(noteReported("a", ["zen/p"])).toBe(true);
   });
 
   it("answers null when the adapter cannot list models or name a default", async () => {

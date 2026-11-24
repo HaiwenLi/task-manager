@@ -91,6 +91,20 @@ export function resetGuardState(state: GuardState = moduleState): void {
   state.defaultRefs = new WeakMap();
 }
 
+/**
+ * Whether a refusal of this task was not yet reported in this process. The
+ * first call for a task and its refused refs says `true` and records the key
+ * `${taskId}\n${JSON.stringify(refs)}` in the state's `reported` set; a later
+ * call with the same task and refs says `false`. With no state it uses the
+ * module's own, so `resetGuardState()` resets it.
+ */
+export function noteReported(taskId: string, refs: readonly string[], state: GuardState = moduleState): boolean {
+  const key = `${taskId}\n${JSON.stringify(refs)}`;
+  if (state.reported.has(key)) return false;
+  state.reported.add(key);
+  return true;
+}
+
 /** The four budget keys of a configuration, each present only when it is set (a cap of 0 is a setting). */
 export function policyOf(cfg: Pick<WorkerConfig, "allowedProviders" | "allowedModels" | "allowPaidModels" | "maxCostPerMillion">): BudgetPolicy {
   const { allowedProviders, allowedModels, allowPaidModels, maxCostPerMillion } = cfg;
