@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter, PromptResult } from "../src/adapters/types.js";
-import { modelAt, modelChain, readModelRotation } from "../src/models.js";
+import { modelChain, readModelRotation } from "../src/models.js";
 import { journalTail } from "../src/journal.js";
 import { TaskStore } from "../src/task-store.js";
 import { runTask, type WorkerConfig, type WorkerEvent } from "../src/worker.js";
@@ -121,13 +121,6 @@ describe("model chain", () => {
     expect(modelChain(undefined, ["x/y"])).toEqual([]);
     expect(modelChain("a/one", undefined)).toEqual(["a/one"]);
     expect(modelChain("a/one", ["", "a/one", "b/two"])).toEqual(["a/one", "b/two"]);
-  });
-
-  it("falls back to the head for an index the chain no longer has", () => {
-    expect(modelAt(["a/one", "b/two"], undefined)).toBe("a/one");
-    expect(modelAt(["a/one", "b/two"], 1)).toBe("b/two");
-    expect(modelAt(["a/one"], 7)).toBe("a/one");
-    expect(modelAt([], 0)).toBeUndefined();
   });
 });
 

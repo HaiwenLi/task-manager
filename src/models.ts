@@ -65,12 +65,6 @@ export function modelChain(primary: string | undefined, fallbacks: readonly stri
   return chain;
 }
 
-/** The model at a rotation index; an index the chain no longer has means the head. */
-export function modelAt(chain: readonly string[], index: number | undefined): string | undefined {
-  const at = index ?? 0;
-  return Number.isInteger(at) && at >= 0 && at < chain.length ? chain[at] : chain[0];
-}
-
 /**
  * The chain a configuration describes.
  *

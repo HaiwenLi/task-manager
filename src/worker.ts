@@ -19,7 +19,7 @@ import {
 import { definitionDigest, readAttempt, readDefinitionSnapshot, readRuntime, writeDefinitionSnapshot, writeRuntime, type AttemptRecord } from "./runtime.js";
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
-import { chainPosition, configChain, modelAt, modelChain, readModelRotation, resetChainCycles, rotateModel, type Handover, type ModelRole } from "./models.js";
+import { chainPosition, configChain, modelChain, readModelRotation, resetChainCycles, rotateModel, type Handover, type ModelRole } from "./models.js";
 import { classifyDispatchFailure, quotaBackoffMs } from "./dispatch.js";
 import { failureFingerprint } from "./fingerprint.js";
 import { startReview, type CriterionResult, type ReviewEvidence, type ReviewResult } from "./review.js";
@@ -449,33 +449,50 @@ const workerChain = (r: Run): string[] => r.task.model === undefined
 /** The reviewer's chain: its own model, then its fallbacks — never the task's silently. */
 const reviewerChain = (r: Run): string[] => modelChain(r.cfg.reviewerModel, r.cfg.reviewerModelFallbacks);
 
-/** The model a role should use now, per the rotation recorded for this task. */
+/**
+ * The model a role should use now, per the rotation recorded for this task.
+ *
+ * The rotation is an index into the full chain, so it is resolved on the full
+ * chain. The chain is then walked from that position: a cooling model is
+ * skipped, the first dispatchable model after it is used, and only when nothing
+ * from there to the end is dispatchable does the walk continue from the head.
+ * Indexing the cooldown-filtered chain instead read a partially expired table
+ * as a stale position and sent the task back to a model it had already been
+ * refused on, carrying the session of the model that was still healthy.
+ */
 async function modelFor(r: Run, role: ModelRole): Promise<string | undefined> {
   const chain = role === "worker" ? workerChain(r) : reviewerChain(r);
   const rotation = await readModelRotation(r.cfg.tasksDir, r.task.id);
   const explicitCycleProbe = (rotation.cycles?.[role] ?? 0) > 0;
-  const available: string[] = [];
+  const available = new Set<string>();
   for (const model of chain) {
-    if (explicitCycleProbe || await modelCooldown(r.cfg.tasksDir, model) === null) available.push(model);
+    if (explicitCycleProbe || await modelCooldown(r.cfg.tasksDir, model) === null) available.add(model);
   }
-  if (chain.length > 0 && available.length === 0) {
+  if (chain.length > 0 && available.size === 0) {
     const next = await nextModelCooldown(r.cfg.tasksDir, chain);
     throw new ModelsCoolingError(next?.retryAfter ?? new Date(Date.now() + (r.cfg.modelCooldownMs ?? 900_000)).toISOString());
   }
-  return modelAt(available, chainPosition(available, rotation[role]));
+  const position = chainPosition(chain, rotation[role]);
+  const walk = [...chain.slice(position), ...chain.slice(0, position)];
+  return walk.find((model) => available.has(model));
 }
 
 /**
- * The model that produced the work, for evidence only. Unlike `modelFor` it
- * never aborts a finished turn: when the whole worker chain is cooling by the
- * time acceptance runs, the label falls back to the model recorded for the
- * turn that just ran.
+ * The model that produced the work, for evidence only: the model recorded with
+ * the latest worker session, which is the one the last turn ran on. It is not
+ * whichever model the chain would dispatch to now — a refusal on another task,
+ * or a lapsed window, between the turn and the gate says nothing about who did
+ * the work. The chain is asked only when no turn recorded a model, and unlike
+ * `modelFor` the lookup never aborts a finished turn: when the whole worker
+ * chain is cooling by then, there is simply no label to give.
  */
 async function producedModel(r: Run): Promise<string | undefined> {
+  const recorded = r.executionState?.latestWorker?.model;
+  if (recorded !== undefined) return recorded;
   try {
     return await modelFor(r, "worker");
   } catch (error) {
-    if (error instanceof ModelsCoolingError) return r.executionState?.latestWorker?.model;
+    if (error instanceof ModelsCoolingError) return undefined;
     throw error;
   }
 }
