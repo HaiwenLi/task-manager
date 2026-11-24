@@ -1,6 +1,7 @@
 import { lockLive } from "./claim.js";
 import { draftAncestor } from "./eligibility.js";
 import { definitionDigest, readAttempt } from "./runtime.js";
+import { readExecutionState, type WorkerSessionFact } from "./execution-state.js";
 import { assertAcyclic, passBudget, taskWorkdir } from "./scheduler.js";
 import type { Task } from "./task-file.js";
 import { runTask, type TaskOutcome, type WorkerConfig, type WorkerDeps } from "./worker.js";
@@ -143,9 +144,11 @@ export async function runBatch(
   const runOne = options.run ?? runTask;
   const shouldStop = options.shouldStop ?? (async () => false);
   const done: string[] = [];
+  let previousWorker: WorkerSessionFact | undefined;
 
   for (const [index, selectedTask] of selected.entries()) {
     const original = originals.get(selectedTask.id)!;
+    const preamble = `## 连续批次\n- 当前任务：${selectedTask.id}\n- 前面已完成：${done.join(", ") || "无"}\n- 不要重做前面已完成的任务，也不要修改它们的定义或任务文件；只完成当前任务并独立验收。\n\n`;
     for (let attempt = 1; ; attempt++) {
       if (await shouldStop()) {
         return {
@@ -181,9 +184,14 @@ export async function runBatch(
         deps,
         current!,
         `batch-${process.pid}-${selectedTask.id}`,
+        attempt === 1
+          ? { batch: { preamble, ...(previousWorker === undefined ? {} : { resumeFrom: previousWorker }) } }
+          : {},
       );
       if (outcome === "done") {
         done.push(selectedTask.id);
+        const latest = (await readExecutionState(cfg.tasksDir, selectedTask.id)).latestWorker;
+        previousWorker = latest?.clean && latest.model ? { ...latest } : undefined;
         break;
       }
       if (outcome !== "open") {

@@ -25,7 +25,7 @@ import { failureFingerprint } from "./fingerprint.js";
 import { startReview, type CriterionResult, type ReviewEvidence, type ReviewResult } from "./review.js";
 import { collectChangeEvidence } from "./changes.js";
 import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck } from "./render.js";
-import { readExecutionState, recordEscalation, recordWorkerSession, type ExecutionState } from "./execution-state.js";
+import { readExecutionState, recordEscalation, recordWorkerSession, type ExecutionState, type WorkerSessionFact } from "./execution-state.js";
 import { clearModelCooldown, modelCooldown, nextModelCooldown, noteModelRefusal } from "./model-cooldown.js";
 import { recordUsage, type UsageRole } from "./usage.js";
 
@@ -114,7 +114,14 @@ export type WorkerDeps = {
 export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
 export type TaskOutcome = "done" | "blocked" | "skipped" | "open" | "awaiting-human";
-export type RunTaskOptions = { reviewOnly?: boolean };
+export type RunTaskOptions = {
+  reviewOnly?: boolean;
+  /** Batch-only input; ordinary runs keep the task-local restore behavior. */
+  batch?: {
+    preamble: string;
+    resumeFrom?: WorkerSessionFact;
+  };
+};
 type ReviewPendingRecord = {
   definitionDigest: string;
   artifactDigest: string;
@@ -145,6 +152,7 @@ type Run = {
   /** Durable execution policy and same-model session facts for this task. */
   executionState?: ExecutionState;
   reviewOnly: boolean;
+  batch: RunTaskOptions["batch"];
   /** The attempt replaced by this claim had already settled cleanly. */
   previousSettled: boolean;
   /**
@@ -183,7 +191,7 @@ export async function runTask(
   let notifyLost!: () => void;
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
   const now = new Date().toISOString();
-  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, previousSettled: false, sweepSkipNoted: false,
+  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, batch: options.batch, previousSettled: false, sweepSkipNoted: false,
     dispatchFailures: new Map(),
     record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing" } };
   let reservation: WorkspaceReservation | null = null;
@@ -695,9 +703,23 @@ async function blockForQuota(r: Run, current: string, result: PromptResult & { d
 }
 
 async function restoreWorkerSession(r: Run, model: string | undefined): Promise<string | undefined> {
-  const previous = r.executionState?.latestWorker;
-  if (!previous?.clean || !previous.model || previous.model !== model || !r.deps.adapter.canResumeSession) return undefined;
-  if (!r.previousSettled) return undefined;
+  const batchPrevious = r.batch?.resumeFrom;
+  const previous = batchPrevious ?? r.executionState?.latestWorker;
+  if (!previous?.clean || !previous.model || !r.deps.adapter.canResumeSession) return undefined;
+  if (previous.model !== model) {
+    // A cross-task candidate that names another actual model must not fall back
+    // to some older task-local session: the batch explicitly starts fresh.
+    if (batchPrevious !== undefined) {
+      await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
+        stage: "worker", event: "session-reuse-skipped",
+        detail: `${previous.sessionId}: actual model ${previous.model} -> ${model ?? "(default)"} does not match; starting fresh`,
+      }));
+    }
+    return undefined;
+  }
+  // runBatch supplies a candidate only after the previous task settled done.
+  // The ordinary task-local path still requires this task's own settled attempt.
+  if (batchPrevious === undefined && !r.previousSettled) return undefined;
   const status = await r.deps.adapter.canResumeSession(previous.sessionId, { model, cwd: r.cfg.workdir });
   if (status === "active") {
     throw new UncertainExecutionError(`recorded worker session ${previous.sessionId} is still active; reconcile before starting another worker`);
@@ -744,11 +766,12 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
   const dependencies = await dependenciesOf(r);
   for (;;) {
     const note = await latestNote(r.cfg.tasksDir, r.task.id);
-    const prompt = buildWorkerPrompt(r.task, {
+    const protocol = buildWorkerPrompt(r.task, {
       handoff: note?.markdown, workdir: r.cfg.workdir, tasksDir: r.cfg.tasksDir,
       taskDir: taskDirOf(r.cfg.tasksDir, r.task.id), logDir: logDirOf(r.cfg.tasksDir, r.task.id),
       ...(dependencies === null ? {} : { dependencies }),
     });
+    const prompt = r.batch === undefined ? protocol : `${r.batch.preamble}${protocol}`;
     let model: string | undefined;
     try {
       model = await modelFor(r, "worker");
@@ -758,7 +781,10 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
     }
     if (restoreSession) {
       sessionId = await restoreWorkerSession(r, model);
-      recordedSession = sessionId ?? "";
+      // A cross-task restore is not yet in this task's session list. Leaving
+      // recordedSession empty in that case makes the first turn append it;
+      // ordinary same-task restores are already recorded and stay deduplicated.
+      recordedSession = sessionId !== undefined && r.task.sessions.includes(sessionId) ? sessionId : "";
       restoreSession = false;
     }
     const result = await workedTurn(r, prompt, model, sessionId);
