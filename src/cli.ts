@@ -95,10 +95,12 @@ async function createControllerTelemetry(cfg: ResolvedConfig, teeTarget?: string
 }
 
 function createWorkerDeps({
-  deps, adapter, store, telemetry, log,
+  deps, adapter, store, telemetry, log, observe,
 }: {
   deps: CliDeps; adapter: AgentAdapter; store: TaskStore;
   telemetry: ControllerTelemetry; log: (line: string) => void;
+  /** Sees every worker event after it is logged; a controller counts what it must report. */
+  observe?: (evt: WorkerEvent) => void;
 }): WorkerDeps {
   return {
     store,
@@ -110,6 +112,7 @@ function createWorkerDeps({
       log(line);
       telemetry.writeLogLine(evt.taskId, line);
       telemetry.refreshBoard();
+      observe?.(evt);
     },
   };
 }
@@ -321,7 +324,7 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   const configPath = flags.get("config") ?? "taskctl.json";
   const cfg = resolveConfig(await readConfig(configPath), configPath);
   const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
-  const store = new TaskStore(cfg.tasksDir);
+  const store = deps.store ?? new TaskStore(cfg.tasksDir);
   // Controller log: with --log every event line is teed to one operator-chosen
   // file; by default each task's lines land in its own task dir under logs/.
   // This replaces the external `Tee-Object` into the workspace root that
@@ -329,7 +332,11 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   const teeTarget = flags.get("log") !== undefined ? resolve(flags.get("log")!) : undefined;
   const telemetry = await createControllerTelemetry(cfg, teeTarget);
   telemetry.refreshBoard();
-  const workerDeps = createWorkerDeps({ deps, adapter, store, telemetry, log });
+  let controllerErrors = 0;
+  const workerDeps = createWorkerDeps({
+    deps, adapter, store, telemetry, log,
+    observe: (evt) => { if (evt.type === "controller-error") controllerErrors += 1; },
+  });
   const batch = flags.get("batch");
   const result = await (async () => {
     try {
@@ -350,6 +357,12 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
       `[scheduler] stopped at the pass budget with ${result.pending.length} ready task(s) not started: `
       + `${result.pending.join(", ")}. Run taskctl run again to continue.`,
     );
+  }
+  if (controllerErrors > 0) {
+    // A task blocked by a controller bug is not an ordinary outcome. The board
+    // was still drained, but the run must not read as clean to a script.
+    log(`[scheduler] ${controllerErrors} task(s) blocked by a controller error; see the controller-error line(s) above`);
+    return 1;
   }
   return 0;
 }

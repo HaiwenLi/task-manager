@@ -113,7 +113,7 @@ export type WorkerDeps = {
   review?: (evidence: ReviewEvidence) => Promise<ReviewResult>;
   onEvent?: (evt: WorkerEvent) => void;
 };
-export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated";
+export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
 export type TaskOutcome = "done" | "blocked" | "skipped" | "open" | "awaiting-human";
 export type RunTaskOptions = {
@@ -287,9 +287,21 @@ export async function runTask(
       await checkpoint(r, "settled", "review-required", err.message);
       return await block(r, err.message);
     }
-    // Unexpected errors can occur after dispatch. Preserve active record/reservation.
-    if (reservation) await checkpoint(r, "uncertain", r.record.operation, String(err)).catch(() => {});
-    throw err;
+    // `controlled` clears the in-flight execution before anything reaches here,
+    // and an unconfirmed shutdown arrives as UncertainExecutionError above. So
+    // an unexpected error leaves no operation running: nothing is uncertain,
+    // the workspace is free, and one task's controller bug must neither abort
+    // the other tasks nor park the board behind a reservation nobody holds.
+    const message = err instanceof Error ? err.message : String(err);
+    try {
+      await checkpoint(r, "settled", "controller-error", message).catch(() => {});
+      await owned(r, () => appendJournal(cfg.tasksDir, task.id, { stage: "worker", event: "controller-error", detail: message }))
+        .catch(() => {});
+      emit(r, "controller-error", message);
+      return await block(r, `unexpected controller error: ${message}`);
+    } catch {
+      throw err;
+    }
   } finally {
     stopping = true; if (timer) clearTimeout(timer); await renewal;
     if (reservation && r.record.phase === "settled") await reservation.release();
@@ -449,6 +461,21 @@ async function modelFor(r: Run, role: ModelRole): Promise<string | undefined> {
     throw new ModelsCoolingError(next?.retryAfter ?? new Date(Date.now() + (r.cfg.modelCooldownMs ?? 900_000)).toISOString());
   }
   return modelAt(available, chainPosition(available, rotation[role]));
+}
+
+/**
+ * The model that produced the work, for evidence only. Unlike `modelFor` it
+ * never aborts a finished turn: when the whole worker chain is cooling by the
+ * time acceptance runs, the label falls back to the model recorded for the
+ * turn that just ran.
+ */
+async function producedModel(r: Run): Promise<string | undefined> {
+  try {
+    return await modelFor(r, "worker");
+  } catch (error) {
+    if (error instanceof ModelsCoolingError) return r.executionState?.latestWorker?.model;
+    throw error;
+  }
 }
 
 /**
@@ -644,10 +671,7 @@ async function noteRefusal(
 
 async function blockForCooldown(r: Run, role: ModelRole, retryAfter: string): Promise<"blocked"> {
   if (role === "reviewer") {
-    return await parkReviewPending(r, undefined, {
-      verdict: "unclear", criteria: [], externalChanges: [], defects: [],
-      summary: `every reviewer model is cooling until ${retryAfter}`, failure: "provider",
-    });
+    return await parkReviewPending(r, undefined, `every reviewer model is cooling until ${retryAfter}`);
   }
   await owned(r, async () => {
     const seq = ((await latestNote(r.cfg.tasksDir, r.task.id))?.seq ?? 0) + 1;
@@ -999,8 +1023,10 @@ async function resumeReviewOnly(r: Run, pending: ReviewPendingRecord): Promise<"
 
 async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "awaiting-human"> {
   // Which model produced the work is part of the evidence: after a handover it
-  // is no longer the model the operator configured.
-  const model = await modelFor(r, "worker");
+  // is no longer the model the operator configured. The lookup only labels
+  // evidence, so a cooldown that began while the worker was running must not
+  // abort a turn that already finished.
+  const model = await producedModel(r);
   if (r.task.verify === "render") return await acceptRender(r, model);
   const command = r.task.acceptance?.trim();
   if (!command) {
@@ -1282,18 +1308,30 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "retry" | "open
     }
     const resolvedReviewer = await r.deps.adapter.resolveModel?.(reviewerModel, r.cfg.reviewerEffort);
     const reviewStarted = Date.now();
-    const result = await controlled(r, "review", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT, () =>
-      r.deps.review
-        ? legacyExecution(() => r.deps.review!(evidence))
-        : startReview({
+    let result: ReviewResult;
+    try {
+      result = await controlled(r, "review", r.cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT, () =>
+        r.deps.review
+          ? legacyExecution(() => r.deps.review!(evidence))
+          : startReview({
             adapter: r.deps.adapter,
             cwd: r.cfg.workdir,
             model: resolvedReviewer ?? reviewerModel,
             effort: resolvedReviewer === undefined ? r.cfg.reviewerEffort : undefined,
             title: r.task.title,
           }, evidence),
-      (review) => review.failure === "provider",
-    );
+        (review) => review.failure === "provider",
+      );
+    } catch (err) {
+      // Only reached once the reviewer's shutdown was positively confirmed
+      // (anything else propagates). The judge never answered, which is the
+      // reviewer-unavailable case of §9: the work and its acceptance stand,
+      // so only the missing review is parked, for `retry --review-only`.
+      if (!(err instanceof WorkerTimeoutError)) throw err;
+      await owned(r, () => appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "review-timed-out", detail: err.message }))
+        .catch(() => {});
+      return await parkReviewPending(r, reviewerModel, err.message);
+    }
     if (result.reviewerSessionId) {
       await captureUsage(r, "reviewer", result.reviewerSessionId, reviewerModel, Date.now() - reviewStarted);
     }
@@ -1358,12 +1396,18 @@ async function reviewStage(r: Run): Promise<"done" | "blocked" | "retry" | "open
     // No reviewer is available, but the worker and acceptance already produced
     // valid evidence. Park only the missing review instead of replaying those
     // side effects on a later scheduler pass.
-    return await parkReviewPending(r, reviewerModel, result);
+    return await parkReviewPending(r, reviewerModel, result.summary || "review provider rejected the turn");
   }
 }
 
+/**
+ * Park only the missing review: the worker and acceptance already produced
+ * valid evidence, and replaying those side effects on a later scheduler pass
+ * is what this avoids. `reason` is why no verdict exists — a refused provider
+ * or a reviewer that ran out of time.
+ */
 async function parkReviewPending(
-  r: Run, reviewerModel: string | undefined, result: ReviewResult,
+  r: Run, reviewerModel: string | undefined, reason: string,
 ): Promise<"blocked"> {
   const acceptance = await readRuntime<Record<string, unknown>>(r.cfg.tasksDir, r.task.id, "acceptance.json");
   const previous = await readRuntime<ReviewPendingRecord>(r.cfg.tasksDir, r.task.id, "review-pending.json");
@@ -1373,7 +1417,7 @@ async function parkReviewPending(
   const now = new Date().toISOString();
   const refusal = {
     model: reviewerModel ?? "(default)",
-    reason: (result.summary || "review provider rejected the turn").slice(0, 1_000),
+    reason: (reason || "review provider rejected the turn").slice(0, 1_000),
   };
   const pending: ReviewPendingRecord = {
     definitionDigest: await attemptDefinition(r),
