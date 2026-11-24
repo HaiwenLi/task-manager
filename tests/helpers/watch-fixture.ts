@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { AgentAdapter } from "../../src/adapters/types.js";
 import type { AcceptanceResult } from "../../src/acceptance.js";
 import { runCli, type CliDeps } from "../../src/cli.js";
+import { serializeTaskFile, type Task } from "../../src/task-file.js";
 import { controlDir } from "../../src/watch-lock.js";
 import { stopRequestPath, type WatchFs, type WatchOptions } from "../../src/watch.js";
 import type { WorkerConfig, WorkerDeps } from "../../src/worker.js";
@@ -53,8 +54,8 @@ export function workerConfigFixture({
 /** The taskctl.json shape shared by real-CLI batch/watch tests. */
 export async function writeBatchConfig(
   root: string,
-  { tasksDir, workdir, lockTtlMs = 20_000, heartbeatMs = 1_000 }: {
-    tasksDir: string; workdir: string; lockTtlMs?: number; heartbeatMs?: number;
+  { tasksDir, workdir, lockTtlMs = 20_000, heartbeatMs = 1_000, batchMaxTasks }: {
+    tasksDir: string; workdir: string; lockTtlMs?: number; heartbeatMs?: number; batchMaxTasks?: number;
   },
 ): Promise<string> {
   const configPath = join(root, "taskctl.json");
@@ -64,8 +65,16 @@ export async function writeBatchConfig(
     model: "w/one",
     lockTtlMs,
     heartbeatMs,
+    ...(batchMaxTasks === undefined ? {} : { batchMaxTasks }),
   }), "utf8");
   return configPath;
+}
+
+/** Seed task definition files the way every board-using suite does. */
+export async function seedTaskFile(tasksDir: string, ...definitions: Task[]): Promise<void> {
+  for (const definition of definitions) {
+    await writeFile(join(tasksDir, `${definition.id}.md`), serializeTaskFile(definition), "utf8");
+  }
 }
 
 /** Deterministic filesystem-event seam shared by the watch suites. */
@@ -119,6 +128,18 @@ export async function requestStopThroughCli(tasksDir: string, wakeControl?: () =
   const code = await runCli(["stop", "--tasks-dir", tasksDir], { log: () => {}, err: () => {} });
   if (code !== 0) throw new Error(`stop CLI exited ${code}`);
   wakeControl?.();
+}
+
+/** Both durable stop flavors, pre-bound to the seam's control-directory wakeup. */
+export function createStopRequests(tasksDir: string, listeners: Map<string, () => void>): {
+  request: () => Promise<void>;
+  throughCli: () => Promise<void>;
+} {
+  const wakeControl = () => listeners.get(controlDir(tasksDir))?.();
+  return {
+    request: () => requestStopThroughFile(tasksDir, wakeControl),
+    throughCli: () => requestStopThroughCli(tasksDir, wakeControl),
+  };
 }
 
 export type WatchCliFixture = {

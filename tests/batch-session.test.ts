@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter, SessionReuseStatus } from "../src/adapters/types.js";
@@ -8,13 +8,13 @@ import { runCli } from "../src/cli.js";
 import { recordWorkerSession } from "../src/execution-state.js";
 import { readJournal } from "../src/journal.js";
 import { readRuntime } from "../src/runtime.js";
-import { serializeTaskFile, type Task } from "../src/task-file.js";
+import type { Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
 import { readUsage } from "../src/usage.js";
 import { runTask, type WorkerConfig, type WorkerDeps } from "../src/worker.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
 import {
-  doneAdapter, passAcceptance, workerConfigFixture, writeBatchConfig,
+  doneAdapter, passAcceptance, seedTaskFile, workerConfigFixture, writeBatchConfig,
 } from "./helpers/watch-fixture.js";
 
 type Turn = {
@@ -38,9 +38,7 @@ let probeStatus: SessionReuseStatus;
 let usageTurns: number;
 
 async function seed(...definitions: Task[]): Promise<void> {
-  for (const definition of definitions) {
-    await writeFile(join(tasks, `${definition.id}.md`), serializeTaskFile(definition), "utf8");
-  }
+  await seedTaskFile(tasks, ...definitions);
 }
 
 function adapter(): AgentAdapter {

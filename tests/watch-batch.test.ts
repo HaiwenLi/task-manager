@@ -1,25 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter } from "../src/adapters/types.js";
 import { selectAutomaticBatch } from "../src/batch.js";
 import { runCli } from "../src/cli.js";
 import { writeRuntime, type AttemptRecord } from "../src/runtime.js";
-import { serializeTaskFile, type Task } from "../src/task-file.js";
+import type { Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
 import { watchQueue } from "../src/watch.js";
 import type { WorkerConfig, WorkerDeps, WorkerEvent } from "../src/worker.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
 import {
-  createWatchEventSeam, doneAdapter, passAcceptance, requestStopThroughFile,
-  runWatchCli, waitForConditionAsync, workerConfigFixture,
+  createStopRequests, createWatchEventSeam, doneAdapter, passAcceptance, runWatchCli,
+  seedTaskFile, waitForConditionAsync as waitForAsync, workerConfigFixture, writeBatchConfig,
 } from "./helpers/watch-fixture.js";
 
 let root: string;
 let tasks: string;
 let work: string;
-let control: string;
 let store: TaskStore;
 let cfg: WorkerConfig;
 let turns: Array<{ id: string; sessionId?: string; text: string }>;
@@ -29,9 +28,10 @@ let events: WorkerEvent[];
 let listeners: Map<string, () => void>;
 let watchFs: ReturnType<typeof createWatchEventSeam>["watchFs"];
 let onTurn: ((id: string) => Promise<void>) | undefined;
+let stop: ReturnType<typeof createStopRequests>;
 
 async function seed(definition: Task): Promise<void> {
-  await writeFile(join(tasks, `${definition.id}.md`), serializeTaskFile(definition), "utf8");
+  await seedTaskFile(tasks, definition);
 }
 
 function adapter(): AgentAdapter {
@@ -79,12 +79,8 @@ function cliWatch(): Promise<number> {
   });
 }
 
-function waitForAsync(check: () => Promise<boolean>, timeoutMs = 2_000): Promise<void> {
-  return waitForConditionAsync(check, timeoutMs);
-}
-
 function requestStop(): Promise<void> {
-  return requestStopThroughFile(tasks, () => listeners.get(control)?.());
+  return stop.request();
 }
 
 function finished(...ids: string[]): boolean {
@@ -95,11 +91,11 @@ beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "taskctl-watch-batch-"));
   tasks = join(root, "tasks");
   work = join(root, "work");
-  control = join(root, ".taskctl");
   await mkdir(tasks);
   await mkdir(work);
   store = new TaskStore(tasks);
   ({ listeners, watchFs } = createWatchEventSeam());
+  stop = createStopRequests(tasks, listeners);
   cfg = workerConfigFixture({ tasksDir: tasks, workdir: work, lockTtlMs: 5_000, heartbeatMs: 20 });
   turns = [];
   probeCalls = [];
@@ -253,19 +249,13 @@ describe("watch automatic batches", () => {
   it("reads batchMaxTasks through the real CLI config path", async () => {
     await seed(task("a"));
     await seed(task("b"));
-    const configPath = join(root, "taskctl.json");
-    await writeFile(configPath, JSON.stringify({
-      tasksDir: tasks,
-      workdir: work,
-      model: "w/one",
-      batchMaxTasks: 2,
-      lockTtlMs: 5_000,
-      heartbeatMs: 20,
-    }), "utf8");
+    const configPath = await writeBatchConfig(root, {
+      tasksDir: tasks, workdir: work, batchMaxTasks: 2, lockTtlMs: 5_000, heartbeatMs: 20,
+    });
 
     const code = await runCli(["run", "--batch", "a,b", "--config", configPath], {
       adapter: adapter(),
-      acceptance: async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" }),
+      acceptance: passAcceptance,
       log: () => {},
       err: () => {},
     });

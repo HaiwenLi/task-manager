@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter } from "../src/adapters/types.js";
 import { runCli } from "../src/cli.js";
-import { serializeTaskFile, type Task } from "../src/task-file.js";
+import type { Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
 import {
   acquireWatchLock,
@@ -17,8 +17,8 @@ import { stopRequestPath, watchQueue } from "../src/watch.js";
 import type { WorkerConfig, WorkerDeps } from "../src/worker.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
 import {
-  createWatchEventSeam, doneAdapter, passAcceptance, requestStopThroughCli,
-  requestStopThroughFile, runWatchCli, waitForCondition, workerConfigFixture,
+  createStopRequests, createWatchEventSeam, doneAdapter, passAcceptance, runWatchCli,
+  seedTaskFile, waitForCondition as waitFor, workerConfigFixture,
 } from "./helpers/watch-fixture.js";
 
 let root: string;
@@ -30,12 +30,13 @@ let cfg: WorkerConfig;
 let turns: string[];
 let listeners: Map<string, () => void>;
 let watchFs: ReturnType<typeof createWatchEventSeam>["watchFs"];
+let stop: ReturnType<typeof createStopRequests>;
 let releaseActive: (() => void) | undefined;
 let activeStarted: (() => void) | undefined;
 let adapterCalls: string[];
 
 async function seed(definition: Task): Promise<void> {
-  await writeFile(join(tasks, `${definition.id}.md`), serializeTaskFile(definition), "utf8");
+  await seedTaskFile(tasks, definition);
 }
 
 function adapter(): AgentAdapter {
@@ -93,15 +94,11 @@ function cliWatch(
 }
 
 function stopThroughCli(): Promise<void> {
-  return requestStopThroughCli(tasks, () => listeners.get(control)?.());
-}
-
-function waitFor(check: () => boolean, timeoutMs = 2_000): Promise<void> {
-  return waitForCondition(check, timeoutMs);
+  return stop.throughCli();
 }
 
 function requestStop(): Promise<void> {
-  return requestStopThroughFile(tasks, () => listeners.get(control)?.());
+  return stop.request();
 }
 
 beforeEach(async () => {
@@ -113,6 +110,7 @@ beforeEach(async () => {
   await mkdir(work);
   store = new TaskStore(tasks);
   ({ listeners, watchFs } = createWatchEventSeam());
+  stop = createStopRequests(tasks, listeners);
   cfg = workerConfigFixture({ tasksDir: tasks, workdir: work, lockTtlMs: 5_000, heartbeatMs: 20 });
   turns = [];
   releaseActive = undefined;

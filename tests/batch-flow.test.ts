@@ -1,14 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter } from "../src/adapters/types.js";
 import { runCli } from "../src/cli.js";
 import { readRuntime } from "../src/runtime.js";
-import { serializeTaskFile, type Task } from "../src/task-file.js";
+import type { Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
-import { doneAdapter, passAcceptance, writeBatchConfig } from "./helpers/watch-fixture.js";
+import { doneAdapter, passAcceptance, seedTaskFile, writeBatchConfig } from "./helpers/watch-fixture.js";
 
 let root: string;
 let tasks: string;
@@ -19,7 +19,7 @@ let turns: string[];
 let errors: string[];
 
 async function seed(definition: Task): Promise<void> {
-  await writeFile(join(tasks, `${definition.id}.md`), serializeTaskFile(definition), "utf8");
+  await seedTaskFile(tasks, definition);
 }
 
 function adapter(onTurn?: (id: string) => Promise<void>): AgentAdapter {
