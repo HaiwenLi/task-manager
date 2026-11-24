@@ -15,7 +15,7 @@ import {
 } from "../src/watch-lock.js";
 import { stopRequestPath, watchQueue, type WatchFs } from "../src/watch.js";
 import type { WorkerConfig, WorkerDeps } from "../src/worker.js";
-import { buildTaskFile } from "./helpers/task-fixture.js";
+import { buildContinuousTask as task } from "./helpers/task-fixture.js";
 
 let root: string;
 let tasks: string;
@@ -27,21 +27,7 @@ let turns: string[];
 let listeners: Map<string, () => void>;
 let releaseActive: (() => void) | undefined;
 let activeStarted: (() => void) | undefined;
-
-function task(id: string, overrides: Partial<Task> = {}): Task {
-  return buildTaskFile({
-    id,
-    title: id,
-    status: "open",
-    complexity: "simple",
-    execution: "continuous",
-    verify: "mechanical",
-    acceptance: "check",
-    criteria: ["C1 ok"],
-    model: "w/one",
-    ...overrides,
-  });
-}
+let adapterCalls: string[];
 
 async function seed(definition: Task): Promise<void> {
   await writeFile(join(tasks, `${definition.id}.md`), serializeTaskFile(definition), "utf8");
@@ -65,6 +51,22 @@ function adapter(): AgentAdapter {
   };
 }
 
+/** Every adapter surface is loud: idle proof must show this log stays empty. */
+function idleAdapter(): AgentAdapter {
+  return {
+    prompt: async () => { adapterCalls.push("prompt"); throw new Error("prompt during idle"); },
+    start: () => { adapterCalls.push("start"); throw new Error("start during idle"); },
+    resolveModel: async (model) => { adapterCalls.push("resolveModel"); return model; },
+    contextUsage: async () => { adapterCalls.push("contextUsage"); return 0; },
+    contextLimit: async () => { adapterCalls.push("contextLimit"); return 100; },
+    sessionUsage: async () => {
+      adapterCalls.push("sessionUsage");
+      return { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+    },
+    canResumeSession: async () => { adapterCalls.push("canResumeSession"); return "unavailable"; },
+  };
+}
+
 function deps(customStore: TaskStore = store): WorkerDeps {
   return {
     store: customStore,
@@ -78,18 +80,41 @@ const watchFs: WatchFs = (path, listener) => {
   return { close: () => { listeners.delete(path); } };
 };
 
+async function cliWatch(
+  agent: AgentAdapter = adapter(),
+  customStore: TaskStore = store,
+  fallbackMs = 1_000,
+  debounceMs = 5,
+  errors: string[] = [],
+): Promise<number> {
+  const configPath = join(root, "taskctl.json");
+  await writeFile(configPath, JSON.stringify({
+    tasksDir: tasks,
+    workdir: work,
+    model: "w/one",
+    lockTtlMs: 5_000,
+    heartbeatMs: 20,
+  }), "utf8");
+  return runCli(["watch", "--config", configPath], {
+    adapter: agent,
+    acceptance: async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" }),
+    log: () => {},
+    err: (line) => { errors.push(line); },
+    store: customStore,
+    watch: { watchFs, fallbackMs, debounceMs },
+  });
+}
+
+async function stopThroughCli(): Promise<void> {
+  const code = await runCli(["stop", "--tasks-dir", tasks], { log: () => {}, err: () => {} });
+  if (code !== 0) throw new Error(`stop CLI exited ${code}`);
+  listeners.get(control)?.();
+}
+
 async function waitFor(check: () => boolean, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!check()) {
     if (Date.now() >= deadline) throw new Error("condition did not become true before timeout");
-    await delay(10);
-  }
-}
-
-async function waitForAsync(check: () => Promise<boolean>, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!await check()) {
-    if (Date.now() >= deadline) throw new Error("async condition did not become true before timeout");
     await delay(10);
   }
 }
@@ -121,6 +146,7 @@ beforeEach(async () => {
   listeners = new Map();
   releaseActive = undefined;
   activeStarted = undefined;
+  adapterCalls = [];
 });
 
 afterEach(async () => {
@@ -169,22 +195,22 @@ describe("watch ownership", () => {
 });
 
 describe("watchQueue", () => {
-  it("does zero model calls while idle and still wakes on the fallback", async () => {
+  it("does zero adapter calls while idle and still wakes on the fallback", async () => {
     let scans = 0;
     const counting = Object.create(store) as TaskStore;
     counting.list = async () => { scans++; return store.list(); };
-    const running = watchQueue(cfg, deps(counting), { watchFs, fallbackMs: 20, debounceMs: 5 });
+    const running = cliWatch(idleAdapter(), counting, 20, 5);
     try {
       await waitFor(() => scans >= 2);
-      expect(turns).toEqual([]);
+      expect(adapterCalls).toEqual([]);
       const heartbeat = JSON.parse(await readFile(watchLockPath(tasks), "utf8")).heartbeat as number;
       await delay(30);
       expect(JSON.parse(await readFile(watchLockPath(tasks), "utf8")).heartbeat).toBeGreaterThan(heartbeat);
     } finally {
-      await requestStop();
+      await stopThroughCli();
       await running;
     }
-    expect(turns).toEqual([]);
+    expect(adapterCalls).toEqual([]);
     await expect(readFile(watchLockPath(tasks), "utf8")).rejects.toThrow("ENOENT");
   });
 
@@ -220,19 +246,20 @@ describe("watchQueue", () => {
       await waitFor(() => listeners.has(tasks));
       await seed(task("a"));
       listeners.get(tasks)?.();
-      await waitForAsync(async () => (await store.get("a")).status === "done");
+      await waitFor(() => turns.includes("a"));
       expect(turns).toEqual(["a"]);
     } finally {
       await requestStop();
       await running;
     }
+    expect((await store.get("a")).status).toBe("done");
   });
 
   it("coalesces a filesystem burst into one scheduling scan", async () => {
     let scans = 0;
     const counting = Object.create(store) as TaskStore;
     counting.list = async () => { scans++; return store.list(); };
-    const running = watchQueue(cfg, deps(counting), { watchFs, fallbackMs: 1_000, debounceMs: 20 });
+    const running = cliWatch(adapter(), counting, 1_000, 20);
     try {
       await waitFor(() => scans === 1 && listeners.has(tasks));
       scans = 0;
@@ -244,7 +271,22 @@ describe("watchQueue", () => {
       expect(scans).toBe(1);
       expect(turns).toEqual([]);
     } finally {
-      await requestStop();
+      await stopThroughCli();
+      await running;
+    }
+  });
+
+  it("refuses a second live watcher through the real CLI", async () => {
+    const secondErrors: string[] = [];
+    const running = cliWatch();
+    try {
+      await waitFor(() => listeners.has(tasks));
+      const code = await cliWatch(adapter(), store, 1_000, 5, secondErrors);
+      expect(code).toBe(1);
+      expect(secondErrors.join("\n")).toContain("held");
+      expect(turns).toEqual([]);
+    } finally {
+      await stopThroughCli();
       await running;
     }
   });
@@ -370,12 +412,13 @@ describe("watchQueue", () => {
     let started!: () => void;
     activeStarted = () => { started(); };
     const began = new Promise<void>((resolve) => { started = resolve; });
-    const running = watchQueue(cfg, deps(), { watchFs, fallbackMs: 1_000, debounceMs: 5 });
+    const running = cliWatch();
     try {
       await began;
-      await requestStop();
+      await stopThroughCli();
       releaseActive?.();
-      await running;
+      const code = await running;
+      expect(code).toBe(0);
     } finally {
       releaseActive?.();
     }
@@ -439,11 +482,12 @@ describe("watch and stop CLI parsing", () => {
     await waitFor(() => listeners.has(tasks));
     await seed(task("a"));
     listeners.get(tasks)?.();
-    await waitForAsync(async () => (await store.get("a")).status === "done");
+    await waitFor(() => turns.includes("a"));
 
     expect(await runCli(["stop", "--tasks-dir", tasks], { log: () => {}, err: () => {} })).toBe(0);
     await expect(running).resolves.toBe(0);
     expect(errors).toEqual([]);
     expect(turns).toEqual(["a"]);
+    expect((await store.get("a")).status).toBe("done");
   });
 });

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter, SessionReuseStatus } from "../src/adapters/types.js";
 import { runBatch, type BatchRunOptions } from "../src/batch.js";
+import { runCli } from "../src/cli.js";
 import { recordWorkerSession } from "../src/execution-state.js";
 import { readJournal } from "../src/journal.js";
 import { readRuntime } from "../src/runtime.js";
@@ -11,7 +12,7 @@ import { serializeTaskFile, type Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
 import { readUsage } from "../src/usage.js";
 import { runTask, type WorkerConfig, type WorkerDeps } from "../src/worker.js";
-import { buildTaskFile } from "./helpers/task-fixture.js";
+import { buildContinuousTask as task } from "./helpers/task-fixture.js";
 
 type Turn = {
   id: string;
@@ -24,27 +25,14 @@ type Turn = {
 let root: string;
 let tasks: string;
 let work: string;
+let configPath: string;
+let cliLines: string[];
 let store: TaskStore;
 let cfg: WorkerConfig;
 let turns: Turn[];
 let probeCalls: Array<{ sessionId: string; expected: { model: string; cwd: string } }>;
 let probeStatus: SessionReuseStatus;
 let usageTurns: number;
-
-function task(id: string, overrides: Partial<Task> = {}): Task {
-  return buildTaskFile({
-    id,
-    title: id,
-    status: "open",
-    complexity: "simple",
-    execution: "continuous",
-    verify: "mechanical",
-    acceptance: "check",
-    criteria: ["C1 ok"],
-    model: "w/one",
-    ...overrides,
-  });
-}
 
 async function seed(...definitions: Task[]): Promise<void> {
   for (const definition of definitions) {
@@ -92,6 +80,15 @@ function deps(agent: AgentAdapter = adapter()): WorkerDeps {
   };
 }
 
+async function cli(ids: string, agent: AgentAdapter = adapter()): Promise<number> {
+  return runCli(["run", "--batch", ids, "--config", configPath], {
+    adapter: agent,
+    acceptance: async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" }),
+    log: (line) => { cliLines.push(line); },
+    err: (line) => { cliLines.push(line); },
+  });
+}
+
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "taskctl-batch-session-"));
   tasks = join(root, "tasks");
@@ -99,6 +96,16 @@ beforeEach(async () => {
   await mkdir(tasks);
   await mkdir(work);
   store = new TaskStore(tasks);
+  configPath = join(root, "taskctl.json");
+  await writeFile(configPath, JSON.stringify({
+    tasksDir: tasks,
+    workdir: work,
+    model: "w/one",
+    retryLimit: 1,
+    lockTtlMs: 20_000,
+    heartbeatMs: 1_000,
+  }), "utf8");
+  cliLines = [];
   cfg = {
     tasksDir: tasks,
     workdir: work,
@@ -123,9 +130,11 @@ describe("cross-task batch sessions", () => {
   it("uses one safe session while keeping prompts, env, acceptance, sessions, and usage independent", async () => {
     await seed(task("a"), task("b"));
 
-    const result = await runBatch(cfg, deps(), ["a", "b"]);
+    const code = await cli("a,b");
 
-    expect(result.done).toEqual(["a", "b"]);
+    expect(code).toBe(0);
+    expect((await store.get("a")).status).toBe("done");
+    expect((await store.get("b")).status).toBe("done");
     expect(turns.map((turn) => turn.sessionId)).toEqual([undefined, "ses-shared"]);
     expect(probeCalls).toHaveLength(1);
     expect(probeCalls[0]).toEqual({
@@ -152,9 +161,10 @@ describe("cross-task batch sessions", () => {
   it("starts fresh after an actual model mismatch and records why", async () => {
     await seed(task("a"), task("b", { model: "w/two" }));
 
-    const result = await runBatch(cfg, deps(), ["a", "b"]);
+    const code = await cli("a,b");
 
-    expect(result.done).toEqual(["a", "b"]);
+    expect(code).toBe(0);
+    expect((await store.get("b")).status).toBe("done");
     expect(turns.map((turn) => turn.sessionId)).toEqual([undefined, undefined]);
     expect(probeCalls).toEqual([]);
     expect((await store.get("b")).sessions).toEqual(["fresh-b"]);
@@ -183,9 +193,10 @@ describe("cross-task batch sessions", () => {
     await seed(task("a"), task("b"));
     probeStatus = "unavailable";
 
-    const result = await runBatch(cfg, deps(), ["a", "b"]);
+    const code = await cli("a,b");
 
-    expect(result.done).toEqual(["a", "b"]);
+    expect(code).toBe(0);
+    expect((await store.get("b")).status).toBe("done");
     expect(turns.map((turn) => turn.sessionId)).toEqual([undefined, undefined]);
     expect(probeCalls).toHaveLength(1);
     expect((await readJournal(tasks, "b")).some((entry) => entry.event === "session-reuse-skipped")).toBe(true);
@@ -195,12 +206,11 @@ describe("cross-task batch sessions", () => {
     await seed(task("a"), task("b"), task("c"));
     probeStatus = "active";
 
-    const result = await runBatch(cfg, deps(), ["a", "b", "c"]);
+    const code = await cli("a,b,c");
 
-    expect(result.done).toEqual(["a"]);
-    expect(result.stoppedAt).toBe("b");
-    expect(result.outcome).toBe("blocked");
-    expect(result.pending).toEqual(["c"]);
+    expect(code).toBe(0);
+    expect(cliLines.join("\n")).toContain("stopped at b (blocked)");
+    expect(cliLines.join("\n")).toContain("unclaimed: c");
     expect(turns.map((turn) => turn.id)).toEqual(["a"]);
     expect((await store.get("b")).status).toBe("blocked");
     expect((await store.get("c")).status).toBe("open");
@@ -214,12 +224,11 @@ describe("cross-task batch sessions", () => {
       task("c"),
     );
 
-    const result = await runBatch(cfg, deps(), ["a", "b", "c"]);
+    const code = await cli("a,b,c");
 
-    expect(result.done).toEqual(["a"]);
-    expect(result.stoppedAt).toBe("b");
-    expect(result.outcome).toBe("awaiting-human");
-    expect(result.pending).toEqual(["c"]);
+    expect(code).toBe(0);
+    expect(cliLines.join("\n")).toContain("stopped at b (awaiting-human)");
+    expect(cliLines.join("\n")).toContain("unclaimed: c");
     expect(turns.map((turn) => turn.id)).toEqual(["a", "b"]);
     expect((await store.get("b")).status).toBe("awaiting-human");
     expect((await store.get("c")).status).toBe("open");

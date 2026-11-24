@@ -29,3 +29,19 @@ export function buildTaskFile(overrides: Partial<Task> & { id: string; title?: s
     verify,
   };
 }
+
+/** The continuous mechanical task shared by batch/watch suites; override only what one test is about. */
+export function buildContinuousTask(id: string, overrides: Partial<Task> = {}): Task {
+  return buildTaskFile({
+    id,
+    title: id,
+    status: "open",
+    complexity: "simple",
+    execution: "continuous",
+    verify: "mechanical",
+    acceptance: "check",
+    criteria: ["C1 ok"],
+    model: "w/one",
+    ...overrides,
+  });
+}

@@ -10,7 +10,7 @@ import { serializeTaskFile, type Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
 import { stopRequestPath, watchQueue, type WatchFs } from "../src/watch.js";
 import type { WorkerConfig, WorkerDeps, WorkerEvent } from "../src/worker.js";
-import { buildTaskFile } from "./helpers/task-fixture.js";
+import { buildContinuousTask as task } from "./helpers/task-fixture.js";
 
 let root: string;
 let tasks: string;
@@ -24,21 +24,6 @@ let reviewed: string[];
 let events: WorkerEvent[];
 let listeners: Map<string, () => void>;
 let onTurn: ((id: string) => Promise<void>) | undefined;
-
-function task(id: string, overrides: Partial<Task> = {}): Task {
-  return buildTaskFile({
-    id,
-    title: id,
-    status: "open",
-    complexity: "simple",
-    execution: "continuous",
-    verify: "mechanical",
-    acceptance: "check",
-    criteria: ["C1 ok"],
-    model: "w/one",
-    ...overrides,
-  });
-}
 
 async function seed(definition: Task): Promise<void> {
   await writeFile(join(tasks, `${definition.id}.md`), serializeTaskFile(definition), "utf8");
@@ -63,21 +48,23 @@ function adapter(): AgentAdapter {
   };
 }
 
+const reviewFor: NonNullable<WorkerDeps["review"]> = async (evidence) => {
+  reviewed.push(evidence.task.id);
+  return {
+    verdict: "pass" as const,
+    criteria: evidence.task.criteria.map((criterion) => ({ id: criterion.split(/\s+/)[0]!, pass: true, evidence: "ok" })),
+    externalChanges: [],
+    defects: [],
+    summary: "ok",
+  };
+};
+
 function deps(): WorkerDeps {
   return {
     store,
     adapter: adapter(),
     acceptance: async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" }),
-    review: async (evidence) => {
-      reviewed.push(evidence.task.id);
-      return {
-        verdict: "pass" as const,
-        criteria: evidence.task.criteria.map((criterion) => ({ id: criterion.split(/\s+/)[0]!, pass: true, evidence: "ok" })),
-        externalChanges: [],
-        defects: [],
-        summary: "ok",
-      };
-    },
+    review: reviewFor,
     onEvent: (event) => { events.push(event); },
   };
 }
@@ -86,6 +73,25 @@ const watchFs: WatchFs = (path, listener) => {
   listeners.set(path, listener);
   return { close: () => { listeners.delete(path); } };
 };
+
+async function cliWatch(): Promise<number> {
+  const configPath = join(root, "taskctl.json");
+  await writeFile(configPath, JSON.stringify({
+    tasksDir: tasks,
+    workdir: work,
+    model: "w/one",
+    lockTtlMs: 5_000,
+    heartbeatMs: 20,
+  }), "utf8");
+  return runCli(["watch", "--config", configPath], {
+    adapter: adapter(),
+    acceptance: async () => ({ passed: true, skipped: false as const, exitCode: 0, output: "ok" }),
+    review: reviewFor,
+    log: () => {},
+    err: () => {},
+    watch: { watchFs, fallbackMs: 1_000, debounceMs: 5 },
+  });
+}
 
 async function waitForAsync(check: () => Promise<boolean>, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -161,13 +167,16 @@ describe("watch automatic batches", () => {
   it("forms one safe batch from two eligible tasks", async () => {
     await seed(task("a"));
     await seed(task("b"));
-    const running = watchQueue(cfg, deps(), { watchFs, fallbackMs: 1_000 });
+    onTurn = async (id) => {
+      if (id === "b") await requestStop();
+    };
+    let code: number | undefined;
     try {
-      await waitForAsync(async () => finished("a", "b"));
+      code = await cliWatch();
     } finally {
-      await requestStop();
-      await running;
+      if (code === undefined) await requestStop();
     }
+    expect(code).toBe(0);
     expect(turns.map((turn) => turn.id)).toEqual(["a", "b"]);
     expect(turns.map((turn) => turn.sessionId)).toEqual([undefined, "ses-a"]);
     expect(probeCalls).toEqual(["ses-a"]);
@@ -193,13 +202,16 @@ describe("watch automatic batches", () => {
     await seed(task("a", { verify: "human" }));
     await seed(task("b"));
     await seed(task("c"));
-    const running = watchQueue(cfg, deps(), { watchFs, fallbackMs: 1_000 });
+    onTurn = async (id) => {
+      if (id === "c") await requestStop();
+    };
+    let code: number | undefined;
     try {
-      await waitForAsync(async () => finished("b", "c"));
+      code = await cliWatch();
     } finally {
-      await requestStop();
-      await running;
+      if (code === undefined) await requestStop();
     }
+    expect(code).toBe(0);
     expect(turns.map((turn) => turn.id)).toEqual(["a", "b", "c"]);
     expect(reviewed).toEqual(["a"]);
     expect(turns.map((turn) => turn.sessionId)).toEqual([undefined, undefined, "ses-b"]);
@@ -255,8 +267,13 @@ describe("watch automatic batches", () => {
       }
       if (id === "b") await requestStop();
     };
-    const running = watchQueue(cfg, deps(), { watchFs, fallbackMs: 1_000, debounceMs: 5 });
-    await running;
+    let code: number | undefined;
+    try {
+      code = await cliWatch();
+    } finally {
+      if (code === undefined) await requestStop();
+    }
+    expect(code).toBe(0);
     expect(turns.map((turn) => turn.id)).toEqual(["a", "b"]);
     expect((await store.get("c")).status).toBe("open");
   });

@@ -7,7 +7,7 @@ import { runCli } from "../src/cli.js";
 import { readRuntime } from "../src/runtime.js";
 import { serializeTaskFile, type Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
-import { buildTaskFile } from "./helpers/task-fixture.js";
+import { buildContinuousTask as task } from "./helpers/task-fixture.js";
 
 let root: string;
 let tasks: string;
@@ -16,21 +16,6 @@ let store: TaskStore;
 let configPath: string;
 let turns: string[];
 let errors: string[];
-
-function task(id: string, overrides: Partial<Task> = {}): Task {
-  return buildTaskFile({
-    id,
-    title: id,
-    status: "open",
-    complexity: "simple",
-    execution: "continuous",
-    verify: "mechanical",
-    acceptance: "check",
-    criteria: ["C1 ok"],
-    model: "w/one",
-    ...overrides,
-  });
-}
 
 async function seed(definition: Task): Promise<void> {
   await writeFile(join(tasks, `${definition.id}.md`), serializeTaskFile(definition), "utf8");
@@ -111,6 +96,18 @@ describe("taskctl run --batch", () => {
     expect(code).toBe(1);
     expect(turns).toEqual([]);
     expect(errors.join("\n")).toContain("continuous");
+    expect((await store.get("a")).status).toBe("open");
+    expect((await store.get("b")).status).toBe("open");
+  });
+
+  it("rejects an initially mixed-workdir selection before spending a worker turn", async () => {
+    await seed(task("b", { workdir: "elsewhere" }));
+
+    const code = await cli(["run", "--batch", "a,b", "--config", configPath], adapter());
+
+    expect(code).toBe(1);
+    expect(turns).toEqual([]);
+    expect(errors.join("\n")).toContain("workdir");
     expect((await store.get("a")).status).toBe("open");
     expect((await store.get("b")).status).toBe("open");
   });

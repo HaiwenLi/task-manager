@@ -41,6 +41,8 @@ export type CliDeps = {
   review?: WorkerDeps["review"];
   /** Test seam for watch filesystem events and timing; production leaves it absent. */
   watch?: WatchOptions;
+  /** Test seam for observing watch scheduling; production leaves it absent. */
+  store?: TaskStore;
   now?: () => Date;
   log?: (line: string) => void;
   err?: (line: string) => void;
@@ -325,7 +327,7 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
 async function watchCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
   const cfg = await configFor(flags);
   const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
-  const store = new TaskStore(cfg.tasksDir);
+  const store = deps.store ?? new TaskStore(cfg.tasksDir);
   const boardRefresh = createCoalescedRefresh(() => refreshBoardFile(cfg.tasksDir));
   const refreshBoard = boardRefresh.request;
   refreshBoard();
