@@ -1377,6 +1377,7 @@ export const CONFIG_KEYS = new Set([
   "opencodeBin",
   "chromeBin",
   "renderViewports",
+  "workerContext",
 ]);
 
 /** Merge config file over the defaults; every present field is validated. */
@@ -1420,7 +1421,36 @@ export function resolveConfig(raw: Record<string, unknown>, path: string): Resol
     opencodeBin: string(raw, "opencodeBin", path),
     chromeBin: string(raw, "chromeBin", path),
     renderViewports: stringArray(raw, "renderViewports", path),
+    workerContext: workerContextSwitches(raw.workerContext, path),
   };
+}
+
+/**
+ * The `workerContext` block of `taskctl.json`. Absent stays `undefined`, so
+ * the worker's own default applies (both on); an object fills each switch it
+ * leaves out with `true`. Anything else is a config error, never a silent
+ * default: `"spec": "false"` meant to turn the spec off.
+ */
+function workerContextSwitches(raw: unknown, path: string): WorkerConfig["workerContext"] {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`config ${path}: field "workerContext" must be an object`);
+  }
+  const record = raw as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (key !== "spec" && key !== "preferences") {
+      throw new Error(`config ${path}: unknown workerContext field "${key}"`);
+    }
+  }
+  const spec = record.spec === undefined ? true : record.spec;
+  if (typeof spec !== "boolean") {
+    throw new Error(`config ${path}: workerContext.spec must be a boolean`);
+  }
+  const preferences = record.preferences === undefined ? true : record.preferences;
+  if (typeof preferences !== "boolean") {
+    throw new Error(`config ${path}: workerContext.preferences must be a boolean`);
+  }
+  return { spec, preferences };
 }
 
 function string(raw: Record<string, unknown>, key: string, path: string): string | undefined {

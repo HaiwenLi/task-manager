@@ -6,6 +6,7 @@ import { waitReason } from "./eligibility.js";
 import { dependencySummary } from "./dependencies.js";
 import { latestNote, writeNote, type HandoffNote } from "./handoff.js";
 import { startAcceptance, type AcceptanceResult } from "./acceptance.js";
+import { readContextSections, type ContextSections } from "./context.js";
 import { buildWorkerPrompt } from "./protocol.js";
 import type { TaskStore } from "./task-store.js";
 import type { Task, TaskExecution } from "./task-file.js";
@@ -104,6 +105,12 @@ export type WorkerConfig = {
    * `artifacts` block of `taskctl.json`.
    */
   artifacts?: ArtifactsConfig;
+  /**
+   * Which context a worker session is given beside the task: the approved
+   * spec, and the owner's preferences with the relevant corrections. Absent
+   * means both. Resolved from the `workerContext` block of `taskctl.json`.
+   */
+  workerContext?: { spec: boolean; preferences: boolean };
 };
 export type WorkerStore = Pick<TaskStore, "list" | "setStatus" | "appendSession" | "incRetries" | "readDoneMarker" | "clearDoneMarker" | "incReviewRounds">;
 export type WorkerDeps = {
@@ -173,6 +180,8 @@ type Run = {
   dispatchFailures: Map<string, string>;
   /** What each dependency produced; computed once per attempt (see `dependenciesOf`). */
   dependencies?: string | null;
+  /** The context sections this attempt was given; read once per attempt (see `contextOf`). */
+  context?: WorkerContext;
   /** The context budget was already reported as unreadable for this attempt. */
   budgetUnavailableNoted: boolean;
   /** The lock heartbeat's first write failure was already journaled for this attempt. */
@@ -854,6 +863,60 @@ async function dependenciesOf(r: Run): Promise<string | null> {
   return r.dependencies;
 }
 
+/** The context sections one attempt was given; see `readContextSections`. */
+export type WorkerContext = ContextSections;
+
+/**
+ * The context sections of this attempt, read once for the whole attempt: a
+ * session of many turns does not read three files on every one of them, and
+ * the journal says `profile-truncated` once, not once per turn.
+ */
+async function contextOf(r: Run): Promise<WorkerContext> {
+  if (r.context === undefined) r.context = await readSections(r);
+  return r.context;
+}
+
+/**
+ * Read the context sections, and the one place that read is guarded.
+ *
+ * The spec, the profile and the corrections are context, not state: a file
+ * that cannot be read says nothing about the work. So anything but a lost
+ * lock is journaled once and the attempt goes on with whatever sections were
+ * read — none, when the read throws as a whole. Without the guard the error
+ * lands in the attempt's error handling and the task is `blocked` over a file
+ * that is only context.
+ */
+async function readSections(r: Run): Promise<WorkerContext> {
+  const flags = r.cfg.workerContext ?? { spec: true, preferences: true };
+  // What was read before an error survives it. That is nothing when the read
+  // itself is what threw: the three files are read in one go.
+  let sections: WorkerContext = { profileTruncatedChars: 0 };
+  try {
+    sections = await readContextSections(r.cfg.tasksDir, r.task, flags);
+    if (sections.profileTruncatedChars > 0) {
+      // The section is the line that says it was cut, then the part that was kept.
+      const kept = sections.profile!.length - sections.profile!.indexOf("\n") - 1;
+      await noteContext(r, "profile-truncated", `profile cut; kept the newest ${kept} characters`);
+    }
+  } catch (err) {
+    if (err instanceof OwnershipLostError) throw err;
+    await noteContext(r, "context-unavailable", err instanceof Error ? err.message : String(err));
+  }
+  return sections;
+}
+
+/**
+ * Journal one fact about the context. The journal is a record, not state: a
+ * line that cannot be written is lost and the attempt goes on — unless the
+ * write failed because the lock is no longer this attempt's.
+ */
+async function noteContext(r: Run, event: string, detail: string): Promise<void> {
+  await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, { stage: "worker", event, detail }))
+    .catch((err: unknown) => {
+      if (err instanceof OwnershipLostError) throw err;
+    });
+}
+
 async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
   let sessionId: string | undefined;
   let recordedSession = "", sessionsUsed = r.task.sessions.length, turns = 0;
@@ -872,12 +935,17 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
   // Dependencies are done before the claim and cannot change under it, so
   // their summary is read once for the whole attempt, not once per turn.
   const dependencies = await dependenciesOf(r);
+  // The same holds for the context sections: read once, not once per turn.
+  const context = await contextOf(r);
   for (;;) {
     const note = await latestNote(r.cfg.tasksDir, r.task.id);
     const protocol = buildWorkerPrompt(r.task, {
       handoff: note?.markdown, workdir: r.cfg.workdir, tasksDir: r.cfg.tasksDir,
       taskDir: taskDirOf(r.cfg.tasksDir, r.task.id), logDir: logDirOf(r.cfg.tasksDir, r.task.id),
       ...(dependencies === null ? {} : { dependencies }),
+      ...(context.spec === undefined ? {} : { spec: context.spec }),
+      ...(context.profile === undefined ? {} : { profile: context.profile }),
+      ...(context.feedback === undefined ? {} : { feedback: context.feedback }),
     });
     const prompt = r.batch === undefined ? protocol : `${r.batch.preamble}${protocol}`;
     let model: string | undefined;

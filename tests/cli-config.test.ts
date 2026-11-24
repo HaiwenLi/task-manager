@@ -129,4 +129,22 @@ describe("resolveConfig", () => {
   it("still only accepts the opencode agent", () => {
     expect(() => resolveConfig({ agent: "kimi" }, "taskctl.json")).toThrow(/unknown agent/);
   });
+
+  it("accepts workerContext switches and fills the absent ones", () => {
+    // Absent stays absent: the worker's own default (both on) then applies.
+    expect(resolveConfig({}, "taskctl.json").workerContext).toBeUndefined();
+    expect(resolveConfig({ workerContext: {} }, "taskctl.json").workerContext).toEqual({ spec: true, preferences: true });
+    expect(resolveConfig({ workerContext: { spec: false } }, "taskctl.json").workerContext).toEqual({ spec: false, preferences: true });
+    expect(resolveConfig({ workerContext: { preferences: false } }, "taskctl.json").workerContext).toEqual({ spec: true, preferences: false });
+    expect(resolveConfig({ workerContext: { spec: false, preferences: false } }, "taskctl.json").workerContext).toEqual({ spec: false, preferences: false });
+  });
+
+  it("rejects a workerContext that is not an object of booleans", () => {
+    expect(() => resolveConfig({ workerContext: "no" }, "taskctl.json")).toThrow(/workerContext/);
+    expect(() => resolveConfig({ workerContext: null }, "taskctl.json")).toThrow(/workerContext/);
+    expect(() => resolveConfig({ workerContext: [] }, "taskctl.json")).toThrow(/workerContext/);
+    expect(() => resolveConfig({ workerContext: { spec: "yes" } }, "taskctl.json")).toThrow(/workerContext/);
+    expect(() => resolveConfig({ workerContext: { spec: null } }, "taskctl.json")).toThrow(/workerContext/);
+    expect(() => resolveConfig({ workerContext: { other: true } }, "taskctl.json")).toThrow(/workerContext/);
+  });
 });
