@@ -39,11 +39,17 @@ function within(root: string, path: string): boolean {
   return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
 }
 
-/** A process-shared mutex. Waiting has a deadline; ownership never has a TTL. */
-async function withRegistryMutex<T>(registryDir: string, action: () => Promise<T>): Promise<T> {
+/** How long a caller waits for the registry mutex before giving up. */
+const REGISTRY_MUTEX_WAIT_MS = 5_000;
+
+/**
+ * A process-shared mutex. Waiting has a deadline; ownership never has a TTL.
+ * `waitMs` exists for tests that exercise the deadline itself.
+ */
+async function withRegistryMutex<T>(registryDir: string, action: () => Promise<T>, waitMs = REGISTRY_MUTEX_WAIT_MS): Promise<T> {
   await mkdir(registryDir, { recursive: true });
   const mutex = join(registryDir, "mutex");
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + waitMs;
   for (;;) {
     try {
       await mkdir(mutex);
@@ -153,12 +159,14 @@ async function gitCommonDir(canonical: string): Promise<string | null> {
  * The local marker is always in cwd, so git init/removal cannot change lock identity.
  * Registry records precede local acquisition and never expire. Missing/replaced
  * markers, interrupted operations and corrupt state require operator cleanup.
- * registryDir is an isolation hook for tests; production callers share the default.
+ * registryDir and mutexWaitMs are hooks for tests; production callers share the
+ * defaults.
  */
 export async function reserveWorkspace(
   cwd: string,
   attemptId: string,
   registryDir: string = DEFAULT_REGISTRY,
+  mutexWaitMs: number = REGISTRY_MUTEX_WAIT_MS,
 ): Promise<WorkspaceReservation | null> {
   const canonical = await realpath(cwd);
   if (!(await lstat(canonical)).isDirectory()) throw new Error(`Workspace is not a directory: ${canonical}`);
@@ -209,7 +217,7 @@ export async function reserveWorkspace(
               throw error;
             }
             await writeRegistry(registryDir, currentRecords.filter((item) => item.token !== record.token));
-          });
+          }, mutexWaitMs);
           released = true;
         },
       };
@@ -235,7 +243,7 @@ export async function reserveWorkspace(
       if (code(error) === "EEXIST") return null;
       throw error;
     }
-  });
+  }, mutexWaitMs);
 }
 
 /**

@@ -192,7 +192,10 @@ describe("reserveWorkspace", () => {
   it("never steals an old registry mutex", async () => {
     await mkdir(join(registryDir, "mutex"), { recursive: true });
     await utimes(join(registryDir, "mutex"), new Date(0), new Date(0));
-    await expect(reserveWorkspace(cwd, "blocked")).rejects.toThrow(/mutex.*busy/i);
+    // The production wait is five seconds. What is under test is that a stale
+    // mutex is waited out and reported, never taken over, so only the wait is
+    // shortened here.
+    await expect(reserveWorkspaceInRegistry(cwd, "blocked", registryDir, 60)).rejects.toThrow(/mutex.*busy/i);
     expect(await readdir(join(registryDir, "mutex"))).toEqual([]);
   }, 15_000);
 
