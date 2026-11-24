@@ -41,6 +41,7 @@ type JsonObject = Record<string, unknown>;
  *   reported as -1 — non-zero either way, which is all callers test.
  * - Control plane: `opencode api <operation> --param key=value` prints one
  *   JSON object `{"location":…,"data":…}`; `session.get` gives token counts,
+ *   `session.message.list` gives the model a session last ran on, and
  *   `model.list` gives per-model context limits.
  *
  * Every child is spawned as an explicit `spawn(file, args)` array with
@@ -320,9 +321,7 @@ export class OpenCodeAdapter implements AgentAdapter {
     const data = asObject((await this.api("session.get", [`sessionID=${sessionId}`])).data);
     const tokens = asObject(data?.tokens);
     const cache = asObject(tokens?.cache);
-    const model = asObject(data?.model);
-    const providerID = typeof model?.providerID === "string" ? model.providerID : "";
-    const id = typeof model?.id === "string" ? model.id : "";
+    const model = await this.sessionModel(sessionId, data?.model);
     return {
       input: count(tokens?.input),
       output: count(tokens?.output),
@@ -330,7 +329,7 @@ export class OpenCodeAdapter implements AgentAdapter {
       cacheRead: count(cache?.read),
       cacheWrite: count(cache?.write),
       ...(typeof data?.cost === "number" && Number.isFinite(data.cost) ? { cost: data.cost } : {}),
-      ...(providerID && id ? { model: `${providerID}/${id}` } : {}),
+      ...(model === undefined ? {} : { model }),
     };
   }
 
@@ -344,11 +343,8 @@ export class OpenCodeAdapter implements AgentAdapter {
       if (!data) return "unavailable";
       const time = asObject(data.time);
       if (typeof time?.busy === "number" && time.idle === undefined && (data.outcome === undefined || data.outcome === null)) return "active";
-      const model = asObject(data.model);
-      const actualModel = typeof model?.providerID === "string" && typeof model.id === "string"
-        ? `${model.providerID}/${model.id}`
-        : undefined;
       const directory = asObject(data.location)?.directory;
+      const actualModel = await this.sessionModel(sessionId, data.model);
       const expectedModel = expected.model.replace(/#.*$/, "");
       const normalize = (path: string) => {
         const value = resolve(path);
@@ -361,6 +357,41 @@ export class OpenCodeAdapter implements AgentAdapter {
     } catch {
       return "unavailable";
     }
+  }
+
+  /**
+   * The model a session last ran on, as `providerID/id`. `session.get`
+   * carried it until opencode 2.4; the current service (v2.4.1, verified
+   * 2026-11-24) reports it only on the assistant messages, newest first, so
+   * one small page is read when the session record has none. A lookup that
+   * fails or times out answers "unknown" — never a guess.
+   */
+  private async sessionModel(sessionId: string, reported: unknown): Promise<string | undefined> {
+    const inline = modelId(asObject(reported));
+    if (inline !== undefined) return inline;
+    let messages: unknown[];
+    try {
+      const envelope = await within(this.api("session.message.list", [`sessionID=${sessionId}`, "limit=8"]), 4_000);
+      messages = Array.isArray(envelope.data) ? envelope.data : [];
+    } catch {
+      return undefined;
+    }
+    // The newest assistant turn is what a resume would continue. Pick it by
+    // its own time so neither listing order nor interleaved user/idle
+    // entries can decide.
+    let newest: JsonObject | undefined;
+    let newestAt = Number.NEGATIVE_INFINITY;
+    for (const message of messages) {
+      const entry = asObject(message);
+      if (entry?.type !== "assistant") continue;
+      const created = asObject(entry.time)?.created;
+      const at = typeof created === "number" ? created : Number.NEGATIVE_INFINITY;
+      if (newest === undefined || at > newestAt) {
+        newest = entry;
+        newestAt = at;
+      }
+    }
+    return modelId(asObject(newest?.model));
   }
 
   /**
@@ -446,6 +477,13 @@ function stderrSnippet(stderr: string): string {
 /** A finite number counts; anything missing or exotic is 0 tokens. */
 function count(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+/** `providerID/id` of a model record that names both; anything else is unknown. */
+function modelId(model: JsonObject | undefined): string | undefined {
+  return typeof model?.providerID === "string" && typeof model.id === "string"
+    ? `${model.providerID}/${model.id}`
+    : undefined;
 }
 
 /** Narrow `unknown` to a plain object, else undefined. */

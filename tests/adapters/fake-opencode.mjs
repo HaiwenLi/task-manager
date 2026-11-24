@@ -1,13 +1,18 @@
 // Fake opencode CLI — the test double for OpenCodeAdapter (Task 6).
 //
-// Mirrors exactly the two surfaces the adapter uses, as verified against the
-// real opencode v2.0.29 CLI (never invoked in tests):
+// Mirrors exactly the surfaces the adapter uses. The `run` transcript was
+// verified against the real opencode v2.0.29 CLI; the session shapes were
+// re-verified against v2.4.1 on 2026-11-24 (never invoked in tests):
 //
-//   run                       → NDJSON event lines on stdout; one JSON object
-//                               per line; every line carries sessionID. Exit
-//                               code comes from $FAKE_EXIT_CODE (default 0).
-//   api session.get --param … → one JSON object {"location":…,"data":…}
-//   api model.list            → one JSON object {"data":[…]}
+//   run                         → NDJSON event lines on stdout; one JSON object
+//                                  per line; every line carries sessionID. Exit
+//                                  code comes from $FAKE_EXIT_CODE (default 0).
+//   api session.get --param …   → one JSON object {"data":…} WITHOUT a model:
+//                                  v2.4.1 answers id/projectID/cost/tokens/
+//                                  outcome/time/title/location only
+//   api session.message.list    → {"data":[…]} newest first; each assistant
+//                                  message carries model {providerID, id}
+//   api model.list              → one JSON object {"data":[…]}
 //
 // Extra test hooks, all optional and inherited via process.env:
 //   FAKE_ARGV_FILE   — path to write the received argv (JSON array) to, so
@@ -32,6 +37,18 @@
 //                      was asked to stop to this file
 //   FAKE_INTERRUPT_UNAVAILABLE — `api session.interrupt` fails: an older or
 //                      unreachable service
+//   FAKE_SESSION_STATUS / _PROVIDER / _MODEL / _CWD — the session the `api`
+//                      face answers for: idle | active | missing, the model it
+//                      last ran on, and its directory
+//   FAKE_SESSION_MODELS — JSON array of `provider/id`, oldest first: one
+//                      assistant message per entry (default: the single
+//                      FAKE_SESSION_PROVIDER/FAKE_SESSION_MODEL turn)
+//   FAKE_MESSAGES_OLDEST_FIRST — list messages oldest first; the adapter must
+//                      pick by message time, not by position
+//   FAKE_SESSION_MODEL_IN_GET — put `model` back on session.get, as services
+//                      before 2.4 did
+//   FAKE_MESSAGE_LIST_FAILS — `api session.message.list` fails: a service
+//                      without the operation
 import { appendFileSync, writeFileSync } from "node:fs";
 
 const argv = process.argv.slice(2);
@@ -108,7 +125,9 @@ if (subcommand === "run") {
       data: process.env.FAKE_SESSION_STATUS === "missing" ? null : {
         tokens: { input: 1000, output: 200, reasoning: 100, cache: { read: 50, write: 25 } },
         cost: 0.25,
-        model: { providerID: process.env.FAKE_SESSION_PROVIDER ?? "anthropic", id: process.env.FAKE_SESSION_MODEL ?? "sonnet", variant: "default" },
+        ...(process.env.FAKE_SESSION_MODEL_IN_GET
+          ? { model: { providerID: process.env.FAKE_SESSION_PROVIDER ?? "anthropic", id: process.env.FAKE_SESSION_MODEL ?? "sonnet", variant: "default" } }
+          : {}),
         location: { directory: process.env.FAKE_SESSION_CWD ?? process.cwd() },
         time: process.env.FAKE_SESSION_STATUS === "active"
           ? { busy: Date.now() }
@@ -137,6 +156,32 @@ if (subcommand === "run") {
     // envelope): a double that invents a wrapper here passes the unit tests
     // and fails against the real CLI.
     process.stdout.write(`${JSON.stringify({ interrupted: true })}\n`);
+    process.exitCode = 0;
+  }
+} else if (subcommand === "api" && operation === "session.message.list") {
+  // The model a session ran on lives on its assistant messages (v2.4.1). Only
+  // the shapes the adapter reads are reproduced: newest first by default.
+  if (process.env.FAKE_MESSAGE_LIST_FAILS) {
+    process.stderr.write(`UnknownError: Operation not found: session.message.list\n`);
+    process.exitCode = 1;
+  } else {
+    const models = JSON.parse(process.env.FAKE_SESSION_MODELS
+      ?? JSON.stringify([`${process.env.FAKE_SESSION_PROVIDER ?? "anthropic"}/${process.env.FAKE_SESSION_MODEL ?? "sonnet"}`]));
+    const now = Date.now();
+    const turns = models.map((model, index) => {
+      const slash = model.indexOf("/");
+      const at = now - (models.length - index) * 1000;
+      return [
+        { id: `msg_u${index}`, time: { created: at - 500 }, type: "user", text: "do it" },
+        {
+          id: `msg_a${index}`, time: { created: at }, type: "assistant",
+          model: { providerID: model.slice(0, slash), id: model.slice(slash + 1) }, content: [],
+        },
+      ];
+    }).flat();
+    const idle = { id: "msg_idle", time: { created: now }, type: "idle", outcome: "succeeded" };
+    const data = process.env.FAKE_MESSAGES_OLDEST_FIRST ? [...turns, idle] : [idle, ...[...turns].reverse()];
+    process.stdout.write(`${JSON.stringify({ data, cursor: { next: null } })}\n`);
     process.exitCode = 0;
   }
 } else if (subcommand === "api" && operation === "model.list") {

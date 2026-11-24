@@ -30,6 +30,10 @@ afterEach(async () => {
   delete process.env.FAKE_SESSION_PROVIDER;
   delete process.env.FAKE_SESSION_MODEL;
   delete process.env.FAKE_SESSION_CWD;
+  delete process.env.FAKE_SESSION_MODELS;
+  delete process.env.FAKE_MESSAGES_OLDEST_FIRST;
+  delete process.env.FAKE_SESSION_MODEL_IN_GET;
+  delete process.env.FAKE_MESSAGE_LIST_FAILS;
   await rm(cwd, { recursive: true, force: true });
 });
 
@@ -249,5 +253,78 @@ describe("OpenCodeAdapter session status and usage", () => {
       cacheRead: 50, cacheWrite: 25, cost: 0.25,
       model: "anthropic/sonnet",
     });
+  });
+
+  // 真实服务 v2.4.1（2026-11-24 Live 核实）：session.get 只回
+  // id/projectID/cost/tokens/outcome/time/title/location，没有 model；
+  // 模型只在 assistant 消息上。只读 session.get 的探测在真实后端上恒为 unavailable。
+  it("derives the model from the newest assistant message when session.get omits it", async () => {
+    const log = join(cwd, "api-calls.log");
+    process.env.FAKE_API_LOG = log;
+    const argvFile = captureArgv("message-list");
+    process.env.FAKE_SESSION_STATUS = "idle";
+    process.env.FAKE_SESSION_CWD = cwd;
+
+    await expect(makeAdapter().canResumeSession("ses_fake123", { model: "anthropic/sonnet", cwd })).resolves.toBe("reusable");
+
+    expect((await readFile(log, "utf8")).trim().split(/\r?\n/)).toEqual(["api session.get", "api session.message.list"]);
+    await expect(readArgv(argvFile)).resolves.toEqual([
+      "api", "session.message.list", "--param", "sessionID=ses_fake123", "--param", "limit=8",
+    ]);
+  });
+
+  it("refuses reuse when the newest assistant message names another model", async () => {
+    process.env.FAKE_SESSION_STATUS = "idle";
+    process.env.FAKE_SESSION_CWD = cwd;
+    process.env.FAKE_SESSION_MODEL = "opus";
+
+    await expect(makeAdapter().canResumeSession("ses_fake123", { model: "anthropic/sonnet", cwd })).resolves.toBe("unavailable");
+  });
+
+  it("lets the newest assistant message decide after a mid-session model switch, whatever the listing order", async () => {
+    process.env.FAKE_SESSION_STATUS = "idle";
+    process.env.FAKE_SESSION_CWD = cwd;
+    process.env.FAKE_SESSION_MODELS = JSON.stringify(["openai/gpt", "anthropic/sonnet"]);
+    const adapter = makeAdapter();
+
+    await expect(adapter.canResumeSession("ses_fake123", { model: "anthropic/sonnet", cwd })).resolves.toBe("reusable");
+    await expect(adapter.canResumeSession("ses_fake123", { model: "openai/gpt", cwd })).resolves.toBe("unavailable");
+
+    process.env.FAKE_MESSAGES_OLDEST_FIRST = "1";
+    await expect(adapter.canResumeSession("ses_fake123", { model: "anthropic/sonnet", cwd })).resolves.toBe("reusable");
+  });
+
+  it("leaves a session without an assistant turn unavailable and its usage without a model", async () => {
+    process.env.FAKE_SESSION_STATUS = "idle";
+    process.env.FAKE_SESSION_CWD = cwd;
+    process.env.FAKE_SESSION_MODELS = "[]";
+    const adapter = makeAdapter();
+
+    await expect(adapter.canResumeSession("ses_fake123", { model: "anthropic/sonnet", cwd })).resolves.toBe("unavailable");
+    const usage = await adapter.sessionUsage("ses_fake123");
+    expect(usage).toMatchObject({ input: 1000, output: 200 });
+    expect("model" in usage).toBe(false);
+  });
+
+  it("still reads a session.get that carries the model, as services before 2.4 did", async () => {
+    const log = join(cwd, "api-calls.log");
+    process.env.FAKE_API_LOG = log;
+    process.env.FAKE_SESSION_MODEL_IN_GET = "1";
+    process.env.FAKE_SESSION_STATUS = "idle";
+    process.env.FAKE_SESSION_CWD = cwd;
+
+    await expect(makeAdapter().canResumeSession("ses_fake123", { model: "anthropic/sonnet", cwd })).resolves.toBe("reusable");
+
+    expect((await readFile(log, "utf8")).trim().split(/\r?\n/)).toEqual(["api session.get"]);
+  });
+
+  it("keeps token usage and refuses reuse when the service cannot list messages", async () => {
+    process.env.FAKE_MESSAGE_LIST_FAILS = "1";
+    process.env.FAKE_SESSION_STATUS = "idle";
+    process.env.FAKE_SESSION_CWD = cwd;
+    const adapter = makeAdapter();
+
+    await expect(adapter.sessionUsage("ses_fake123")).resolves.toMatchObject({ input: 1000, output: 200 });
+    await expect(adapter.canResumeSession("ses_fake123", { model: "anthropic/sonnet", cwd })).resolves.toBe("unavailable");
   });
 });
