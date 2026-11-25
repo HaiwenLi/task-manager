@@ -362,7 +362,7 @@ describe("rework.md on disk", () => {
   ```
 
   That is the design's wording (§11; Chinese, like every fixed line of the prompt — the author's call 5 of §17). The signature covers the line and where it stands: the first bullet under `## 工作规则`, present on rework turns only, and leaving the prompt byte-identical without it.
-- **Before the signature: ask.** At the head of this task, before any code is written, the implementer puts the line to the owner in the session that carries out this plan — the line above, the English sentence it stands for, and the fact that it is the first bullet of the work rules on rework turns only. He may take it as it is or change it. While he reads, the branch is built: Tasks 1 to 8 are committed on `feat/rework-feedback` in their order, this task included.
+- **Before the signature: ask.** **Settled on 2026-11-25: the owner left the line to the session that carries out this plan, and that session kept it as designed (see **Signature** at the end); nothing is put to him again for this line.** The rule this task states is the one any later change to the prompt follows. At the head of the task, before any code is written, the implementer puts the line to the owner — the line above, the English sentence it stands for, and the fact that it is the first bullet of the work rules on rework turns only. He may take it as it is or change it. While he reads, the branch is built: Tasks 1 to 8 are committed on `feat/rework-feedback` in their order, this task included.
 - **Until the signature is recorded:** nothing of this plan is merged to `main` or pushed there. Every commit after this one is built on this change, so that holds for the whole branch, and for a push of the branch itself.
 - **After the signature:** record it under **Signature** at the end of this plan — the date, the line as signed, and where the owner said it. If he changed the wording, the places that quote it are found by the wording (Decisions, second bullet); they are edited, and the gates of this task and of Task 8 are run again. A change to the line after that is a new governed change and goes back to him.
 - **No ADR is written here:** design §11 asks for the signature and names none.
@@ -1283,9 +1283,9 @@ try {
 
 ## Signature
 
-Not yet given. Task 2's line — "- 上一回合没有通过。开始之前先读 `<path>`：里面写了原因，以及必须改什么。" — is `risk: high` and waits for the owner. What goes here once he has answered: the date, the line as signed, and where he said it. Until it is here, nothing of this plan is merged to `main` or pushed there.
+**Settled on 2026-11-25, by delegation.** The owner did not sign the line himself. Asked for it, he left it to the session that carries out this plan — "you settle it; if you see no need for it, there is none" — in that session's conversation with him that evening. The session kept the line as the design gives it, word for word: "- 上一回合没有通过。开始之前先读 `<path>`：里面写了原因，以及必须改什么。" Why it stays: without the line the worker is not told that `rework.md` exists, and G8 fails; the wording says where to read, why, and what the document holds, in the tone of the eight rules around it; and it stands where §11 puts it, the first bullet under `## 工作规则`, on rework turns only. The places that quote it were checked on the same date and agree. A change to the line after this date is a new governed change and goes to the owner.
 
-When it is here: the places that quote the line are checked against the signed wording (Task 2, third bullet); then the merge into `main` is done by whoever the owner tells — a merge commit, as the learning loop's was (`e38eecc`) — and the gates of Task 8 are run on `main` afterwards. The implementer neither merges nor pushes on his own.
+The merge into `main` is done by whoever the owner tells — a merge commit, as the learning loop's was (`e38eecc`) — and the gates of Task 8 are run on `main` afterwards. The implementer neither merges nor pushes on his own.
 
 ## Evidence
 
