@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentAdapter } from "../src/adapters/types.js";
+import type { AcceptanceResult } from "../src/acceptance.js";
 import { runCli } from "../src/cli.js";
 import { McpClientError } from "../src/mcp-client.js";
 import type { MemoryBackend, MemoryHit } from "../src/memory.js";
@@ -53,7 +54,7 @@ const passReview = async () => ({
 });
 
 /** Fixture acceptance: every command passes. */
-const passGate = async () => ({ passed: true, exitCode: 0, output: "", skipped: false });
+const passGate = async (): Promise<AcceptanceResult> => ({ passed: true, exitCode: 0, output: "", skipped: false });
 
 /** 捕获 CLI 输出的注入 seam（status 测试另按 brief 用 console spy）。 */
 function capture(): {

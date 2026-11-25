@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { callTools, McpClientError } from "../src/mcp-client.js";
 import {
   buildRecallQuery,
@@ -9,14 +9,15 @@ import {
   type MemoryBackend,
   type MemoryConfig,
   type MemoryHit,
+  type RecallIo,
 } from "../src/memory.js";
 
 const cfg: MemoryConfig = { command: ["x"], excludeWings: ["dify_deploy"], rooms: ["pitfall", "pattern", "decision"], minSimilarity: 0.55, maxItems: 5, maxChars: 2_000, itemChars: 400, timeoutMs: 20_000 };
 const hit = (drawerId: string, similarity: number, wing = "w", room = "pitfall", text = "t") => ({ drawerId, similarity, wing, room, text });
 const input = { title: "t", description: "d", spec: null, at: "2026-11-25T00:00:00.000Z" };
 const fakeBackend = (groups: MemoryHit[][]): MemoryBackend => ({ name: "fake", searchAll: async () => groups });
-let io: { write: ReturnType<typeof vi.fn>; journal: ReturnType<typeof vi.fn> };
-beforeEach(() => { io = { write: vi.fn(), journal: vi.fn() }; });
+let io: { write: Mock<RecallIo["write"]>; journal: Mock<RecallIo["journal"]> };
+beforeEach(() => { io = { write: vi.fn<RecallIo["write"]>(), journal: vi.fn<RecallIo["journal"]>() }; });
 
 describe("memory layer", () => {
   it("keeps a hit at the threshold and drops one below it", () => {
