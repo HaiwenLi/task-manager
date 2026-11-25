@@ -111,14 +111,14 @@ let configWithoutMemory: string;
 let configMemoryOff: string;
 
 /**
- * A `taskctl.json` under `root`, pointing at the tasks dir. The memory
- * block's command names a file that exists nowhere: `recall` is given its
- * backend through the seam in these tests, and one that ever built its own
- * could not reach a real server from here.
+ * A `taskctl.json` under `root`, pointing at the tasks dir and carrying
+ * whatever `extra` names. The memory block's command names a file that exists
+ * nowhere: `recall` is given its backend through the seam in these tests, and
+ * one that ever built its own could not reach a real server from here.
  */
-async function writeConfig(name: string, memory: Record<string, unknown> | undefined): Promise<string> {
+async function writeConfig(name: string, memory: Record<string, unknown> | undefined, extra: Record<string, unknown> = {}): Promise<string> {
   const path = join(root, name);
-  const config: Record<string, unknown> = { tasksDir: tasks, workdir: join(root, "workspace") };
+  const config: Record<string, unknown> = { tasksDir: tasks, workdir: join(root, "workspace"), ...extra };
   if (memory !== undefined) config.memory = { command: [join(root, "no-such-memory-server", "mempalace-mcp.exe")], ...memory };
   await writeFile(path, JSON.stringify(config), "utf8");
   return path;
@@ -164,6 +164,15 @@ afterEach(async () => {
 
 /** The files under `root` that a recall must never leave behind. */
 const recallFiles = async () => (await filesUnder(root)).filter((file) => file.endsWith("recall.json"));
+
+/** A rule file of the owner's, outside the tasks dir: in a directory whose name no line of the output may carry. */
+async function writeSource(name: string, content: string): Promise<string> {
+  const dir = join(root, "owner-rules");
+  await mkdir(dir, { recursive: true });
+  const path = join(dir, name);
+  await writeFile(path, content, "utf8");
+  return path;
+}
 
 describe("taskctl recall", () => {
   it("recall --query prints the hits and the section without writing anything", async () => {
@@ -274,6 +283,84 @@ describe("taskctl recall", () => {
     expect(cap.lines).toEqual(['memory backend is "none"; nothing to recall']);
     expect(cap.errors).toEqual([]);
     expect(calls).toHaveLength(0);
+  });
+
+  it("recall prints the fixed sources before what memory found", async () => {
+    const cap = capture();
+    const { backend } = fakeBackend([[hit("d1", "RECALLED LESSON")]]);
+    const voice = await writeSource("voice.md", "称呼一律「你」，不用「您」\n");
+
+    const code = await runCli(
+      ["recall", "--query", "q", "--config", await writeConfig("sources-on.json", { backend: "mempalace" }, { fixedSources: [voice] })],
+      { memory: backend, ...cap.deps },
+    );
+
+    expect(code).toBe(0);
+    // How each file was read, then the files as the worker prompt carries them; the recall follows as it always did.
+    expect(cap.lines).toEqual([
+      "fixed sources: voice.md=13",
+      "【voice.md】",
+      "称呼一律「你」，不用「您」",
+      "query: q",
+      "backend: fake, outcome: ok, hits: 1, below=0 room=0 wing=0",
+      "- [w/pitfall · -] RECALLED LESSON",
+    ]);
+    expect(cap.errors).toEqual([]);
+  });
+
+  it("recall prints the fixed sources and exits 0 when memory is off", async () => {
+    const cap = capture();
+    const voice = await writeSource("voice.md", "称呼一律「你」，不用「您」\n");
+
+    const code = await runCli(["recall", "--query", "q", "--config", await writeConfig("sources-off.json", undefined, { fixedSources: [voice] })], cap.deps);
+
+    expect(code).toBe(0);
+    expect(cap.lines).toEqual([
+      "fixed sources: voice.md=13",
+      "【voice.md】",
+      "称呼一律「你」，不用「您」",
+      'memory backend is "none"; nothing to recall',
+    ]);
+    expect(cap.errors).toEqual([]);
+  });
+
+  it("recall exits 1 when a source is missing or cannot be read, and names it by file name and state", async () => {
+    const cap = capture();
+    const { backend } = fakeBackend([[hit("d1", "RECALLED LESSON")]]);
+    const voice = await writeSource("voice.md", "称呼一律「你」，不用「您」\n");
+    // One source was never written; another is a directory where a file is named.
+    await mkdir(join(root, "owner-rules", "x.md"), { recursive: true });
+
+    const code = await runCli(
+      ["recall", "--query", "q", "--config", await writeConfig("sources-broken.json", { backend: "mempalace" }, {
+        fixedSources: [voice, join(root, "owner-rules", "notes.md"), join(root, "owner-rules", "x.md")],
+      })],
+      { memory: backend, ...cap.deps },
+    );
+
+    expect(code).toBe(1);
+    expect(cap.lines).toEqual([
+      "fixed sources: voice.md=13; notes.md=missing; x.md=unreadable(EISDIR)",
+      "【voice.md】",
+      "称呼一律「你」，不用「您」",
+      "query: q",
+      "backend: fake, outcome: ok, hits: 1, below=0 room=0 wing=0",
+      "- [w/pitfall · -] RECALLED LESSON",
+    ]);
+    expect(cap.errors).toEqual(["source unavailable: notes.md (missing)", "source unavailable: x.md (unreadable: EISDIR)"]);
+  });
+
+  it("recall exits 1 when memory is off and a source is missing", async () => {
+    const cap = capture();
+
+    const code = await runCli(
+      ["recall", "--query", "q", "--config", await writeConfig("off-broken.json", undefined, { fixedSources: [join(root, "owner-rules", "notes.md")] })],
+      cap.deps,
+    );
+
+    expect(code).toBe(1);
+    expect(cap.lines).toEqual(["fixed sources: notes.md=missing", 'memory backend is "none"; nothing to recall']);
+    expect(cap.errors).toEqual(["source unavailable: notes.md (missing)"]);
   });
 
   it("recall needs exactly one of --task and --query", async () => {

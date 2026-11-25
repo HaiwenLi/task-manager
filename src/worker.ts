@@ -6,7 +6,7 @@ import { waitReason } from "./eligibility.js";
 import { dependencySummary } from "./dependencies.js";
 import { latestNote, writeNote, type HandoffNote } from "./handoff.js";
 import { startAcceptance, type AcceptanceResult } from "./acceptance.js";
-import { readContextSections, type ContextSections } from "./context.js";
+import { readContextSections, readFixedSources, sourcesDetail, type ContextSections } from "./context.js";
 import { createMempalaceBackend, runRecall, type MemoryBackend, type MemorySettings } from "./memory.js";
 import { buildWorkerPrompt } from "./protocol.js";
 import type { TaskStore } from "./task-store.js";
@@ -113,6 +113,13 @@ export type WorkerConfig = {
    * means both. Resolved from the `workerContext` block of `taskctl.json`.
    */
   workerContext?: { spec: boolean; preferences: boolean };
+  /**
+   * Files holding the owner's own rules (how text is to be written, what must
+   * never happen), read by path for every attempt and given to the worker as
+   * they stand: never searched for, never ranked. Absent or empty means off.
+   * Resolved from the `fixedSources` list of `taskctl.json`.
+   */
+  fixedSources?: string[];
   /**
    * Memory recall for an attempt: the settings with the backend switch.
    * Absent, or a backend of `none`, means off — no recall, no record, no
@@ -955,10 +962,11 @@ async function dependenciesOf(r: Run): Promise<string | null> {
 
 /**
  * The context sections one attempt was given: what `readContextSections`
- * reads from disk, and — when memory is on — what recall found, as the lines
- * the prompt shows. An absent `memory` is no memory section.
+ * reads from disk, the fixed sources read by file, and — when memory is on —
+ * what recall found, as the lines the prompt shows. An absent `memory` is no
+ * memory section, and an absent `fixedSources` is no fixed-sources section.
  */
-export type WorkerContext = ContextSections & { memory?: string };
+export type WorkerContext = ContextSections & { fixedSources?: string; memory?: string };
 
 /**
  * The context sections of this attempt, read once for the whole attempt: a
@@ -986,6 +994,14 @@ async function contextOf(r: Run): Promise<WorkerContext> {
  * deadline, ends its own child and never throws, so nothing here can park the
  * task. A memory that cannot be reached costs the attempt its memory section
  * — never `blocked` — and leaves its reason in the record and the journal.
+ *
+ * The fixed sources sit between the two, and only when some are named. They
+ * are read by file, whatever the `workerContext` switches say: they are the
+ * owner's own rules, not this task's context. `readFixedSources` never
+ * throws — a file that is missing or cannot be read is a state, not an error
+ * — so the one line this adds to the journal is always written, all files
+ * missing included: a rule the owner counts on not reaching the worker is
+ * worth a record.
  */
 async function readSections(r: Run): Promise<WorkerContext> {
   const flags = r.cfg.workerContext ?? { spec: true, preferences: true };
@@ -998,6 +1014,12 @@ async function readSections(r: Run): Promise<WorkerContext> {
       // The section is the line that says it was cut, then the part that was kept.
       const kept = sections.profile!.length - sections.profile!.indexOf("\n") - 1;
       await noteContext(r, "profile-truncated", `profile cut; kept the newest ${kept} characters`);
+    }
+    if (r.cfg.fixedSources !== undefined && r.cfg.fixedSources.length > 0) {
+      const { text, files } = await readFixedSources(r.cfg.fixedSources);
+      await noteContext(r, "sources", sourcesDetail(files));
+      // Nothing was read, not even a clipped file: then there is no section to give.
+      if (text !== undefined) sections.fixedSources = text;
     }
     // Recall is off until a backend is named. What it finds is the last
     // section, and what was read before it is already in hand: the step sits
@@ -1070,6 +1092,7 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       ...(context.spec === undefined ? {} : { spec: context.spec }),
       ...(context.profile === undefined ? {} : { profile: context.profile }),
       ...(context.feedback === undefined ? {} : { feedback: context.feedback }),
+      ...(context.fixedSources === undefined ? {} : { fixedSources: context.fixedSources }),
       ...(context.memory === undefined ? {} : { memory: context.memory }),
     });
     const prompt = r.batch === undefined ? protocol : `${r.batch.preamble}${protocol}`;

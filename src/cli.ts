@@ -18,6 +18,7 @@ import { createCoalescedRefresh, renderBoardMarkdown, renderBoardTable, writeBoa
 import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
 import { readRelevantFeedback, recordTaskFeedback, type FeedbackEvent } from "./feedback.js";
+import { readFixedSources, sourcesDetail } from "./context.js";
 import { humanTouches, modelFirstPass, readFlowInput, summarizeFlow, type HumanTouch, type ModelFirstPass } from "./metrics.js";
 import { clearQuestions, questionsPath, readQuestions, writeQuestions } from "./questions.js";
 import { waitReason } from "./eligibility.js";
@@ -462,9 +463,16 @@ async function taskRecallInput(tasksDir: string, id: string): Promise<Omit<Recal
  * is normalised as every recall query is: whitespace collapsed, 250
  * characters at most.
  *
+ * The fixed sources are shown first, as they are placed in the prompt, and
+ * whether memory is on or not: one line saying how each file was read, then
+ * the files as the prompt carries them. A file that is missing or cannot be
+ * read is said on a line of its own — by file name and state, never by path
+ * — and the exit code is 1, whatever memory then found.
+ *
  * Exit code 0 when something was kept and when nothing was — an empty memory
- * is an answer — and 1 when the backend could not answer in time or at all.
- * With memory off there is nothing to ask; that is said, and is no failure.
+ * is an answer — and 1 when the backend could not answer in time or at all,
+ * or when a fixed source could not be read. With memory off there is nothing
+ * to ask; that is said, and is no failure.
  */
 async function recallCommand(
   flags: Map<string, string>, deps: CliDeps, log: (line: string) => void, err: (line: string) => void,
@@ -479,9 +487,23 @@ async function recallCommand(
     throw new UsageError("recall needs text after --query");
   }
   const cfg = await configFor(flags);
+  // The fixed sources come first, as they do in the prompt, and whether memory is on or not. `readFixedSources`
+  // never throws: a file that cannot be read costs a line to `err` and the exit code, never the rest of the preview.
+  let sourceFailed = false;
+  if (cfg.fixedSources !== undefined && cfg.fixedSources.length > 0) {
+    const { text, files } = await readFixedSources(cfg.fixedSources);
+    log(`fixed sources: ${sourcesDetail(files)}`);
+    // The blocks as the prompt carries them: nothing at all when no file could be read.
+    for (const line of text === undefined ? [] : text.split("\n")) log(line);
+    for (const { name, state, detail } of files) {
+      if (state !== "missing" && state !== "unreadable") continue;
+      err(`source unavailable: ${name} (${state}${detail === undefined ? "" : `: ${detail}`})`);
+      sourceFailed = true;
+    }
+  }
   if (cfg.memory === undefined || cfg.memory.backend === "none") {
     log('memory backend is "none"; nothing to recall');
-    return 0;
+    return sourceFailed ? 1 : 0;
   }
   const at = new Date().toISOString();
   const input: RecallInput = id === undefined
@@ -508,7 +530,7 @@ async function recallCommand(
   if (record.outcome === "timeout" || record.outcome === "error") {
     err(`recall unavailable: ${record.outcome}${record.detail === undefined ? "" : `: ${record.detail}`}`);
   }
-  return record.outcome === "ok" || record.outcome === "no-hits" ? 0 : 1;
+  return (record.outcome === "ok" || record.outcome === "no-hits") && !sourceFailed ? 0 : 1;
 }
 
 /**
@@ -1686,6 +1708,7 @@ export const CONFIG_KEYS = new Set([
   "chromeBin",
   "renderViewports",
   "workerContext",
+  "fixedSources",
   "memory",
   "allowedProviders",
   "allowedModels",
@@ -1735,6 +1758,7 @@ export function resolveConfig(raw: Record<string, unknown>, path: string): Resol
     chromeBin: string(raw, "chromeBin", path),
     renderViewports: stringArray(raw, "renderViewports", path),
     workerContext: workerContextSwitches(raw.workerContext, path),
+    fixedSources: fixedSourcePaths(raw, path),
     memory: memorySettings(raw.memory, path),
     // The budget guard's policy. Each is absent by default; what each one allows is in `src/budget.ts`.
     allowedProviders: stringArray(raw, "allowedProviders", path),
@@ -1770,6 +1794,20 @@ function workerContextSwitches(raw: unknown, path: string): WorkerConfig["worker
     throw new Error(`config ${path}: workerContext.preferences must be a boolean`);
   }
   return { spec, preferences };
+}
+
+/**
+ * The `fixedSources` list of `taskctl.json`: files the worker is given as
+ * they stand. Absent stays `undefined`, so nothing is read; an empty list is
+ * off too. Each path is made absolute the way `tasksDir` is, since the
+ * worker's cwd is its workdir and a relative path would point elsewhere
+ * there. `~` is not expanded, and a file need not exist: whether a source can
+ * be read is settled when it is read, per attempt, not by refusing the whole
+ * configuration.
+ */
+function fixedSourcePaths(raw: Record<string, unknown>, path: string): string[] | undefined {
+  const sources = stringArray(raw, "fixedSources", path);
+  return sources === undefined ? undefined : sources.map((source) => resolve(source));
 }
 
 /** The settings a `memory` block of `taskctl.json` may carry. */

@@ -7,7 +7,7 @@ import type { AcceptanceResult } from "../src/acceptance.js";
 import { SPEC_MAX_CHARS } from "../src/context.js";
 import { recordFeedback, type FeedbackRecord } from "../src/feedback.js";
 import { readJournal } from "../src/journal.js";
-import { buildWorkerPrompt, SPEC_NOTE } from "../src/protocol.js";
+import { buildWorkerPrompt, FIXED_SOURCES_NOTE, SPEC_NOTE } from "../src/protocol.js";
 import { profilePath } from "../src/profile.js";
 import { writeSpec } from "../src/spec.js";
 import type { Task, TaskStatus } from "../src/task-file.js";
@@ -206,6 +206,18 @@ async function attempt(cfg: WorkerConfig, turnsUntilDone = 1) {
   return { outcome, text: adapter.calls[0]?.text ?? "", turns: adapter.calls.length };
 }
 
+/** A rule file of the owner's, outside the tasks dir: in a directory whose name must reach neither the prompt nor the journal. */
+async function writeSource(name: string, content: string): Promise<string> {
+  const dir = join(root, "owner-rules");
+  await mkdir(dir, { recursive: true });
+  const path = join(dir, name);
+  await writeFile(path, content, "utf8");
+  return path;
+}
+
+/** The `sources` lines of task `a`'s journal: one for each attempt that read the fixed sources. */
+const sourcesLines = async () => (await readJournal(tasksDir, "a")).filter((line) => line.event === "sources");
+
 describe("runTask — worker context", () => {
   it("gives the worker the approved spec, the profile and the relevant corrections", async () => {
     // tasks/a.md open with a passing acceptance; tasks/a/spec.md containing "SPEC GOAL LINE";
@@ -280,5 +292,57 @@ describe("runTask — worker context", () => {
     expect(outcome).toBe("done");
     expect((await readJournal(tasksDir, "a")).filter((line) => line.event === "context-unavailable")).toHaveLength(1);
     expect(text).not.toContain("## 用户偏好");
+  });
+
+  it("gives the worker the fixed sources read by file, and journals one line for them", async () => {
+    // owner-rules/voice.md with one rule in it; fixedSources names that file. An attempt that needs two turns to finish.
+    const voice = await writeSource("voice.md", "称呼一律「你」，不用「您」\n");
+    const { outcome, text, turns } = await attempt(cfg(tasksDir, { fixedSources: [voice] }), 2);
+
+    expect(outcome).toBe("done");
+    expect(turns).toBe(2);
+    expect(text).toContain(`## 用户本人的规范（跨项目有效，不是检索来的）\n${FIXED_SOURCES_NOTE}\n【voice.md】\n称呼一律「你」，不用「您」\n`);
+    // Once for the attempt, not once per turn; and by file name: how the one file was read.
+    const journaled = await sourcesLines();
+    expect(journaled).toHaveLength(1);
+    expect(journaled[0]).toMatchObject({ stage: "worker", event: "sources", detail: "voice.md=13" });
+  });
+
+  it("journals a source that is missing, and finishes the attempt without the section", async () => {
+    // owner-rules/ exists and is empty: fixedSources names voice.md, which was never written.
+    await mkdir(join(root, "owner-rules"), { recursive: true });
+    const { outcome, text } = await attempt(cfg(tasksDir, { fixedSources: [join(root, "owner-rules", "voice.md")] }));
+
+    expect(outcome).toBe("done");
+    const journaled = await sourcesLines();
+    expect(journaled).toHaveLength(1);
+    expect(journaled[0]).toMatchObject({ stage: "worker", event: "sources", detail: "voice.md=missing" });
+    expect(text).not.toContain("## 用户本人的规范");
+    // A source that is not there is a fact about the attempt, not a failure of the task's context.
+    expect((await readJournal(tasksDir, "a")).map((line) => line.event)).not.toContain("context-unavailable");
+  });
+
+  it("names a source by its file name only: its directory reaches neither the prompt nor the journal", async () => {
+    // owner-rules/voice.md as above.
+    const voice = await writeSource("voice.md", "称呼一律「你」，不用「您」\n");
+    const { text } = await attempt(cfg(tasksDir, { fixedSources: [voice] }));
+
+    const journal = (await readJournal(tasksDir, "a")).map((line) => line.detail).join("\n");
+    // The prompt carries other paths of this attempt by design (its workdir, its tasks dir); the source's own is not among them.
+    expect(text).toContain("【voice.md】");
+    expect(text).not.toContain("owner-rules");
+    expect(journal).toContain("voice.md=13");
+    expect(journal).not.toContain("owner-rules");
+  });
+
+  it("reads nothing and journals nothing when the list of fixed sources is empty", async () => {
+    // owner-rules/voice.md as above; fixedSources is [].
+    await writeSource("voice.md", "称呼一律「你」，不用「您」\n");
+    const config = cfg(tasksDir, { fixedSources: [] });
+    const { outcome, text } = await attempt(config);
+
+    expect(outcome).toBe("done");
+    expect(text).toBe(legacyProtocol(config, task()));
+    expect(await sourcesLines()).toEqual([]);
   });
 });

@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import { basename } from "node:path";
 import type { Task } from "./task-file.js";
 import { pickFeedback, readFeedback, renderEntry, type FeedbackRecord } from "./feedback.js";
 import { readProfile } from "./profile.js";
@@ -11,9 +13,13 @@ export const PROFILE_MAX_CHARS = 2_000;
 export const WORKER_FEEDBACK_LIMIT = 5;
 /** Longest correction block a worker is given, in code points as rendered. */
 export const WORKER_FEEDBACK_MAX_CHARS = 1_500;
+/** Longest fixed source a worker is given, in code units; a longer one is clipped head and tail behind a visible marker. */
+export const FIXED_SOURCE_MAX_CHARS = 8_000;
 
 /** What stands where the middle of a too-long spec was left out. */
 const SPEC_CUT_MARKER = "\n\n…（规格过长，中段已省略）…\n\n";
+/** What stands where the middle of a too-long fixed source was left out. */
+const SOURCE_CUT_MARKER = "\n\n…（这个文件过长，中段已省略）…\n\n";
 
 /**
  * Keep the head and the tail of a text too long to show whole, with a visible
@@ -125,4 +131,75 @@ export async function readContextSections(tasksDir: string, task: Task, flags: C
  */
 function oneLine(text: string): string {
   return text.replace(/\s*\r?\n\s*/g, " ");
+}
+
+/** How one configured source fared: read whole, clipped, empty once trimmed, not there, or there and not readable. */
+export type FixedSourceState = "read" | "clipped" | "empty" | "missing" | "unreadable";
+/** How one configured source was read. `name` is the file's base name: a path is never shown, journaled or printed. */
+export type FixedSourceFile = { name: string; state: FixedSourceState; chars: number; detail?: string };
+
+/**
+ * The fixed sources of a configuration, read file by file, in the order they
+ * are named: the rules the owner keeps across projects — how text is to be
+ * written, what must never happen. They are read, never searched for, so no
+ * similarity decides whether a rule reaches the worker: a file that is there
+ * is always given, whole up to {@link FIXED_SOURCE_MAX_CHARS}.
+ *
+ * A file that cannot be given is reported, never thrown, and the next one is
+ * read. It is `missing` when there is no such file to read, a directory on
+ * the way to it that is not there included; `unreadable`, with the error's
+ * code, when the read failed any other way. Only that code is kept: the
+ * message of a failed read names the path.
+ *
+ * `text` is what the prompt carries: each file behind a line with its base
+ * name, a file too long behind a line saying how long it is whole. It is
+ * `undefined` when no file could be read at all.
+ */
+export async function readFixedSources(paths: readonly string[]): Promise<{ text: string | undefined; files: FixedSourceFile[] }> {
+  const files: FixedSourceFile[] = [];
+  const blocks: string[] = [];
+  for (const path of paths) {
+    const name = basename(path);
+    let raw: string;
+    try {
+      raw = await readFile(path, "utf8");
+    } catch (err) {
+      const error = err as NodeJS.ErrnoException;
+      files.push(error.code === "ENOENT" || error.code === "ENOTDIR"
+        ? { name, state: "missing", chars: 0 }
+        : { name, state: "unreadable", chars: 0, detail: error.code ?? error.name });
+      continue;
+    }
+    // As the file holds it, minus a byte-order mark, `\r\n` and the blank ends.
+    const text = (raw.startsWith("\uFEFF") ? raw.slice(1) : raw).replace(/\r\n/g, "\n").trim();
+    if (text.length === 0) {
+      files.push({ name, state: "empty", chars: 0 });
+      continue;
+    }
+    const clipped = text.length > FIXED_SOURCE_MAX_CHARS;
+    const content = clipped ? clipHeadTail(text, FIXED_SOURCE_MAX_CHARS, SOURCE_CUT_MARKER) : text;
+    files.push({ name, state: clipped ? "clipped" : "read", chars: content.length });
+    // A clipped file says how long it is whole, so nobody takes the excerpt for the file.
+    const notice = clipped ? `（文件共 ${text.length} 字符，这里只保留开头和结尾）\n` : "";
+    blocks.push(`【${name}】\n${notice}${content}`);
+  }
+  return { text: blocks.length === 0 ? undefined : blocks.join("\n\n"), files };
+}
+
+/**
+ * The fixed sources on one journal line: one item per file in the order
+ * configured, each the file's name and what came of reading it — how many
+ * characters were given, or that it was clipped, empty, missing, or could not
+ * be read and with what error.
+ */
+export function sourcesDetail(files: readonly FixedSourceFile[]): string {
+  return files.map((file) => {
+    switch (file.state) {
+      case "read": return `${file.name}=${file.chars}`;
+      case "clipped": return `${file.name}=clipped(${file.chars})`;
+      case "empty": return `${file.name}=empty`;
+      case "missing": return `${file.name}=missing`;
+      case "unreadable": return `${file.name}=unreadable(${file.detail})`;
+    }
+  }).join("; ");
 }

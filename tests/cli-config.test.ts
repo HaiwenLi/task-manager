@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { join } from "node:path";
 import { CONFIG_KEYS, resolveConfig } from "../src/cli.js";
 
 describe("resolveConfig", () => {
@@ -236,5 +237,28 @@ describe("resolveConfig", () => {
     expect(resolveConfig({ maxCostPerMillion: 1.5 }, "taskctl.json").maxCostPerMillion).toBe(1.5);
     expect(() => resolveConfig({ maxCostPerMillion: Number.NaN }, "taskctl.json")).toThrow(/maxCostPerMillion.*non-negative/);
     expect(() => resolveConfig({ maxCostPerMillion: Number.POSITIVE_INFINITY }, "taskctl.json")).toThrow(/maxCostPerMillion.*non-negative/);
+  });
+
+  it("reads fixed sources as a list of files, and none by default", () => {
+    // Absent stays absent: no source is read, and the worker's prompt is the one it always was.
+    expect(resolveConfig({}, "taskctl.json").fixedSources).toBeUndefined();
+    // An empty list is off too, and stays a list.
+    expect(resolveConfig({ fixedSources: [] }, "taskctl.json").fixedSources).toEqual([]);
+    // Each path is made absolute against the working directory, the way tasksDir is: the worker's cwd is its workdir.
+    const absolute = join(process.cwd(), "rules", "contract.md");
+    expect(resolveConfig({ fixedSources: ["rules/voice.md", absolute] }, "taskctl.json").fixedSources)
+      .toEqual([join(process.cwd(), "rules", "voice.md"), absolute]);
+  });
+
+  it("refuses a fixed-sources list that is anything but non-empty strings, and still refuses a near miss", () => {
+    const bad = (fixedSources: unknown) => () => resolveConfig({ fixedSources }, "taskctl.json");
+    const message = 'config taskctl.json: field "fixedSources" must be an array of non-empty strings';
+    expect(bad("voice.md")).toThrowError(new Error(message));
+    expect(bad([""])).toThrowError(new Error(message));
+    expect(bad(["  \t\n"])).toThrowError(new Error(message));
+    expect(bad([1])).toThrowError(new Error(message));
+    expect(bad(null)).toThrowError(new Error(message));
+    // The allowlist grew by exactly this key: one letter short is still unknown.
+    expect(() => resolveConfig({ fixedSource: ["voice.md"] }, "taskctl.json")).toThrow(/unknown field "fixedSource"/);
   });
 });

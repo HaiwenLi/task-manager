@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { resolve } from "node:path";
-import { buildWorkerPrompt, MEMORY_NOTE, SPEC_NOTE, type WorkerPromptContext } from "../src/protocol.js";
+import { buildWorkerPrompt, FIXED_SOURCES_NOTE, MEMORY_NOTE, SPEC_NOTE, type WorkerPromptContext } from "../src/protocol.js";
 import type { Task } from "../src/task-file.js";
 
 function task(overrides: Partial<Task> = {}): Task {
@@ -123,5 +123,36 @@ describe("buildWorkerPrompt — context sections", () => {
     expect(text).not.toContain("## 已批准的规格");
     expect(text).not.toContain("## 用户偏好");
     expect(text).not.toContain("## 同类任务上人工给过的纠正");
+  });
+
+  it("places the fixed sources after the work rules and before the owner's preferences", () => {
+    const text = buildWorkerPrompt(task(), {
+      ...base, fixedSources: "FIXED BODY", profile: "PROFILE BODY", feedback: "FEEDBACK BODY", memory: "MEMORY BODY",
+    });
+    inOrder(text, [
+      "## 工作规则",
+      "## 用户本人的规范（跨项目有效，不是检索来的）",
+      FIXED_SOURCES_NOTE,
+      "FIXED BODY",
+      "## 用户偏好（来自过往确认与纠错，优先遵守）",
+      "PROFILE BODY",
+      "## 上一段会话的交接笔记",
+    ]);
+    // Pinned on both sides: the last of the eight work rules, the section, then the heading that follows it.
+    expect(text).toContain(
+      "- 若收到\"上下文预算告急\"的收尾指令：立即运行一次 taskctl note（尽量详尽，同上参数），然后只回复 HANDOFF_READY\n"
+      + `\n## 用户本人的规范（跨项目有效，不是检索来的）\n${FIXED_SOURCES_NOTE}\nFIXED BODY\n`
+      + "\n## 用户偏好（来自过往确认与纠错，优先遵守）\nPROFILE BODY",
+    );
+    // With no other section supplied, the handoff is what follows it.
+    expect(buildWorkerPrompt(task(), { ...base, fixedSources: "FIXED BODY" }))
+      .toContain(`## 用户本人的规范（跨项目有效，不是检索来的）\n${FIXED_SOURCES_NOTE}\nFIXED BODY\n\n## 上一段会话的交接笔记`);
+  });
+
+  it("leaves the prompt byte-identical when the fixed sources are absent or empty", () => {
+    const sections = { ...base, spec: "S", profile: "P", feedback: "F", memory: "M" };
+    expect(buildWorkerPrompt(task(), { ...base, fixedSources: "" })).toBe(buildWorkerPrompt(task(), base));
+    expect(buildWorkerPrompt(task(), { ...base, fixedSources: undefined })).toBe(buildWorkerPrompt(task(), base));
+    expect(buildWorkerPrompt(task(), { ...sections, fixedSources: "" })).toBe(buildWorkerPrompt(task(), sections));
   });
 });
