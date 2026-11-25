@@ -307,7 +307,7 @@ describe("modelFirstPass", () => {
   });
 
   it("does not count a reviewer turn the provider refused as a missed first review", () => {
-    // The worker journals a refused reviewer turn as a verdict degraded to `unclear`, then `provider-failed` right after it.
+    // A refused reviewer turn is not recorded as a verdict: the journal gets only its `provider-failed` line.
     const refused = [line("review", "started", "criteria=1"), line("review", "verdict", "unclear"), line("review", "provider-failed", "review turn failed with exit 1")];
     // With nothing after the pair no reviewer judged the work, so the task had no review. With the next model's real
     // verdict after it, that verdict is the first review, and it passed.

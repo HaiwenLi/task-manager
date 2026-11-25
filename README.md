@@ -101,7 +101,7 @@ npx tsx src/main.ts <子命令> [参数]
 }
 ```
 
-这样配置之后，护栏只放行这个 provider 的模型：别的 provider 的免费模型、任何按量计费的模型（包括同名的按量孪生，如 `zhipuai/glm-5.3`）、以及别的 provider 里目录不报成本、又没被 `allowedModels` 点名的模型，一律拒绝——要用套餐之外的模型，把它写进 `modelChain` 并用 `allowedModels` 点名，那是你的决定。跑之前先用 `taskctl models` 看一遍判定。
+这样配置之后，护栏只放行这个 provider 的免费和成本未知的模型：别的 provider 的免费模型、任何按量计费的模型（包括同名的按量孪生，如 `zhipuai/glm-5.3`）、以及别的 provider 里目录不报成本、又没被 `allowedModels` 点名的模型，一律拒绝——要用套餐之外的模型，把它写进 `modelChain`，再按它的成本放行：**免费**模型只认 provider——把它的 provider 加进 `allowedProviders`（`allowedModels` 对免费模型不起作用）；**按量计费**的模型用 `allowedModels` 点名，或开 `allowPaidModels`，或把 `maxCostPerMillion` 提到不低于它的单价（`allowedProviders` 放行不了按量模型）；目录不报成本的模型，`allowedModels` 或 `allowedProviders` 点到一个就行。跑之前先用 `taskctl models` 看一遍判定。
 
 ## 任务文件
 
@@ -362,7 +362,7 @@ provider 拒绝（429 / 配额 / 鉴权 / 5xx / `no-route`，即 adapter 标出�
 - 连续 `modelRounds` 轮（默认 4，约 4–5 分钟）没有任何模型接受之后，attempt 自己**不做判断**，只把轮次记下。控制器等到没有任何尝试在跑时才看这次执行自己的证据：**期间有没有别的任务在链上某个模型上成功过一个回合。** 另一个任务的回合正在跑时就先等它结算——它可能就是证据。
   - 有：模型是好的，问题在这个任务自己。只把它 `blocked`，交接笔记逐个写出每个模型和它的拒绝原话；依赖它的任务照常等，其余任务继续。
   - 没有：这是模型不可用。任务原样留在 `open`、`retries` 不动，整次 `run` 或 `watch` 停下并打印报告（每个模型的原因、几轮、多久、还在等的任务），退出码 **3**。改好 `modelChain`（需要的话补上 `allowedModels`，先用 `taskctl models` 看判定）后直接再跑一次 `taskctl run`（或 `taskctl watch`），所有等待的任务自动继续，不需要逐个 `retry`。
-- 「成功过一个回合」指 worker 回合退出码为 0，或 reviewer 给出了判决（且有它自己的会话）；超时或崩溃的回合不算。证据按模型记在这一次执行里，不落盘，也从不读共享冷却表——那张表每个模型只有一条，会被最近一次拒绝覆盖。
+- 「成功过一个回合」指 worker 回合退出码为 0，或 reviewer 的回合不是 provider 拒绝且有自己的会话（哪怕它崩了、没给出判决）；超时的复核回合（照旧 park）和退出码非 0 的 worker 回合不算。证据按模型记在这一次执行里，不落盘，也从不读共享冷却表——那张表每个模型只有一条，会被最近一次拒绝覆盖。
 - 同一次执行里轮次用尽的任务不会再被提供；新的一次 `run` / `watch` 从第 0 轮算起。手工 `taskctl retry` 不归档推迟记录：它保留已经记下的最早可领取时间，把轮次和第一次被拒的时间清零——这次 `retry` 买到全新的一轮 `modelRounds`；共享冷却表照旧不清，刚拒绝过的模型不会被立刻再撞。
 - **预算护栏的拒绝不是这里的拒绝。** 护栏判定的是「这个模型要不要花钱」，被拒的任务没有会话启动、没有模型被问，所以不开始一轮、不写推迟记录、也不算证据。`run` 对它只提供一次，照常打印护栏原话并以退出码 1 结束；`watch` 五分钟内不再拿它，批次在它那里停下。被拒的任务记在 `.taskctl/guard-refusals.json`，`taskctl status --stuck` 据此列出它。推迟在调度器里是护栏之外的**第二重**排除：两者都不算进展，都等到各自的时间为止。两种等待并不一样——推迟会让 `run` 等一等再试，因为 provider 的拒绝会过去；护栏的拒绝不会，因为读到的目录在进程存活期间不会变。
 - 复核阶段同理：reviewer 被拒不花任何额度，也不重放 worker 的工作和验收。窗口一到，控制器自己对保留下来的证据只跑复核（`review-pending.json` 与它的摘要门）；`modelRounds` 轮之后由控制器按同一条证据规则决定——留给人（`blocked` + `review-pending.json`），或按模型不可用停下并保留证据。reviewer **超时不是拒绝**，保持今天的 park（`blocked` + `review-pending.json`，`taskctl retry --review-only` 恢复）；**崩溃也不是拒绝**，保持今天的处理：判不出来转 `awaiting-human`。复核阶段的轮次单独计数，所以一个任务可以先作为 worker、再作为被复核的任务，各被推迟 `modelRounds` 轮。窗口还没到时执行 `taskctl retry --review-only`，命令不会跑，而是打印等到几点再来。复核没有单独配链时沿用 worker 链；worker 的链首刚拒绝过，复核就从接手的那个模型开始。

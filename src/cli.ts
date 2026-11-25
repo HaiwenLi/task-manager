@@ -249,7 +249,7 @@ async function recordHumanFeedback(
  * no CLI dependency (binding constraint). Values pass through untouched, so
  * newlines, quotes and Chinese land in note files verbatim (Review Focus 5).
  * Returns the process exit code: 0 ok, 1 runtime error, 2 usage error, 3 a stop
- * for an outage (`run`, `EXIT_OUTAGE`).
+ * for an outage (`run`, `watch`, `EXIT_OUTAGE`).
  */
 export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number> {
   const log = deps.log ?? ((line: string) => console.log(line));
