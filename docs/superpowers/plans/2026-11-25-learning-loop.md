@@ -1489,6 +1489,38 @@ No assertion was loosened, and `tests/protocol.test.ts` is untouched.
 - `18635d4` test(replace), the flaky-test fix named above.
 - After the rebase: `0cd9e91` test, the ten type errors `npm run typecheck` reported in three test files this branch added.
 - Task 11 did more than its steps say: the README also carries the second refusal path, the per-directory reads, what a failed `opencode api` call may quote, and the recall child on Windows and POSIX; GLOSSARY has a fourth entry, `拒绝`; and the design has corrections beside its Status line (§6.3, §6.6, §6.7 and one line of the §6.1 diagram).
+- After the hand-off from the other harness on 2026-11-25, and not from the plan: `fee4f2a` feat(context), fixed sources, the owner's own rules read by file for every attempt; `ce2511c` fix(context), a source named by what follows its last separator of either kind (on POSIX `path.basename` would have handed back a whole Windows path as the name); `7151b7c` feat(metrics), human touches apart; `a1e5f86` docs(adr), ADR-0013. Described under "Added after the hand-off" below.
+
+### Added after the hand-off (2026-11-25, afternoon)
+
+Two additions came with the hand-off from the other harness, not from this plan. Neither changes a step above; each is recorded here, and in the design.
+
+**Fixed sources.** `taskctl.json` gains `fixedSources`, a list of the files that hold the owner's own rules, how text is to be written and what must never happen. Every attempt reads them once, as it starts, in the order configured, whatever the `workerContext` switches say: whole up to 8,000 characters each. They become the section `## 用户本人的规范（跨项目有效，不是检索来的）`, between the work rules and the preferences, and a file that cannot be read costs the attempt that file, never the task, leaving one `sources` journal line. `taskctl recall` prints them first and exits 1 when one could not be read. The decision is ADR-0013, `docs/adr/0013-fixed-sources.md`; the design has it as §6.10.
+
+**Human touches apart.** `humanTouches` still counts every human touch, and now also counts them by kind. `SIGN_OFF` (`approved`, `accepted`, `retry`, `applied`) is the cost to drive down; `ADJUDICATED` (`answered`, `rejected`, `audited`) is where the standard comes from and is not to be squeezed, a send-back included because it carries its reason; a touch in neither set is `other`. `total` is the three together, `waitedMs` is unchanged, and the `人工触点` section of `taskctl metrics` shows both counts on a task's line and in a totals line. The design has it in §6.7.
+
+**Existing expectations changed.** No assertion was loosened, and the changes are all in `tests/metrics.test.ts`:
+
+- "counts human touches per task and kind" and "counts a spot check as a touch, and waits only for a push that has a time and a line before it" gained `signOff`, `adjudicated` and `other` in the expected object.
+- "the metrics command shows both views" now expects `a  共 2 次  审批 2  裁决 0  （approved×1, accepted×1）  等人 2h0m`.
+- "says none where nobody touched a task, and shows a dash and an unknown model where nothing was reviewed or recorded" expects five lines instead of three, the fifth pinning that no totals line follows `（无）`.
+
+One test helper changed: `writeConfig` in `tests/cli-recall.test.ts` gained an optional third parameter. `tests/protocol.test.ts` is untouched by the four commits.
+
+**Verification.** Observed on 2026-11-25 before the plan's commit, on `4064002` plus this plan's edits short of the three lines that quote this run, with the temp directory set to one the run owned:
+
+- `npm test`: `Test Files  76 passed | 1 skipped (77)`, `Tests  865 passed | 1 skipped (866)`, `Duration  23.20s`. The skipped file is `tests/e2e.smoke.test.ts`, which needs `TASKCTL_E2E=1` and a real backend.
+- `npm run typecheck`: exit code 0, no output after its command line.
+- `npx tsc --noEmit`: exit code 0, `TypeScript: No errors found`.
+
+**Real services.** Checked by the coordinator on 2026-11-25 at about 13:20, from source with `npx tsx src/main.ts`: read-only, no backend, no model session, no memory server. Each output was checked for `apiKey`, `Authorization`, `Bearer `, `sk-` followed by 12 or more characters, and `headers`; none matched.
+
+- `taskctl recall --query preview` with the three profile files as `fixedSources` and memory off: exit 0, `fixed sources: contract.md=1755; voice.md=871; non-negotiables.md=842`, then the three files as the prompt carries them, then `memory backend is "none"; nothing to recall`. The three together are about 3,470 characters.
+- With `voice.md` and a second, non-existent file beside it: exit 1, `fixed sources: voice.md=871; no-such-file.md=missing`, and `source unavailable: no-such-file.md (missing)`.
+- `taskctl metrics` on a board written for the check, one task with five human touches in its journal (`approved`, `answered`, `rejected`, `audited`, `accepted`): exit 0, `touch-demo  共 5 次  审批 2  裁决 3  （approved×1, answered×1, rejected×1, audited×1, accepted×1）  等人 1h35m`, then `合计  共 5 次  审批 2  裁决 3`.
+- Not verified against real services: a worker session that carries the fixed-sources section (it would start a model session), and whether the harness a worker is started through loads the same files on its own — a fresh child session of the server did hold them, a worker started by `opencode run` was not run.
+
+What is known and not tested about the two additions is under "Known gaps" below.
 
 ### Known gaps
 
@@ -1499,6 +1531,11 @@ No assertion was loosened, and `tests/protocol.test.ts` is untouched.
 - Two error branches (`exit null`, unknown error) have no test.
 - The catalogue memo key is not normalised for case or real path.
 - The first correction is kept whatever its length.
+- The `ENOTDIR` half of `missing` (a path under a file) has no test, and on Windows cannot get the plain one: Node reports `ENOENT` there for such a path, which the other half covers.
+- The fallback to an error's `name` when it has no `code` (`unreadable(<name>)`) has no test.
+- `taskctl recall` with an empty `fixedSources` list is not tested separately; the empty list is tested at the config, the prompt and the worker.
+- When the read of the board's context files throws, the attempt reads no fixed sources and writes no `sources` line: both reads sit inside one guard in `readSections`, and no test puts a broken context file and a `fixedSources` list together.
+- The fixed-sources section sits in the part of the prompt a 28K clip gives up first.
 - Pre-existing and unchanged: the stderr tail of a failed model turn or usage call is journaled.
 - The checks against the real backend and the real palace are below, under "Real services".
 
