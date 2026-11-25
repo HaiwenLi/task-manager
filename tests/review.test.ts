@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { buildReviewPrompt, parseVerdict } from "../src/review.js";
+import { buildReviewPrompt, parseVerdict, runReview } from "../src/review.js";
 import { parseTaskFile } from "../src/task-file.js";
+import type { AgentAdapter, PromptResult } from "../src/adapters/types.js";
+import { buildTaskFile } from "./helpers/task-fixture.js";
 
 const criteria = ["C1 npm test 全绿", "C2 401 时文案正确"];
 
@@ -184,5 +186,29 @@ describe("buildReviewPrompt", () => {
     });
     expect(prompt).toContain("先写你对本任务和验收标准的复述");
     expect(prompt).toContain("判 unclear");
+  });
+});
+
+describe("a refused review turn", () => {
+  const task = buildTaskFile({ id: "001-a", title: "登录改版", status: "review", criteria: ["C1 npm test 全绿"] });
+  const evidence = { task, spec: "", acceptanceMarkdown: "exit 0", handoff: null, journal: [], window: { startedAt: "2026-11-16T00:00:00.000Z", finishedAt: "2026-11-16T00:20:00.000Z" } };
+  const answering = (result: PromptResult): AgentAdapter => ({ prompt: async () => result, contextUsage: async () => 0, contextLimit: async () => 100 });
+  const review = (result: PromptResult) => runReview({ adapter: answering(result), cwd: "." }, evidence);
+  const refusedBy = (text: string) => review({ sessionId: "s", exitCode: 1, text, failure: "provider" });
+
+  it("carries the backend's text of a provider refusal, its first line and no more than 240 characters", async () => {
+    expect((await refusedBy("  Error: weekly limit reached")).refusalText).toBe("Error: weekly limit reached");
+    expect((await refusedBy("")).refusalText).toBe("no output");
+    expect((await refusedBy("x".repeat(300))).refusalText).toHaveLength(240);
+    // The first line only, as the worker keeps it.
+    expect((await review({ sessionId: "s", exitCode: 1, text: `Error: 429 too many requests
+and a second line`, failure: "provider" })).refusalText).toBe("Error: 429 too many requests");
+  });
+
+  it("carries none for a turn that crashed or was judged", async () => {
+    const crashed = await review({ sessionId: "s", exitCode: 1, text: "Error: boom" });
+    expect(crashed.failure).toBeUndefined();
+    expect(crashed).not.toHaveProperty("refusalText");
+    expect(await review({ sessionId: "s", exitCode: 0, text: '{"verdict":"unclear"}' })).not.toHaveProperty("refusalText");
   });
 });

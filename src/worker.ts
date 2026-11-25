@@ -31,7 +31,7 @@ import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck
 import { readExecutionState, recordEscalation, recordWorkerSession, type ExecutionState, type WorkerSessionFact } from "./execution-state.js";
 import { clearModelCooldown, modelCooldown, nextModelCooldown, noteModelRefusal } from "./model-cooldown.js";
 import {
-  addRefusal, chainKeys, clearModelWait, coolingRefusals, formatDuration, mergeRefusals, modelCooldownMsOf, modelKey, modelRoundsOf,
+  DEFAULT_MODEL_KEY, addRefusal, chainKeys, clearModelWait, coolingRefusals, formatDuration, mergeRefusals, modelCooldownMsOf, modelKey, modelRoundsOf,
   modelWaitHolds, processRun, readModelWait, refusalReason, servedSince, writeModelWait, modelWaitHold,
   type ModelRefusal, type ModelWaitRecord, type ModelWaitStage, type RunContext,
 } from "./model-wait.js";
@@ -206,6 +206,9 @@ type ReviewPendingRecord = {
    */
   window?: { startedAt: string; finishedAt: string };
 };
+/** A record that can anchor a review-only recovery: both digests are strings. */
+const validPending = (record: ReviewPendingRecord | null): record is ReviewPendingRecord =>
+  record !== null && typeof record.definitionDigest === "string" && typeof record.artifactDigest === "string";
 export class WorkerTimeoutError extends Error {
   constructor(message: string, readonly partialOutput?: string) { super(message); }
 }
@@ -314,6 +317,13 @@ async function holdForRefusal(
   cfg: WorkerConfig, deps: WorkerDeps, task: Task, record: ModelWaitRecord, served: string,
 ): Promise<void> {
   const rounds = record.rounds;
+  if (record.stage === "review") {
+    // The review deferral preserved the worker's and the acceptance's evidence,
+    // so the controller's half is only the journal line and the status: the
+    // next claim resumes the review on it (spec 2026-11-25 §16).
+    await parkReviewFromRecord(cfg, deps, task, record, `own problem: refused in ${rounds} round(s) while ${served} served another task`);
+    return;
+  }
   await withMutex(join(cfg.tasksDir, task.id, ".mutation.lock"), async () => {
     const seq = ((await latestNote(cfg.tasksDir, task.id))?.seq ?? 0) + 1;
     await writeNote(cfg.tasksDir, {
@@ -333,6 +343,28 @@ async function holdForRefusal(
     type: "blocked", taskId: task.id,
     detail: `every model refused this task in ${rounds} round(s) while ${served} served another task; retries untouched — the task itself is the problem`,
   });
+}
+
+/**
+ * The controller's half of the park (`holdForRefusal`, review stage): the
+ * preserved evidence was written at the deferral, so only the journal line and
+ * the status are written here. No note and no record rewrite — the preserved
+ * `review-pending.json` is what the next claim reads.
+ */
+async function parkReviewFromRecord(
+  cfg: WorkerConfig, deps: WorkerDeps, task: Task, record: ModelWaitRecord, verdict: string,
+): Promise<"blocked"> {
+  const last = record.refusals.at(-1) ?? { model: DEFAULT_MODEL_KEY, reason: "review provider rejected the turn" };
+  await withMutex(join(cfg.tasksDir, task.id, ".mutation.lock"), () => appendJournal(cfg.tasksDir, task.id, {
+    stage: "review", event: "review-pending",
+    detail: `${last.model}: ${last.reason}; worker/acceptance preserved; ${verdict}`,
+  }));
+  await deps.store.setStatus(task.id, "blocked");
+  deps.onEvent?.({
+    type: "blocked", taskId: task.id,
+    detail: "review pending: reviewer providers unavailable; worker and acceptance preserved; retry with --review-only",
+  });
+  return "blocked";
 }
 
 /**
@@ -422,6 +454,11 @@ export async function runTask(
     // a task whose rounds this run already spent waits for the controller's decision.
     const hold = modelWaitHold(await readModelWait(cfg.tasksDir, task.id), r.run.id, modelRoundsOf(cfg), new Date());
     if (hold !== null) return "skipped";
+    // A task that carries preserved worker/acceptance evidence never goes back
+    // through the worker: the claim resumes its review (spec 2026-11-25 §16).
+    if (!r.reviewOnly && current.status === "open" && validPending(await readRuntime<ReviewPendingRecord>(cfg.tasksDir, task.id, "review-pending.json"))) {
+      r.reviewOnly = true;
+    }
     r.task = structuredClone(current); r.definition = definitionDigest(current);
     r.executionState = await readExecutionState(cfg.tasksDir, task.id, declaredExecution(current));
     r.escalated = r.executionState.requiresReview;
@@ -437,7 +474,7 @@ export async function runTask(
         return await block(r, "review-only recovery requires a settled previous attempt");
       }
       reviewPending = await readRuntime<ReviewPendingRecord>(cfg.tasksDir, task.id, "review-pending.json");
-      if (!reviewPending || typeof reviewPending.definitionDigest !== "string" || typeof reviewPending.artifactDigest !== "string") {
+      if (!validPending(reviewPending)) {
         return await block(r, "review-only recovery requires a valid review-pending record");
       }
     } else if ((previous && previous.phase !== "settled") || (!previous && current.status === "running")) {
@@ -924,40 +961,6 @@ async function noteRefusal(
   });
 }
 
-/**
- * Park a task because every model on its chain is cooling. `dispatchedTurns` is
- * how many turns this attempt already dispatched. A task blocked before its
- * first dispatch spent nothing. Whether a dispatched turn spent a retry depends
- * on why it failed — a refused provider turn spends none — and an exhausted
- * budget returns `blocked` before the loop ever gets here, so the note states
- * the count and points at the task file instead of guessing.
- */
-async function blockForCooldown(r: Run, role: ModelRole, retryAfter: string, dispatchedTurns = 0): Promise<"blocked"> {
-  if (role === "reviewer") {
-    // Name the models that are cooling, so the parked record says who refused.
-    return await parkReviewPending(r, reviewerChain(r).join(", ") || undefined, `every reviewer model is cooling until ${retryAfter}`);
-  }
-  const spent = dispatchedTurns === 0
-    ? "本任务未派发，也未消耗 retries。"
-    : `本尝试已派发 ${dispatchedTurns} 个回合，之后所有候选模型都进入了冷却；已消耗的重试次数以任务文件为准。`;
-  await owned(r, async () => {
-    const seq = ((await latestNote(r.cfg.tasksDir, r.task.id))?.seq ?? 0) + 1;
-    await writeNote(r.cfg.tasksDir, {
-      task: r.task.id, seq, status: "blocked:needs-owner",
-      done: `所有候选模型都处于共享冷却窗口；${spent}`,
-      found: `下一次可探测时间：${retryAfter}`,
-      next: "等待窗口结束、调整模型链，或由所有者明确恢复；不要反复启动 run 撞同一批失效模型。",
-      files: [],
-    });
-    await r.deps.store.setStatus(r.task.id, "blocked");
-    await appendJournal(r.cfg.tasksDir, r.task.id, {
-      stage: "worker", event: "model-cooldown", detail: `every model cooling; next probe ${retryAfter}; turns spent ${dispatchedTurns}`,
-    });
-  });
-  emit(r, "blocked", `every model is cooling; next probe ${retryAfter}; ${dispatchedTurns === 0 ? "retries untouched" : `${dispatchedTurns} turn(s) already spent`}`);
-  return "blocked";
-}
-
 /** Note one refused turn — the shared table and this round's list — and say whether it was about allowance. */
 async function noteTurnRefusal(
   r: Run, refusals: readonly ModelRefusal[], model: string | undefined, result: PromptResult & { durationMs: number },
@@ -998,7 +1001,11 @@ async function refusedRound(
     updatedAt: now.toISOString(),
   };
   const said = refusals.map((refusal) => `${refusal.model}: ${refusal.reason}`).join(" | ");
+  // A refused review round preserves the worker's and the acceptance's evidence
+  // beside the deferral record, so the next claim can resume only the review.
+  const preserved = stage === "review" ? await reviewPendingRecord(r, refusals.map(({ model, reason }) => ({ model, reason }))) : null;
   await owned(r, async () => {
+    if (preserved !== null) await writeRuntime(r.cfg.tasksDir, r.task.id, "review-pending.json", preserved);
     await writeModelWait(r.cfg.tasksDir, r.task.id, record);
     await r.deps.store.setStatus(r.task.id, "open");
     await appendJournal(r.cfg.tasksDir, r.task.id, {
@@ -1707,6 +1714,7 @@ async function reviewStage(
   const chainCycles = r.cfg.chainCycles ?? 0;
   const maxHandovers = reviewerChain(r).length * (1 + chainCycles);
   let handovers = 0;
+  let refusals: ModelRefusal[] = [];
   // Every review round starts at the head of its chain, with a fresh wrap budget.
   await resetRotation(r.cfg.tasksDir, id, "reviewer");
   for (;;) {
@@ -1714,8 +1722,12 @@ async function reviewStage(
     try {
       reviewerModel = await modelFor(r, "reviewer");
     } catch (error) {
-      if (error instanceof ModelsCoolingError) return await blockForCooldown(r, "reviewer", error.retryAfter);
-      throw error;
+      if (!(error instanceof ModelsCoolingError)) throw error;
+      // Nothing could be tried: every reviewer model is cooling on a refusal.
+      // The review waits for the earliest window; only a round in which this
+      // review itself was refused counts.
+      const cooling = await coolingRefusals(r.cfg.tasksDir, reviewerChain(r));
+      return await refusedRound(r, "review", mergeRefusals(refusals, cooling), refusals.length > 0, error.retryAfter);
     }
     const resolvedReviewer = await r.deps.adapter.resolveModel?.(reviewerModel, r.cfg.reviewerEffort);
     const reviewStarted = Date.now();
@@ -1746,38 +1758,48 @@ async function reviewStage(
     if (result.reviewerSessionId) {
       await captureUsage(r, "reviewer", result.reviewerSessionId, reviewerModel, Date.now() - reviewStarted);
     }
-    await owned(r, async () => {
-      // Which model judged is part of the evidence: work passed by a fallback is
-      // not the same claim as work passed by the model the operator chose. So is
-      // the declaration that authorised any excused drift — a narrowed field
-      // must not read as if the reviewer had been allowed what it now says.
-      const definition = await attemptDefinition(r);
-      await writeRuntime(r.cfg.tasksDir, id, "review.json", {
-        ...result,
-        model: reviewerModel,
-        tolerate: r.task.tolerate,
-        definitionDigest: definition,
-        // What the reviewer actually saw, for post-mortems: the exact
-        // (already-truncated) change list and diffstat injected into the
-        // prompt, not a re-collection that may since have changed.
-        evidence: { gitStatus: changes.status, gitDiffStat: changes.diffStat },
-        at: new Date().toISOString(),
-      });
-      await appendJournal(r.cfg.tasksDir, id, {
-        stage: "review",
-        event: "verdict",
-        // Tolerated drift is recorded, never silent: the count is in the journal
-        // and the changes themselves are in review.json.
-        detail: result.externalChanges.length > 0
-          ? `${result.verdict} external=${result.externalChanges.length}`
-          : result.verdict,
-      });
-    });
-    emit(r, "reviewed", result.externalChanges.length > 0
-      ? `${result.verdict} (${result.externalChanges.length} external change(s) tolerated)`
-      : result.verdict);
-
     if (result.failure !== "provider") {
+      // A provider rejection is not a verdict, so nothing is recorded as one:
+      // review.json keeps the last real verdict, and a later real verdict is
+      // not read as "unchanged since last time" against criteria no reviewer
+      // ever judged.
+      await owned(r, async () => {
+        // Which model judged is part of the evidence: work passed by a fallback is
+        // not the same claim as work passed by the model the operator chose. So is
+        // the declaration that authorised any excused drift — a narrowed field
+        // must not read as if the reviewer had been allowed what it now says.
+        const definition = await attemptDefinition(r);
+        await writeRuntime(r.cfg.tasksDir, id, "review.json", {
+          ...result,
+          model: reviewerModel,
+          tolerate: r.task.tolerate,
+          definitionDigest: definition,
+          // What the reviewer actually saw, for post-mortems: the exact
+          // (already-truncated) change list and diffstat injected into the
+          // prompt, not a re-collection that may since have changed.
+          evidence: { gitStatus: changes.status, gitDiffStat: changes.diffStat },
+          at: new Date().toISOString(),
+        });
+        await appendJournal(r.cfg.tasksDir, id, {
+          stage: "review",
+          event: "verdict",
+          // Tolerated drift is recorded, never silent: the count is in the journal
+          // and the changes themselves are in review.json.
+          detail: result.externalChanges.length > 0
+            ? `${result.verdict} external=${result.externalChanges.length}`
+            : result.verdict,
+        });
+      });
+      emit(r, "reviewed", result.externalChanges.length > 0
+        ? `${result.verdict} (${result.externalChanges.length} external change(s) tolerated)`
+        : result.verdict);
+      // A reviewer turn that actually ran is the run's evidence that this
+      // reviewer model works, and it ends any deferral — exactly as a worker
+      // turn with exit code 0 is (`loop`). The mark of a turn that ran is its
+      // session: a verdict the `review` seam answered dispatched no turn, and
+      // no model served anything for it.
+      if (result.reviewerSessionId !== undefined) r.run.accepted.set(modelKey(reviewerModel), Date.now());
+      await clearModelWait(r.cfg.tasksDir, id);
       if (reviewerModel !== undefined) await clearModelCooldown(r.cfg.tasksDir, reviewerModel);
       // Checked again here: the pre-review check ran before this turn, and a task
       // file edited while the reviewer was reading would otherwise be completed —
@@ -1786,28 +1808,32 @@ async function reviewStage(
       await rm(join(r.cfg.tasksDir, id, "review-pending.json"), { force: true });
       return await judge(r, result, prevCriteria);
     }
+    const said = result.refusalText ?? result.summary ?? "review provider rejected the turn";
     if (reviewerModel !== undefined) {
       await noteModelRefusal(r.cfg.tasksDir, reviewerModel, {
-        reason: result.summary || "review provider rejected the turn",
+        reason: said,
         category: "provider", cooldownMs: modelCooldownMsOf(r.cfg),
       });
     }
     await owned(r, () => appendJournal(r.cfg.tasksDir, id, {
       stage: "review",
       event: "provider-failed",
-      detail: result.summary,
+      detail: said,
     }));
+    refusals = addRefusal(refusals, {
+      model: modelKey(reviewerModel), at: new Date().toISOString(),
+      reason: said, source: "turn",
+    });
     const handedOver = handovers < maxHandovers
-      && await fallBack(r, "reviewer", `review rejected by ${reviewerModel ?? "(default)"}`);
+      && await fallBack(r, "reviewer", `review rejected by ${reviewerModel ?? DEFAULT_MODEL_KEY}`);
     if (handedOver) {
       handovers++;
       emit(r, "rework", "reviewer provider failure; retrying with the next model");
       continue;
     }
-    // No reviewer is available, but the worker and acceptance already produced
-    // valid evidence. Park only the missing review instead of replaying those
-    // side effects on a later scheduler pass.
-    return await parkReviewPending(r, reviewerModel, result.summary || "review provider rejected the turn");
+    // No reviewer is left: the worker and acceptance already produced valid
+    // evidence, so the round ends with a deferral and nothing is replayed.
+    return await refusedRound(r, "review", refusals, true);
   }
 }
 
@@ -1819,35 +1845,37 @@ function preservedWindow(
   return typeof window?.startedAt === "string" && typeof window.finishedAt === "string" ? window : undefined;
 }
 
-/**
- * Park only the missing review: the worker and acceptance already produced
- * valid evidence, and replaying those side effects on a later scheduler pass
- * is what this avoids. `reason` is why no verdict exists — a refused provider
- * or a reviewer that ran out of time.
- */
-async function parkReviewPending(
-  r: Run, reviewerModel: string | undefined, reason: string,
-): Promise<"blocked"> {
+/** The record `review-pending.json` carries, keeping the first window and the first refusal time. */
+async function reviewPendingRecord(r: Run, round: readonly { model: string; reason: string }[]): Promise<ReviewPendingRecord> {
   const acceptance = await readRuntime<Record<string, unknown>>(r.cfg.tasksDir, r.task.id, "acceptance.json");
   const previous = await readRuntime<ReviewPendingRecord>(r.cfg.tasksDir, r.task.id, "review-pending.json");
   const artifactDigestAfter = typeof acceptance?.artifactAfter === "string"
     ? acceptance.artifactAfter
     : await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir], r.cfg.artifactIgnore ?? []);
   const now = new Date().toISOString();
-  const refusal = {
-    model: reviewerModel ?? "(default)",
-    reason: (reason || "review provider rejected the turn").slice(0, 1_000),
-  };
-  const pending: ReviewPendingRecord = {
+  return {
     definitionDigest: await attemptDefinition(r),
     artifactDigest: artifactDigestAfter,
     createdAt: previous?.createdAt ?? now,
     updatedAt: now,
-    refusals: [...(previous?.refusals ?? []), refusal].slice(-20),
+    refusals: [...(previous?.refusals ?? []), ...round].slice(-20),
     // The window of the attempt whose evidence is preserved. A recovery that is
     // parked again is a later attempt that produced nothing: it keeps the first.
     window: preservedWindow(previous) ?? { startedAt: r.record.startedAt, finishedAt: now },
   };
+}
+
+/**
+ * Park only the missing review: the worker and acceptance already produced
+ * valid evidence, and replaying those side effects on a later scheduler pass
+ * is what this avoids. `reason` is why no verdict exists — a reviewer that
+ * ran out of time (a refused provider round defers instead, `refusedRound`).
+ */
+async function parkReviewPending(
+  r: Run, reviewerModel: string | undefined, reason: string,
+): Promise<"blocked"> {
+  const refusal = { model: reviewerModel ?? "(default)", reason: reason.slice(0, 1_000) };
+  const pending = await reviewPendingRecord(r, [refusal]);
   await owned(r, async () => {
     await writeRuntime(r.cfg.tasksDir, r.task.id, "review-pending.json", pending);
     await r.deps.store.setStatus(r.task.id, "blocked");

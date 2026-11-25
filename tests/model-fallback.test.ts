@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { AgentAdapter, PromptResult } from "../src/adapters/types.js";
 import { modelChain, readModelRotation } from "../src/models.js";
 import { journalTail } from "../src/journal.js";
+import { readModelWait } from "../src/model-wait.js";
 import { TaskStore } from "../src/task-store.js";
 import { runTask, type WorkerConfig, type WorkerEvent } from "../src/worker.js";
 
@@ -250,16 +251,17 @@ describe("reviewer model fallback", () => {
     expect(models.filter((model) => model.startsWith("review:"))).toEqual(["review:r/one", "review:r/two"]);
   });
 
-  it("parks review-pending without rerunning successful work when no reviewer model is left", async () => {
+  it("defers the review without rerunning successful work when no reviewer model is left", async () => {
     await seed();
     const models: string[] = [];
     const agent = adapter({ turns: { "w/one": "done" }, reviews: { "r/one": rejected("r/one") } }, models);
 
-    expect(await run(agent, [], { reviewerModel: "r/one", retryLimit: 2 })).toBe("blocked");
+    expect(await run(agent, [], { reviewerModel: "r/one", retryLimit: 2 })).toBe("open");
     expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one"]);
     expect(models.filter((model) => model.startsWith("review:"))).toEqual(["review:r/one"]);
     expect((await store.get("a")).retries).toBe(0);
-    expect((await store.get("a")).status).toBe("blocked");
+    expect((await store.get("a")).status).toBe("open");
+    expect(await readModelWait(tasks, "a")).toMatchObject({ stage: "review", rounds: 1 });
   });
 });
 

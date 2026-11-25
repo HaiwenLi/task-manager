@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,11 +6,12 @@ import type { AgentAdapter, PromptResult } from "../src/adapters/types.js";
 import { latestNote } from "../src/handoff.js";
 import { readJournal } from "../src/journal.js";
 import { clearModelCooldown, noteModelRefusal } from "../src/model-cooldown.js";
-import { readAttempt } from "../src/runtime.js";
+import { readAttempt, readRuntime } from "../src/runtime.js";
+import { runCli } from "../src/cli.js";
 import { serializeTaskFile, type Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
 import { runTask, settleExhausted, WRAP_UP_INSTRUCTION, type TaskOutcome, type WorkerConfig, type WorkerDeps, type WorkerEvent } from "../src/worker.js";
-import { DEFAULT_MODEL_KEY, MODEL_ROUNDS_DEFAULT, newRunContext, readModelWait, writeModelWait, type RunContext } from "../src/model-wait.js";
+import { DEFAULT_MODEL_KEY, MODEL_ROUNDS_DEFAULT, clearModelWait, newRunContext, readModelWait, writeModelWait, type RunContext } from "../src/model-wait.js";
 import { buildTaskFile } from "./helpers/task-fixture.js";
 import { doneTaskId, markDoneTask, seedTaskFile } from "./helpers/watch-fixture.js";
 
@@ -375,5 +376,142 @@ describe("after modelRounds rounds", () => {
 
     expect((await settle(config({ run: context }), ["a"])).outcome).toEqual({ held: [] });
     expect((await readJournal(tasks, "a")).some((line) => line.event === "model-outage")).toBe(false);
+  });
+});
+
+const PASS: PromptResult = { sessionId: "s-review", exitCode: 0, text: '{"verdict":"pass","criteria":[{"id":"C1","pass":true,"evidence":"ok"}],"externalChanges":[],"defects":[],"summary":"ok"}' };
+const FAIL: PromptResult = { sessionId: "s-review", exitCode: 0, text: '{"verdict":"fail","criteria":[{"id":"C1","pass":false,"evidence":"wrong"}],"externalChanges":[],"defects":["fix it"],"summary":"not good"}' };
+const REVIEW = { modelChain: ["w/one"], reviewerModel: "r/one", reviewerModelFallbacks: ["r/two"] };
+const refused = () => backend({
+  turns: { "w/one": "done" },
+  reviews: { "r/one": refusal("Error: 429 too many requests"), "r/two": refusal("Error: weekly limit reached") },
+});
+const pending = () => readRuntime<{ definitionDigest: string; refusals: Array<{ model: string }>; window?: unknown }>(tasks, "a", "review-pending.json");
+/** What a controller does once nothing is in flight, for the tasks it got back deferred. */
+const settleReview = async (cfg: WorkerConfig, deferred: string[]) => settleExhausted(cfg, {
+  store, adapter: refused().adapter, acceptance: passing,
+}, await store.list(), deferred);
+
+describe("a refused review", () => {
+  it("walks the reviewer chain, and a fully refused round defers with the evidence preserved", async () => {
+    const { adapter, seen } = refused();
+    const events: WorkerEvent[] = [];
+
+    expect(await run(adapter, events, REVIEW, { review: undefined })).toBe("open");
+
+    expect(seen).toEqual(["w/one", "review:r/one", "review:r/two"]);
+    expect(await store.get("a")).toMatchObject({ status: "open", retries: 0, reviewRounds: 0 });
+    expect(await pending()).toMatchObject({ definitionDigest: expect.any(String), refusals: [{ model: "r/one" }, { model: "r/two" }] });
+    expect(await readModelWait(tasks, "a")).toMatchObject({
+      stage: "review", rounds: 1,
+      refusals: [{ model: "r/one", reason: "Error: 429 too many requests" }, { model: "r/two", reason: "Error: weekly limit reached" }],
+    });
+    expect(events.some((event) => event.type === "blocked")).toBe(false);
+  });
+
+  it("the next claim after the window resumes the review by itself, without the worker or the acceptance", async () => {
+    expect(await run(refused().adapter, [], REVIEW, { review: undefined })).toBe("open");
+    const acceptance = vi.fn(passing);
+    const { adapter, seen } = backend({ turns: { "w/one": "done" }, reviews: { "r/one": PASS } });
+
+    expect(await run(adapter, [], REVIEW, { review: undefined, acceptance })).toBe("done");
+
+    expect(seen).toEqual(["review:r/one"]);
+    expect(acceptance).toHaveBeenCalledTimes(0); // this attempt ran no gate; the first one ran it once
+    expect((await readJournal(tasks, "a")).some((line) => line.stage === "review" && line.event === "review-only")).toBe(true);
+    expect(await pending()).toBeNull();
+    expect(await readModelWait(tasks, "a")).toBeNull();
+    expect(await store.get("a")).toMatchObject({ status: "done" });
+  });
+
+  it("a fail verdict after that resumption opens rework without invoking the worker", async () => {
+    expect(await run(refused().adapter, [], REVIEW, { review: undefined })).toBe("open");
+    const { adapter, seen } = backend({ turns: { "w/one": "done" }, reviews: { "r/one": FAIL } });
+
+    expect(await run(adapter, [], REVIEW, { review: undefined })).toBe("open");
+
+    expect(seen).toEqual(["review:r/one"]);
+    expect(await store.get("a")).toMatchObject({ status: "open" });
+    expect((await latestNote(tasks, "a"))?.markdown).toContain("review-failed");
+    expect(await pending()).toBeNull();
+  });
+
+  it("after modelRounds rounds with no task served, keeps the evidence and tells the run to stop", async () => {
+    const context = newRunContext();
+    const one = () => run(refused().adapter, [], { ...REVIEW, run: context }, { review: undefined });
+    expect(await one()).toBe("open");
+    const first = (await pending())?.window;
+    for (let i = 1; i < MODEL_ROUNDS_DEFAULT; i++) expect(await one()).toBe("open");
+
+    expect(await settleReview(config({ ...REVIEW, run: context }), ["a"])).toEqual({ held: [], outage: { taskId: "a" } });
+
+    expect(await store.get("a")).toMatchObject({ status: "open", retries: 0 });
+    expect((await pending())?.window).toEqual(first);
+    expect(await readModelWait(tasks, "a")).toMatchObject({ stage: "review", rounds: 4 });
+  });
+
+  it("after modelRounds rounds with another task served on a chain model, parks the task as today", async () => {
+    await seedTaskFile(tasks, buildTaskFile({ id: "b", title: "b", acceptance: "check", criteria: ["C1 ok"] }));
+    const context = newRunContext();
+    for (let i = 0; i < MODEL_ROUNDS_DEFAULT; i++) expect(await run(refused().adapter, [], { ...REVIEW, run: context }, { review: undefined })).toBe("open");
+    const serving = backend({ turns: { "w/one": "done" }, reviews: { "r/one": PASS } });
+    expect(await run(serving.adapter, [], { ...REVIEW, run: context }, { review: undefined }, "b")).toBe("done");
+
+    expect(await settleReview(config({ ...REVIEW, run: context }), ["a"])).toEqual({ held: ["a"] });
+
+    expect(await store.get("a")).toMatchObject({ status: "blocked", retries: 0 });
+    expect(await pending()).not.toBeNull();
+    expect(await journal()).toMatch(/review review-pending .*own problem: refused in 4 round\(s\) while r\/one served another task/);
+  });
+
+  it("asks about the chain that refused, not about the worker's chain", async () => {
+    await seedTaskFile(tasks, buildTaskFile({ id: "b", title: "b", acceptance: "check", criteria: ["C1 ok"], verify: "mechanical" }));
+    const context = newRunContext();
+    const reviewerOnly = { ...REVIEW, reviewerModelFallbacks: [] };
+    for (let i = 0; i < MODEL_ROUNDS_DEFAULT; i++) expect(await run(refused().adapter, [], { ...reviewerOnly, run: context }, { review: undefined })).toBe("open");
+    // b's worker is served on w/one and needs no review: not evidence for r/one.
+    expect(await run(backend({ turns: { "w/one": "done" } }).adapter, [], { ...reviewerOnly, run: context }, { review: undefined }, "b")).toBe("done");
+
+    expect(await settleReview(config({ ...reviewerOnly, run: context }), ["a"])).toEqual({ held: [], outage: { taskId: "a" } });
+  });
+
+  it("an open task that carries preserved evidence is never sent back through the worker, whoever wrote the record", async () => {
+    expect(await run(refused().adapter, [], REVIEW, { review: undefined })).toBe("open");
+    await clearModelWait(tasks, "a"); // the deferral is gone; the preserved evidence is what counts
+    const { adapter, seen } = backend({ turns: { "w/one": "done" }, reviews: { "r/one": PASS } });
+
+    expect(await run(adapter, [], REVIEW, { review: undefined })).toBe("done");
+
+    expect(seen).toEqual(["review:r/one"]);
+  });
+
+  it("the digest gate still refuses an automatic resumption on changed artifacts", async () => {
+    expect(await run(refused().adapter, [], REVIEW, { review: undefined })).toBe("open");
+    await writeFile(join(work, "changed-after-the-work.txt"), "drift", "utf8");
+    const { adapter, seen } = backend({ turns: { "w/one": "done" }, reviews: { "r/one": PASS } });
+    const events: WorkerEvent[] = [];
+
+    expect(await run(adapter, events, REVIEW, { review: undefined })).toBe("blocked");
+
+    expect(seen).toEqual([]);
+    expect(events.find((event) => event.type === "blocked")?.detail).toContain("review-only recovery refused");
+    expect(await pending()).not.toBeNull();
+  });
+
+  it("a retry --review-only asked for inside the window is not run, and says until when", async () => {
+    // Deferred for a real window, and blocked as the controller blocks it once its rounds are spent.
+    expect(await run(refused().adapter, [], { ...REVIEW, modelCooldownMs: 60_000 }, { review: undefined })).toBe("open");
+    await store.setStatus("a", "blocked");
+    const nextAt = (await readModelWait(tasks, "a"))!.nextAt;
+    const { adapter, seen } = backend({ turns: { "w/one": "done" }, reviews: { "r/one": PASS } });
+    const configPath = join(root, "taskctl.json");
+    await writeFile(configPath, JSON.stringify({ tasksDir: tasks, workdir: work, ...REVIEW }), "utf8");
+    const lines: string[] = [];
+
+    const code = await runCli(["retry", "--task", "a", "--review-only", "--config", configPath], { adapter, log: (line) => { lines.push(line); } });
+
+    expect(code).toBe(1);
+    expect(lines).toEqual([`review-only recovery is held by a model window until ${nextAt}; ask again then`]);
+    expect(seen).toEqual([]); // no claim, no session
   });
 });

@@ -26,6 +26,12 @@ export type ReviewResult = {
   raw?: string;
   /** The independent reviewer session, for evidence and usage joins. */
   reviewerSessionId?: string;
+  /**
+   * The backend's own text of a provider refusal: the first non-empty line of
+   * the turn's output, or `no output`, cut to 240 characters — bounded the way
+   * the worker bounds a refused turn's. Present only with `failure: "provider"`.
+   */
+  refusalText?: string;
   /** The backend rejected the review turn itself (quota/auth/5xx); no judging happened. */
   failure?: "provider";
 };
@@ -261,9 +267,11 @@ export function startReview(deps: ReviewDeps, evidence: ReviewEvidence): Executi
       `review turn failed with exit ${result.exitCode}`,
     );
     // A backend rejection is not a verdict: the worker must retry, not ask a
-    // human to judge work the reviewer never looked at.
+    // human to judge work the reviewer never looked at. The backend's own text
+    // rides along, so the deferral record can name each reviewer model's reason
+    // the way it names a worker model's.
     return result.failure === "provider"
-      ? { ...degradedResult, failure: "provider", ...(result.sessionId ? { reviewerSessionId: result.sessionId } : {}) }
+      ? { ...degradedResult, failure: "provider", refusalText: refusalText(result.text), ...(result.sessionId ? { reviewerSessionId: result.sessionId } : {}) }
       : { ...degradedResult, ...(result.sessionId ? { reviewerSessionId: result.sessionId } : {}) };
   };
 
@@ -288,6 +296,16 @@ function degraded(ids: string[], reason: string): ReviewResult {
     defects: [],
     summary: reason,
   };
+}
+
+/**
+ * The backend's own text of a refusal, the expression `refusalReason` keeps
+ * (`src/model-wait.ts`): the first non-empty trimmed line of the turn's output,
+ * or `no output`, cut to 240 characters.
+ */
+function refusalText(text: string): string {
+  const first = text.split(/\r?\n/).map((line) => line.trim()).find((line) => line.length > 0) ?? "no output";
+  return first.slice(0, 240);
 }
 
 /** Try the fenced block first, then the outermost braces; null when neither parses. */

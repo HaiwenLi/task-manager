@@ -33,6 +33,7 @@ import { resolveArtifacts } from "./artifacts.js";
 import { runSelfCheck } from "./self-check.js";
 import { runBatch } from "./batch.js";
 import { judgeRefs, policyOf, renderVerdicts, reviewerModels, workerModels, type ModelVerdict } from "./budget.js";
+import { modelRoundsOf, modelWaitHold, newRunContext, readModelWait } from "./model-wait.js";
 import { stopRequestPath, watchQueue, type WatchOptions } from "./watch.js";
 import { createMempalaceBackend, runRecall, type MemoryBackend, type RecallInput, type RecallRecord } from "./memory.js";
 
@@ -1570,6 +1571,13 @@ async function retryCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
     const store = deps.store ?? new TaskStore(tasksDir);
     const task = await store.get(id);
     const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+    // Asked for inside a model window, the recovery is not run: the claim path
+    // would hold it, and a `skipped` would say nothing. It says until when.
+    const wait = modelWaitHold(await readModelWait(tasksDir, id), newRunContext().id, modelRoundsOf(cfg), new Date());
+    if (wait?.kind === "window") {
+      log(`review-only recovery is held by a model window until ${wait.nextAt}; ask again then`);
+      return 1;
+    }
     // Every other entry point resolves the task's own workdir before reserving
     // and hashing it. Recovery must too, or a task that declares a workdir is
     // re-digested against another tree and refused as changed for good.
