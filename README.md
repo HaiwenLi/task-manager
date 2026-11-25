@@ -452,10 +452,22 @@ taskctl note --task <id> --status <一句话状态> --done <已完成> --found <
 ### taskctl status — 看板
 
 ```bash
-npx tsx src/main.ts status [--tasks-dir <dir>]
+npx tsx src/main.ts status [--stuck] [--tasks-dir <dir>]
 ```
 
 每任务一行：id、status、retries、sessions 数、最新笔记的 Status 行。没有 `schema: taskctl/v1` 的 Markdown（或 frontmatter 解析不了的文件）单独列为 `ignored`，不参与调度。
+
+`taskctl status --stuck` 只列出受阻或等待的任务，每个一行，只读文件、不问后端：
+
+| 行 | 说明 |
+| --- | --- |
+| `已阻塞` | 原因（来自交接笔记或最近一条 blocked 日志）、起始时间；因模型拒绝而阻塞的逐个列出模型和拒绝原话；只差复核的写 `只差复核：<模型>：<原因>` |
+| `等受阻依赖` | 等的是哪个任务（隔了一层时写 `A（经 B）`），以及那个任务为什么受阻 |
+| `等模型窗口` | 第 n/`modelRounds` 轮、下次可领取时间；轮次用尽的：有尝试在跑时写明等它们结算后判断，没有时写明等所有者处理，新的 `taskctl run` 从第 0 轮开始 |
+| `等护栏放行` | 被预算护栏拒绝的任务：护栏当时的原话和判定时间（来自 `.taskctl/guard-refusals.json`）；现在的判定以 `taskctl models` 为准 |
+| `等放行` / `等签字` / `待回答问题` | `awaiting-human`、等签字的 `draft`（含待回答的问题） |
+
+没有这样的任务时只打印一行「没有受阻或等待的任务」。当你问「哪些任务卡住了」，答案就是这个命令的输出。
 
 所有「写临时文件、再改名覆盖」的落盘——任务文件、`attempt.json` 等运行记录、任务锁与 watch 锁的心跳、模型轮转、共享冷却表、usage、看板——都走同一个带重试的改名（`src/replace.ts`）：Windows 上杀软/索引器偶尔会短暂占用目标文件（EPERM/EBUSY/EACCES），重试耗尽才报错。心跳写失败**不等于**所有权丢失：只有锁记录不再属于自己（`heartbeat` 返回 false，或受保护写入前的所有权检查失败）才结束尝试或 watcher；写不进去不会被当成丢锁：任务尝试记一条 `heartbeat-write-failed` 日志（每个尝试一条），watch 报告一次（每次 watch 一条），下一个心跳周期重试。看板文件 `.taskctl/board.md` 是每次 `status` 重新生成的派生视图，重试耗尽也只影响这一次看板刷新。运行中的事件刷新会合并突发写入，只保留正在写的一次和最后一次最新状态。
 

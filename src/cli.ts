@@ -35,7 +35,7 @@ import { runBatch } from "./batch.js";
 import { judgeRefs, policyOf, renderVerdicts, reviewerModels, workerModels, type ModelVerdict } from "./budget.js";
 import { directModel } from "./models.js";
 import { modelRoundsOf, modelWaitHold, newRunContext, readModelWait } from "./model-wait.js";
-import { outageReport, renderOutageReport } from "./stuck.js";
+import { outageReport, renderOutageReport, statusLineFromNote, stuckLines } from "./stuck.js";
 import { stopRequestPath, watchQueue, type WatchEnd, type WatchOptions } from "./watch.js";
 import { createMempalaceBackend, runRecall, type MemoryBackend, type RecallInput, type RecallRecord } from "./memory.js";
 
@@ -171,7 +171,7 @@ const USAGE = [
   "  taskctl done --task <id> [--tasks-dir <dir>]",
   "  taskctl check --task <id> [--tasks-dir <dir>]",
   "  taskctl note --task <id> --status <s> --done <d> --found <f> --next <n> [--files <a,b>] [--tasks-dir <dir>]",
-  "  taskctl status [--tasks-dir <dir>]",
+  "  taskctl status [--stuck] [--tasks-dir <dir>]",
   "  taskctl board [--all] [--json] [--tasks-dir <dir>]",
   "  taskctl report --task <id> [--tasks-dir <dir>]",
   "  taskctl accept --task <id> [--note \"…\"] [--tasks-dir <dir>]",
@@ -319,7 +319,7 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
       ]);
       return noteCommand(flags, log);
     case "status":
-      checkFlags(command, flags, ["tasks-dir", "config"], []);
+      checkFlags(command, flags, ["tasks-dir", "config", "stuck"], []);
       return statusCommand(flags, log);
     case "board":
       checkFlags(command, flags, ["tasks-dir", "config", "all", "json"], []);
@@ -1169,10 +1169,19 @@ async function noteCommand(flags: Map<string, string>, log: (line: string) => vo
   return 0;
 }
 
-/** `taskctl status` — one table row per task, then the files it refused to register. */
+/** `taskctl status` — one table row per task, then the files it refused to register; `--stuck` lists only what is held or waiting. */
 async function statusCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
   const tasksDir = await tasksDirFor(flags);
   const store = new TaskStore(tasksDir);
+  if (flags.has("stuck")) {
+    // Files only: the config for `modelRounds`/`lockTtlMs`, the board, and what
+    // the attempts wrote. No adapter is built, so the guard's backend catalogue
+    // is never asked — the list prints what was judged when each record was
+    // written, and today's judgement is `taskctl models`' business.
+    const cfg = await configFor(flags);
+    for (const line of await stuckLines(tasksDir, await store.list(), cfg)) log(line);
+    return 0;
+  }
   const { tasks, ignored } = await store.scan();
   const rows: string[][] = [["id", "status", "retries", "sessions", "note"]];
   for (const task of tasks) {
@@ -1201,7 +1210,7 @@ async function statusCommand(flags: Map<string, string>, log: (line: string) => 
 // `resume` was missing here until 2026-11-24: the usage text and the stop
 // refusal both send the operator to `watch --resume`, but the parser read it
 // as a value flag and exited 2, so a stopped queue could not be restarted.
-const BOOLEAN_FLAGS = new Set(["simple", "quick", "all", "apply", "json", "review-only", "resume"]);
+const BOOLEAN_FLAGS = new Set(["simple", "quick", "all", "apply", "json", "review-only", "resume", "stuck"]);
 
 /** `taskctl board` — rewrite `.taskctl/board.md` and print the same content as a table. */
 async function boardCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
@@ -2008,29 +2017,6 @@ function nonNegativeNumber(raw: Record<string, unknown>, key: string, path: stri
     throw new Error(`config ${path}: field "${key}" must be a non-negative finite number`);
   }
   return value;
-}
-
-/**
- * The `## Status` section's first non-empty line — the "一句话状态" a
- * `taskctl note` leaves behind. Multiline statuses are represented by their
- * first line so every table row stays a single line.
- */
-function statusLineFromNote(markdown: string): string {
-  const lines = markdown.split(/\r?\n/);
-  const heading = lines.indexOf("## Status");
-  if (heading === -1) {
-    return "-";
-  }
-  for (let i = heading + 1; i < lines.length; i++) {
-    const line = lines[i]!;
-    if (line.startsWith("## ")) {
-      break;
-    }
-    if (line.trim().length > 0) {
-      return line.trim();
-    }
-  }
-  return "-";
 }
 
 /** Pad every column to the widest cell; the last column is trim-ended. */
