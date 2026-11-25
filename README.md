@@ -56,7 +56,8 @@ npx tsx src/main.ts <子命令> [参数]
 | `reviewerModelFallbacks` | string[] | `[]` | 复核会话的降级链，排在 `reviewerModel` 之后；没配 `reviewerModel` 时复核链为空，于是沿用 worker 链 |
 | `modelChain` | string[] | 等价于 `[model]` | 整条派发链：第一个是主模型，其后是替代。设置了就替代 `model` 作为链首，`modelFallbacks` 仍追加在末尾。配额耗尽时按这条链推进（见「派发失败」） |
 | `chainCycles` | number | `0` | 模型链走到链尾后还能回绕到链首几次；`0` = 线性链，到链尾即视为耗尽。回绕是重探此前拒绝过的模型（它的配额窗口可能已经重置），退避照常；整个循环都耗尽才 `blocked` 等所有者决策。新一轮 attempt / 复核轮重新计圈，轮换位置保留 |
-| `modelCooldownMs` | number | `900000` | 某个模型被 provider 拒绝后，在整个看板内共享的冷却窗口。期间其他 Task 和后续 run 跳过它；到期重探，成功清除，显式 `chainCycles` 仍可在本任务内重探 |
+| `modelCooldownMs` | number | `60000` | 某个模型被 provider 拒绝后，在整个看板内共享的跳过窗口。期间其他 Task 和后续 run 不再向它派发；到期重探，成功清除，显式 `chainCycles` 仍可在本任务内重探。它只是窗口，不会让任务 `blocked` |
+| `modelRounds` | number | `4` | 一个任务在同一次执行里连续几轮被链上所有模型拒绝之后才做判断；必须是正整数。轮次与判断规则见「模型拒绝与轮次」 |
 | `failureFingerprintLimit` | number | `3` | 验收连续给出**同一失败**（归一化后的指纹相同）几次后转 `blocked` 等人工，不再自动重试 |
 | `opencodeBin` | string | `opencode` | opencode 可执行文件。**Windows 下 `.cmd` shim 无法被 `shell:false` 直接启动**，应在本地配置实际 `.exe`，不要提交机器专属路径 |
 | `chromeBin` | string | 自动探测 | 渲染验收用的浏览器可执行文件；也可用环境变量 `TASKCTL_CHROME`。找不到时渲染任务 `blocked`，不会当成通过 |

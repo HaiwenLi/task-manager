@@ -30,6 +30,7 @@ import { collectChangeEvidence } from "./changes.js";
 import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck } from "./render.js";
 import { readExecutionState, recordEscalation, recordWorkerSession, type ExecutionState, type WorkerSessionFact } from "./execution-state.js";
 import { clearModelCooldown, modelCooldown, nextModelCooldown, noteModelRefusal } from "./model-cooldown.js";
+import { modelCooldownMsOf } from "./model-wait.js";
 import { recordUsage, type UsageRole } from "./usage.js";
 
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
@@ -91,8 +92,14 @@ export type WorkerConfig = {
    * so a task parks for a human only when the whole cycle is out of allowance.
    */
   chainCycles?: number;
-  /** Shared re-probe window for a provider/model refusal (default 15 minutes). */
+  /** Shared re-probe window for a provider/model refusal (default 60 seconds). */
   modelCooldownMs?: number;
+  /**
+   * Rounds of one run a task may be refused by every model before the run
+   * decides between the task's own problem and an outage (default 4, see
+   * `src/model-wait.ts`). A round is one pass over the chain.
+   */
+  modelRounds?: number;
   /** How many tasks the scheduler may run at once (default 2). */
   parallel?: number;
   /** Maximum automatic watch batch size (default 5); 1 disables grouping. */
@@ -618,7 +625,7 @@ async function modelFor(r: Run, role: ModelRole): Promise<string | undefined> {
   }
   if (chain.length > 0 && available.size === 0) {
     const next = await nextModelCooldown(r.cfg.tasksDir, chain);
-    throw new ModelsCoolingError(next?.retryAfter ?? new Date(Date.now() + (r.cfg.modelCooldownMs ?? 900_000)).toISOString());
+    throw new ModelsCoolingError(next?.retryAfter ?? new Date(Date.now() + modelCooldownMsOf(r.cfg)).toISOString());
   }
   const position = chainPosition(chain, rotation[role]);
   const walk = [...chain.slice(position), ...chain.slice(0, position)];
@@ -832,7 +839,7 @@ async function noteRefusal(
   await noteModelRefusal(r.cfg.tasksDir, model, {
     reason: (result.text ?? "provider rejected the turn").slice(0, 1_000),
     category,
-    cooldownMs: r.cfg.modelCooldownMs ?? 900_000,
+    cooldownMs: modelCooldownMsOf(r.cfg),
   });
 }
 
@@ -1687,7 +1694,7 @@ async function reviewStage(
     if (reviewerModel !== undefined) {
       await noteModelRefusal(r.cfg.tasksDir, reviewerModel, {
         reason: result.summary || "review provider rejected the turn",
-        category: "provider", cooldownMs: r.cfg.modelCooldownMs ?? 900_000,
+        category: "provider", cooldownMs: modelCooldownMsOf(r.cfg),
       });
     }
     await owned(r, () => appendJournal(r.cfg.tasksDir, id, {

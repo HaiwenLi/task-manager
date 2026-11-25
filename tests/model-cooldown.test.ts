@@ -95,6 +95,26 @@ describe("shared model cooldown", () => {
     expect(seen).toEqual(["q/two"]);
   });
 
+  it("skips a refused model for sixty seconds when no window is configured", async () => {
+    await seed("a");
+    const cfg: WorkerConfig = {
+      tasksDir: tasks, workdir: work, agent: "fixture", model: "q/one",
+      contextThreshold: 0.8, retryLimit: 1, lockTtlMs: 5_000, heartbeatMs: 50,
+    };
+    const refusing: AgentAdapter = {
+      prompt: async () => ({ sessionId: "", exitCode: 1, text: "weekly limit reached", failure: "provider", tokens: 0 }),
+      contextUsage: async () => 0, contextLimit: async () => 100,
+    };
+
+    await runTask(cfg, { store, adapter: refusing }, await store.get("a"), "a-run");
+
+    const table = JSON.parse(await readFile(join(root, ".taskctl", "model-cooldowns.json"), "utf8")) as {
+      models: Record<string, { observedAt: string; retryAfter: string }>;
+    };
+    const entry = table.models["q/one"]!;
+    expect(Date.parse(entry.retryAfter) - Date.parse(entry.observedAt)).toBe(60_000);
+  });
+
   it("writes nothing when there is no refusal to clear", async () => {
     // Every successful dispatch calls this for the model that just worked, and
     // almost always there is nothing to clear.
