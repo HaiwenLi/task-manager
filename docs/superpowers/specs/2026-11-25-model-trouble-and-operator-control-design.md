@@ -198,9 +198,11 @@ Behaviour:
      takes it when no attempt is in flight: with `parallel` above one, another task's turn may be
      running on a chain model at that moment, so the attempts still running are waited for and
      settled before the evidence is read. A run in which another task is being served is never
-     reported as a total outage. Until then the task is shown in the stuck list (§8) as deferred and
-      waiting for the attempts in flight; when no controller is running, as deferred with its rounds
-      spent and waiting for the owner.
+     reported as a total outage, and no decision is taken once the operator has asked to stop: a stop
+     settles every attempt, and a run that was stopped is not judged for an outage. Until then the
+     task is shown in the stuck list (§8) as deferred and waiting for the attempts in flight; when no
+     controller is running, as deferred with its rounds spent and waiting for the owner. A controller
+     counts as running when some task on the board has a live attempt.
    A task with a deferral is shown in the stuck list (§8) with its round count and next time.
 - *Call.* `modelCooldownMs` defaults to 60 seconds (today 900 000) and `modelRounds` to 4. With
   four models that is four to five minutes before a task is held or a run stops.
@@ -290,6 +292,10 @@ the answer is this command's output.
 - *New.* `SIGINT` and `SIGTERM` on `run` and `watch` do what `stop --now` does. Ctrl-C is how the
   owner will use it.
 - A batch turn (several tasks in one session) is interrupted the same way.
+- *Call.* Two short waits are not interrupted: the budget guard's read of the model catalogue and the
+  memory recall. Neither is work on a task, each is bounded (30 and 20 seconds), and a stop that lands
+  in one is observed the moment it ends. A task the guard refused is not an interrupted attempt: no
+  session had started.
 - What the interrupted task had already written stays in the workspace; nothing is rolled back. The
   owner has accepted running it again.
 - *Owner's decision.* The acceptance command is interrupted as well: the owner's gates run for tens
@@ -298,6 +304,10 @@ the answer is this command's output.
   process can hold open — and making it so is part of this work. A gate that was cut is not judged:
   the task returns to `open` and the gate runs again with the task.
 - The worker gets no stop input of its own.
+- *Call.* When several of the events of §6, §7 and this section fall in one run, the most serious
+  decides the exit code: an unconfirmed stop (1: an execution is `uncertain` and needs
+  reconciliation), then an outage stop (3), then a controller error or a guard refusal (1), then 130
+  or 143 for a stop by a signal, then 0.
 
 ## 10. The owner's decisions
 
@@ -408,7 +418,7 @@ walked, a fully refused round defers the task, and nothing is replayed — the w
 acceptance evidence are preserved, as today's park preserves them. When the window reopens, the
 controller resumes the review on the preserved evidence by itself, through today's review-only path
 and its digest gate; a `retry --review-only` that is asked for while the deferral's time lies in the
-future is not run and says so, with that time, never as a silent `skipped`. The rounds of the review
+future is not run, says so with that time, and exits 1: it is never a silent `skipped`. The rounds of the review
 stage are counted anew, so a task can be deferred for `modelRounds` rounds as a worker and again as a
 reviewer. After `modelRounds` the same evidence rule decides: if another task got a turn
 accepted, the task is parked as today, `blocked` with `review-pending.json`, for the owner;
@@ -480,3 +490,5 @@ What the author decided while revising. Each is a *call*:
 8. A manual `retry` of a deferred task keeps its earliest time and starts its rounds again; the review
    stage counts its rounds anew; `run --batch` does not wait for a window; a `retry --review-only`
    that a deferral holds says so, with the time.
+9. A stop does not interrupt the budget guard's read of the catalogue or the memory recall; a run
+   that was stopped is not judged for an outage; among exit codes the most serious wins (§9).
