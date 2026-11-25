@@ -18,7 +18,8 @@ import { createCoalescedRefresh, renderBoardMarkdown, renderBoardTable, writeBoa
 import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
 import { readRelevantFeedback, recordTaskFeedback, type FeedbackEvent } from "./feedback.js";
-import { readFlow } from "./metrics.js";
+import { readFixedSources, sourcesDetail } from "./context.js";
+import { ADJUDICATED, humanTouches, modelFirstPass, readFlowInput, SIGN_OFF, summarizeFlow, type HumanTouch, type ModelFirstPass } from "./metrics.js";
 import { clearQuestions, questionsPath, readQuestions, writeQuestions } from "./questions.js";
 import { waitReason } from "./eligibility.js";
 import {
@@ -31,7 +32,9 @@ import { taskWorkdir } from "./scheduler.js";
 import { resolveArtifacts } from "./artifacts.js";
 import { runSelfCheck } from "./self-check.js";
 import { runBatch } from "./batch.js";
+import { judgeRefs, policyOf, renderVerdicts, reviewerModels, workerModels, type ModelVerdict } from "./budget.js";
 import { stopRequestPath, watchQueue, type WatchOptions } from "./watch.js";
+import { createMempalaceBackend, runRecall, type MemoryBackend, type RecallInput, type RecallRecord } from "./memory.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
 export type CliDeps = {
@@ -39,6 +42,8 @@ export type CliDeps = {
   acceptance?: (command: string, cwd: string) => Promise<AcceptanceResult>;
   /** Test seam for review-only recovery without starting a reviewer agent. */
   review?: WorkerDeps["review"];
+  /** Test seam: what answers instead of the MemPalace server, for run, watch and recall; production leaves it absent. */
+  memory?: MemoryBackend;
   /** Test seam for watch filesystem events and timing; production leaves it absent. */
   watch?: WatchOptions;
   /** Test seam for observing watch scheduling; production leaves it absent. */
@@ -59,6 +64,16 @@ type ResolvedConfig = WorkerConfig & { opencodeBin?: string };
 type ControllerTelemetry = {
   refreshBoard: () => void;
   writeLogLine: (taskId: string, line: string) => void;
+  /**
+   * The line of a task the budget guard refused: no model session was started
+   * for it and no attempt was recorded, so the line goes to the operator's
+   * `--log` file when there is one, and never into the task's own directory.
+   * "Unclaimed" describes the task once the refusal has returned, on both of
+   * its paths: normally nothing was claimed; after the second judgement
+   * (`runTask` in `./worker.ts`) the claim's lock record and the workspace
+   * reservation had been written, and both were released again.
+   */
+  writeUnclaimedLine: (line: string) => void;
   /** Settle the trailing board refresh and queued log writes. */
   flush: () => Promise<void>;
 };
@@ -75,16 +90,21 @@ async function createControllerTelemetry(cfg: ResolvedConfig, teeTarget?: string
   }
   const boardRefresh = createCoalescedRefresh(() => refreshBoardFile(cfg.tasksDir));
   let logJob: Promise<unknown> = Promise.resolve();
+  const appendLine = (target: string, line: string): void => {
+    logJob = logJob.then(async () => {
+      await mkdir(dirname(target), { recursive: true });
+      await appendFile(target, `${new Date().toISOString()}  ${line}\n`, "utf8");
+    }).catch(() => {
+      // A log write that cannot happen must not take the controller down.
+    });
+  };
   return {
     refreshBoard: boardRefresh.request,
     writeLogLine: (taskId, line) => {
-      const target = teeTarget ?? join(cfg.tasksDir, taskId, "logs", `run-${runStamp}.log`);
-      logJob = logJob.then(async () => {
-        await mkdir(dirname(target), { recursive: true });
-        await appendFile(target, `${new Date().toISOString()}  ${line}\n`, "utf8");
-      }).catch(() => {
-        // A log write that cannot happen must not take the controller down.
-      });
+      appendLine(teeTarget ?? join(cfg.tasksDir, taskId, "logs", `run-${runStamp}.log`), line);
+    },
+    writeUnclaimedLine: (line) => {
+      if (teeTarget !== undefined) appendLine(teeTarget, line);
     },
     flush: async () => {
       boardRefresh.request();
@@ -107,11 +127,22 @@ function createWorkerDeps({
     adapter,
     ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
     ...(deps.review === undefined ? {} : { review: deps.review }),
+    ...(deps.memory === undefined ? {} : { memory: deps.memory }),
     onEvent: (evt) => {
       const line = workerEventLine(evt);
       log(line);
-      telemetry.writeLogLine(evt.taskId, line);
-      telemetry.refreshBoard();
+      if (evt.type === "refused") {
+        // The budget guard said no, so no attempt of the task started: none of
+        // its lines go into its directory, this one included. Normally nothing
+        // was claimed at all; after the second judgement the claim's lock
+        // record and the reservation had been written, and both were released
+        // again (`writeUnclaimedLine`). The verdicts in the line are what the
+        // operator reads.
+        telemetry.writeUnclaimedLine(line);
+      } else {
+        telemetry.writeLogLine(evt.taskId, line);
+        telemetry.refreshBoard();
+      }
       observe?.(evt);
     },
   };
@@ -141,6 +172,8 @@ const USAGE = [
   "  taskctl reject --task <id> --reason \"…\" [--stage clarify|worker|reviewer] [--tasks-dir <dir>]",
   "  taskctl audit --task <id> --verdict pass|fail [--stage …] [--note \"…\"] [--tasks-dir <dir>]",
   "  taskctl metrics [--tasks-dir <dir>]",
+  "  taskctl recall (--task <id> | --query <text>) [--config taskctl.json]",
+  "  taskctl models [--config taskctl.json]",
   "  taskctl reconcile --task <id> [--tasks-dir <dir>]",
   "  taskctl retry --task <id> [--review-only] [--tasks-dir <dir>]",
   "  taskctl findings --task <id> [--out <file>] [--tasks-dir <dir>]",
@@ -215,7 +248,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
   const log = deps.log ?? ((line: string) => console.log(line));
   const err = deps.err ?? ((line: string) => console.error(line));
   try {
-    return await dispatch(argv, deps, log);
+    return await dispatch(argv, deps, log, err);
   } catch (e) {
     if (e instanceof UsageError) {
       err(`taskctl: ${e.message}`);
@@ -227,7 +260,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
   }
 }
 
-async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => void): Promise<number> {
+async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => void, err: (line: string) => void): Promise<number> {
   const { command, positionals, flags } = parseArgs(argv);
   if (command === undefined) {
     throw new UsageError("missing command");
@@ -238,7 +271,7 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
   switch (command) {
     case "add":
       checkFlags(command, flags, ["type", "simple", "quick", "verify", "execution", "target", "id", "config", "risk", "workdir", "tasks-dir", "acceptance"], []);
-      return addCommand(positionals, flags, deps, log);
+      return addCommand(positionals, flags, deps, log, err);
     case "spec":
       checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
       return specCommand(flags, log);
@@ -250,7 +283,7 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
       return answerCommand(flags, log);
     case "split":
       checkFlags(command, flags, ["task", "apply", "tasks-dir", "config"], ["task"]);
-      return splitCommand(flags, deps, log);
+      return splitCommand(flags, deps, log, err);
     case "run":
       checkFlags(command, flags, ["config", "log", "batch"], []);
       return runCommand(flags, deps, log);
@@ -299,6 +332,12 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "metrics":
       checkFlags(command, flags, ["tasks-dir", "config"], []);
       return metricsCommand(flags, log);
+    case "recall":
+      checkFlags(command, flags, ["config", "task", "query"], []);
+      return recallCommand(flags, deps, log, err);
+    case "models":
+      checkFlags(command, flags, ["config"], []);
+      return modelsCommand(flags, deps, log);
     case "learn":
       checkFlags(command, flags, ["note", "tasks-dir", "config"], ["note"]);
       return learnCommand(flags, log);
@@ -358,13 +397,32 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
       + `${result.pending.join(", ")}. Run taskctl run again to continue.`,
     );
   }
+  // Each is said when its own count is above zero, the controller errors
+  // first: a run with both must not let the earlier return hide the later line.
+  let failed = false;
   if (controllerErrors > 0) {
     // A task blocked by a controller bug is not an ordinary outcome. The board
     // was still drained, but the run must not read as clean to a script.
     log(`[scheduler] ${controllerErrors} task(s) blocked by a controller error; see the controller-error line(s) above`);
-    return 1;
+    failed = true;
   }
-  return 0;
+  // What was refused is read off the result, never off the events: those are
+  // reported once per process per task, and an exit code must not depend on
+  // what happened earlier in this process.
+  const refused = batch === undefined
+    // `runScheduler` names every task it refused.
+    ? ("refused" in result ? result.refused ?? [] : [])
+    // A batch stops on the first task that was refused.
+    : "stoppedAt" in result && result.stoppedAt !== undefined && result.outcome === "refused"
+      ? [result.stoppedAt]
+      : [];
+  if (refused.length > 0) {
+    // The guard's verdicts are in the `refused` line(s) above. The board was
+    // still drained, but a task that did not run must not read as clean to a script.
+    log(`[scheduler] ${refused.length} task(s) refused by the budget guard; no model session was started for them`);
+    failed = true;
+  }
+  return failed ? 1 : 0;
 }
 
 /** `taskctl watch` — own and drain one board until its stop request appears. */
@@ -385,6 +443,152 @@ async function watchCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
     await telemetry.flush();
   }
   return 0;
+}
+
+/** What a recall is asked for a task: its own words, and its spec whole. */
+async function taskRecallInput(tasksDir: string, id: string): Promise<Omit<RecallInput, "at">> {
+  const task = await new TaskStore(tasksDir).get(id);
+  return { title: task.title, description: task.description, spec: await readSpec(tasksDir, id) };
+}
+
+/**
+ * `taskctl recall (--task <id> | --query <text>)` — show what a recall
+ * finds, and write nothing: no `recall.json`, no journal line.
+ *
+ * A read-only preview of the step a worker attempt takes when it starts
+ * (`readSections` in `./worker.ts`), through the same `runRecall`, so what is
+ * printed here is what the prompt would carry. `--task` asks with a task's
+ * own words and its spec's goal; `--query` asks with a query written by hand,
+ * to tune the cut-off or to reproduce an earlier recall. Either way the query
+ * is normalised as every recall query is: whitespace collapsed, 250
+ * characters at most.
+ *
+ * The fixed sources are shown first, as they are placed in the prompt, and
+ * whether memory is on or not: one line saying how each file was read, then
+ * the files as the prompt carries them. A file that is missing or cannot be
+ * read is said on a line of its own — by file name and state, never by path
+ * — and the exit code is 1, whatever memory then found.
+ *
+ * Exit code 0 when something was kept and when nothing was — an empty memory
+ * is an answer — and 1 when the backend could not answer in time or at all,
+ * or when a fixed source could not be read. With memory off there is nothing
+ * to ask; that is said, and is no failure.
+ */
+async function recallCommand(
+  flags: Map<string, string>, deps: CliDeps, log: (line: string) => void, err: (line: string) => void,
+): Promise<number> {
+  const id = flags.get("task");
+  const query = flags.get("query");
+  // Said before anything is read or asked.
+  if ((id === undefined) === (query === undefined)) {
+    throw new UsageError("recall needs exactly one of --task <id> and --query <text>");
+  }
+  if (query !== undefined && query.trim().length === 0) {
+    throw new UsageError("recall needs text after --query");
+  }
+  const cfg = await configFor(flags);
+  // The fixed sources come first, as they do in the prompt, and whether memory is on or not. `readFixedSources`
+  // never throws: a file that cannot be read costs a line to `err` and the exit code, never the rest of the preview.
+  let sourceFailed = false;
+  if (cfg.fixedSources !== undefined && cfg.fixedSources.length > 0) {
+    const { text, files } = await readFixedSources(cfg.fixedSources);
+    log(`fixed sources: ${sourcesDetail(files)}`);
+    // The blocks as the prompt carries them: nothing at all when no file could be read.
+    for (const line of text === undefined ? [] : text.split("\n")) log(line);
+    for (const { name, state, detail } of files) {
+      if (state !== "missing" && state !== "unreadable") continue;
+      err(`source unavailable: ${name} (${state}${detail === undefined ? "" : `: ${detail}`})`);
+      sourceFailed = true;
+    }
+  }
+  if (cfg.memory === undefined || cfg.memory.backend === "none") {
+    log('memory backend is "none"; nothing to recall');
+    return sourceFailed ? 1 : 0;
+  }
+  const at = new Date().toISOString();
+  const input: RecallInput = id === undefined
+    // A query written by hand is the whole of the input: nothing is added to it.
+    ? { title: query!, description: "", spec: null, at }
+    : { ...(await taskRecallInput(cfg.tasksDir, id)), at };
+  // The record is kept for the lines below; neither it nor a journal line is written anywhere.
+  let record: RecallRecord | undefined;
+  const text = await runRecall(cfg.memory, deps.memory ?? createMempalaceBackend(cfg.memory), input, {
+    write: async (written) => { record = written; },
+    journal: async () => {
+      // A preview leaves no journal line.
+    },
+  });
+  if (record === undefined) throw new Error("recall left no record of itself");
+  log(`query: ${record.query}`);
+  log(
+    `backend: ${record.backend}, outcome: ${record.outcome}, hits: ${record.hits.length}, `
+    + `below=${record.filtered.belowThreshold} room=${record.filtered.room} wing=${record.filtered.wing}`
+    + (record.truncated ? ", truncated" : ""),
+  );
+  // One line per hit, as the worker prompt shows them; nothing when none was kept.
+  for (const line of text === null ? [] : text.split("\n")) log(line);
+  if (record.outcome === "timeout" || record.outcome === "error") {
+    err(`recall unavailable: ${record.outcome}${record.detail === undefined ? "" : `: ${record.detail}`}`);
+  }
+  return (record.outcome === "ok" || record.outcome === "no-hits") && !sourceFailed ? 0 : 1;
+}
+
+/**
+ * `taskctl models [--config taskctl.json]` — what the budget guard will
+ * allow, seen before anything is offered: one line per model this
+ * configuration can run a task on, with the guard's verdict.
+ *
+ * Read-only. The backend is asked only for its catalogue and its default
+ * model, never for a session. A line comes from the verdict's own fields
+ * (`renderVerdicts`): a catalogue entry carries credentials, so nothing else
+ * of it is here to print.
+ *
+ * The models are the lists the guard judges before a claim (`checkModels`
+ * in `./budget.ts`), in this order: the worker's chain, the reviewer's
+ * chain, the `model` of every task on the board that is not `done`, and —
+ * where a chain is empty — the backend's default, which is what that role
+ * then runs on. Each list is judged once, on its own; a model that already
+ * has a line is not listed again.
+ *
+ * Exit 1 when any line is refused: that is what `run` would refuse too. An
+ * adapter that cannot list models is not guarded at all; that is said, and
+ * is no failure. It takes no `--tasks-dir`: the board is the one the
+ * configuration names, as it is for `run`.
+ */
+async function modelsCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
+  const cfg = await configFor(flags);
+  const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+  // What makes `catalogueOf` answer `null` in `./budget.ts`, and the guard
+  // stand aside. Asked of the adapter itself, not of a read of the backend:
+  // a catalogue that cannot be read is no "no catalogue", it is the refusal
+  // every line below then carries.
+  if (typeof adapter.modelCatalog !== "function") {
+    log("此适配器不提供模型目录，护栏不生效");
+    return 0;
+  }
+  const board = await new TaskStore(cfg.tasksDir).list();
+  const policy = policyOf(cfg);
+  const lists: readonly (readonly string[])[] = [
+    // The configuration's own chain: what a task without a model of its own runs on.
+    workerModels(cfg, { model: undefined } as Task),
+    reviewerModels(cfg),
+    ...board.flatMap((task) => task.status !== "done" && task.model !== undefined ? [[task.model]] : []),
+  ];
+  // Asked together, in the configured workdir (where a session would start): every list reads the same catalogue,
+  // so a backend that is slow or down is asked once.
+  const judged = await Promise.all(lists.map((refs) => judgeRefs(refs, policy, adapter, undefined, cfg.workdir)));
+  const verdicts: ModelVerdict[] = [];
+  for (const list of judged) {
+    for (const verdict of list) {
+      if (!verdicts.some((listed) => listed.ref === verdict.ref)) verdicts.push(verdict);
+    }
+  }
+  log("模型与护栏判定：");
+  const lines = renderVerdicts(verdicts);
+  if (lines.length > 0) {
+    for (const line of lines.split("\n")) log(line);
+  }
+  return verdicts.some((verdict) => !verdict.allowed) ? 1 : 0;
 }
 
 /** `taskctl stop` — request a graceful drain; never signals a worker process. */
@@ -452,12 +656,25 @@ async function refreshBoardFile(tasksDir: string): Promise<void> {  const tasks 
   await writeBoard(tasksDir, renderBoardMarkdown(tasks, { all: false, notes, highlighted, now: new Date() }));
 }
 
+/**
+ * The budget guard for a session that runs on one model, the configured one
+ * or else the backend's default: the clarify session of `add`, the planner
+ * session of `split`. The verdicts that were not allowed; empty when the
+ * session may start. An adapter that cannot list models is not guarded.
+ */
+async function sessionRefusals(cfg: ResolvedConfig, adapter: AgentAdapter): Promise<ModelVerdict[]> {
+  // Asked in `cfg.workdir`: the directory the session starts in, which the backend answers by.
+  const verdicts = await judgeRefs(cfg.model ? [cfg.model] : [], policyOf(cfg), adapter, undefined, cfg.workdir);
+  return verdicts.filter((verdict) => !verdict.allowed);
+}
+
 /** `taskctl add "<intent>"` — capture the intent, draft the spec, gate the state. */
 async function addCommand(
   positionals: string[],
   flags: Map<string, string>,
   deps: CliDeps,
   log: (line: string) => void,
+  err: (line: string) => void,
 ): Promise<number> {
   const intent = positionals.join(" ").trim();
   if (intent.length === 0) {
@@ -519,6 +736,17 @@ async function addCommand(
     sessions: [],
     retries: 0,
   };
+
+  const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+  // Before anything is written: a clarify session the budget guard refuses
+  // leaves no task file behind. A quick task has no session, so it is not asked.
+  if (!quick) {
+    const disallowed = await sessionRefusals(cfg, adapter);
+    if (disallowed.length > 0) {
+      err(renderVerdicts(disallowed));
+      throw new Error(`budget guard refused: ${disallowed.map((verdict) => verdict.ref).join(", ")}`);
+    }
+  }
   await writeFile(join(tasksDir, `${id}.md`), serializeTaskFile(task), { encoding: "utf8", flag: "wx" });
 
   if (quick) {
@@ -536,7 +764,6 @@ async function addCommand(
     return 0;
   }
 
-  const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
   const profile = await readProfile(tasksDir);
   const feedback = await relevantFeedback(tasksDir, { type, intent }, log);
   const prompt = buildClarifyPrompt({ task, type, profile, ...(feedback === null ? {} : { feedback }) });
@@ -746,8 +973,17 @@ function answerBlock(questions: string[], answers: string, at: string): string {
  * never replaced by a fresh model call just because the command ran again,
  * and an edited plan file is applied exactly as edited. To plan again, the
  * plan file is deleted on purpose; the command says so.
+ *
+ * Before a planner session starts, the budget guard judges the model it would
+ * run on (see `src/budget.ts`). A refusal is journaled as `budget-refused`,
+ * printed, and exits 1, and no plan is written.
  */
-async function splitCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
+async function splitCommand(
+  flags: Map<string, string>,
+  deps: CliDeps,
+  log: (line: string) => void,
+  err: (line: string) => void,
+): Promise<number> {
   const tasksDir = await tasksDirFor(flags);
   const id = flags.get("task")!;
   const apply = flags.has("apply");
@@ -773,6 +1009,19 @@ async function splitCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
   if (plan === null) {
     const cfg = await configFor(flags);
     const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+    // The planner session runs on one model, judged before it starts. A
+    // refusal is this command's own doing, so it is said in the journal, on
+    // stderr, and in the exit code; and no plan is written.
+    const disallowed = await sessionRefusals(cfg, adapter);
+    if (disallowed.length > 0) {
+      await appendJournal(tasksDir, id, {
+        stage: "split",
+        event: "budget-refused",
+        detail: disallowed.map((verdict) => verdict.ref).join(","),
+      });
+      err(renderVerdicts(disallowed));
+      return 1;
+    }
     const spec = (await readSpec(tasksDir, id)) ?? "";
     const result = await adapter.prompt({
       text: buildSplitPrompt({ parent, spec }),
@@ -1104,6 +1353,14 @@ async function auditCommand(flags: Map<string, string>, log: (line: string) => v
     ...(note === undefined ? {} : { note }),
     ...(verdict === "pass" ? { highlight: true } : {}),
   });
+  // A spot check is time a person spent on the task. The audit log keeps the
+  // verdict; this line lets the metrics count the touch (`humanTouches` in
+  // `./metrics.ts`). It is all the journal gains: the status does not move.
+  await appendJournal(tasksDir, id, {
+    stage: "human",
+    event: "audited",
+    detail: note === undefined ? `${verdict} ${stage}` : `${verdict} ${stage}: ${note}`,
+  });
   if (note !== undefined) {
     await recordHumanFeedback(tasksDir, task, log, { action: "audit", verdict, stage, note });
   }
@@ -1111,14 +1368,106 @@ async function auditCommand(flags: Map<string, string>, log: (line: string) => v
   return 0;
 }
 
-/** `taskctl metrics` — which stage a human keeps failing, and how often work comes back, and whose doing it was. */
+/** `taskctl metrics` — which stage a human keeps failing, how often work comes back and whose doing it was, where a person had to step in, and how each model's first review fares. */
 async function metricsCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
   const tasksDir = await tasksDirFor(flags);
   const tasks = await new TaskStore(tasksDir).list();
-  for (const line of [...summarizeAudits(await readAudits(tasksDir)), ...await readFlow(tasksDir, tasks)]) {
+  // The journals are read once: the flow and the two views under it are all computed from them.
+  const input = await readFlowInput(tasksDir, tasks);
+  // Only a finished task says anything about how its model's first review went.
+  const firstPass = modelFirstPass(await Promise.all(
+    tasks.filter((task) => task.status === "done").map(async (task) => ({
+      model: await acceptanceModel(tasksDir, task.id),
+      journal: input.journals.get(task.id) ?? [],
+    })),
+  ));
+  for (const line of [
+    ...summarizeAudits(await readAudits(tasksDir)),
+    ...summarizeFlow(input),
+    ...humanTouchSection(humanTouches(input.journals)),
+    ...firstPassSection(firstPass),
+  ]) {
     log(line);
   }
   return 0;
+}
+
+/**
+ * The model a finished task's acceptance ran on, from its `acceptance.json`.
+ * A task with `verify: render` has no `acceptance.json`: the render check is
+ * what accepted it, and it writes `render.json` instead. So when the record
+ * is absent or names no model, the `model` of `render.json` is read. `null`
+ * when neither says. A record too torn to read is one that says nothing (as
+ * `readClassification` in `./metrics.ts` reads its own): the task is
+ * credited to no model, and the metrics still print.
+ */
+async function acceptanceModel(tasksDir: string, id: string): Promise<string | null> {
+  return await recordedModel(tasksDir, id, "acceptance.json")
+    ?? await recordedModel(tasksDir, id, "render.json");
+}
+
+/** The `model` of one runtime record: `null` when the file is absent, cannot be parsed, or has none. */
+async function recordedModel(tasksDir: string, id: string, name: string): Promise<string | null> {
+  let record: { model?: unknown } | null;
+  try {
+    record = await readRuntime<{ model?: unknown }>(tasksDir, id, name);
+  } catch (err) {
+    if (err instanceof SyntaxError) return null;
+    throw err;
+  }
+  return typeof record?.model === "string" ? record.model : null;
+}
+
+/**
+ * The section `人工触点`: the two kinds of touch and which events are which
+ * — read off the sets themselves, so the line cannot drift from what is
+ * counted — then what the waiting time is, an approximation said every time.
+ * After them one line per task a person touched: its touches under each
+ * kind, the ones in neither kind when there are any, the touches by event,
+ * and how long it waited for them. The totals over the tasks close the
+ * section, and only when there is at least one task; `（无）` when there is
+ * none.
+ */
+function humanTouchSection(touches: readonly HumanTouch[]): string[] {
+  const byKind = (byEvent: Record<string, number>): string =>
+    Object.entries(byEvent).map(([event, count]) => `${event}×${count}`).join(", ");
+  /** `共 N 次  审批 S  裁决 A`, then the touches in neither kind when there are any: the shape of a task's line and of the totals. */
+  const counts = ({ total, signOff, adjudicated, other }: Pick<HumanTouch, "total" | "signOff" | "adjudicated" | "other">): string =>
+    `共 ${total} 次  审批 ${signOff}  裁决 ${adjudicated}${other > 0 ? `  未归类 ${other}` : ""}`;
+  const sum = touches.reduce(
+    (all, touch) => ({
+      total: all.total + touch.total, signOff: all.signOff + touch.signOff,
+      adjudicated: all.adjudicated + touch.adjudicated, other: all.other + touch.other,
+    }),
+    { total: 0, signOff: 0, adjudicated: 0, other: 0 },
+  );
+  return [
+    "人工触点",
+    `审批型是签字放行（${[...SIGN_OFF].join("、")}），该往下压；裁决型是定标准、判对错（${[...ADJUDICATED].join("、")}），是判断的来源，不压`,
+    "等人时长为墙钟时间，包含夜间和周末，是近似值",
+    ...(touches.length === 0 ? ["（无）"] : [
+      ...touches.map(({ task, byEvent, total, signOff, adjudicated, other, waitedMs }) => {
+        const minutes = Math.floor(waitedMs / 60_000);
+        return `${task}  ${counts({ total, signOff, adjudicated, other })}  （${byKind(byEvent)}）  等人 ${Math.floor(minutes / 60)}h${minutes % 60}m`;
+      }),
+      `合计  ${counts(sum)}`,
+    ]),
+  ];
+}
+
+/**
+ * The section `按模型的首轮复核通过`: one line per model. The rate is taken
+ * over the tasks that had a review at all, and is `-` when there are none.
+ */
+function firstPassSection(rows: readonly ModelFirstPass[]): string[] {
+  return [
+    "按模型的首轮复核通过",
+    ...rows.map(({ model, tasks, firstReviewPassed, noReview }) => {
+      const reviewed = tasks - noReview;
+      const rate = reviewed === 0 ? "-" : `${Math.round((100 * firstReviewPassed) / reviewed)}%`;
+      return `${model}  任务 ${tasks}  首轮通过 ${firstReviewPassed}  未复核 ${noReview}  首轮通过率 ${rate}`;
+    }),
+  ];
 }
 
 function parseStage(value: string): AuditStage {
@@ -1377,6 +1726,13 @@ export const CONFIG_KEYS = new Set([
   "opencodeBin",
   "chromeBin",
   "renderViewports",
+  "workerContext",
+  "fixedSources",
+  "memory",
+  "allowedProviders",
+  "allowedModels",
+  "allowPaidModels",
+  "maxCostPerMillion",
 ]);
 
 /** Merge config file over the defaults; every present field is validated. */
@@ -1420,6 +1776,116 @@ export function resolveConfig(raw: Record<string, unknown>, path: string): Resol
     opencodeBin: string(raw, "opencodeBin", path),
     chromeBin: string(raw, "chromeBin", path),
     renderViewports: stringArray(raw, "renderViewports", path),
+    workerContext: workerContextSwitches(raw.workerContext, path),
+    fixedSources: fixedSourcePaths(raw, path),
+    memory: memorySettings(raw.memory, path),
+    // The budget guard's policy. Each is absent by default; what each one allows is in `src/budget.ts`.
+    allowedProviders: stringArray(raw, "allowedProviders", path),
+    allowedModels: stringArray(raw, "allowedModels", path),
+    allowPaidModels: boolean(raw, "allowPaidModels", path),
+    maxCostPerMillion: nonNegativeNumber(raw, "maxCostPerMillion", path),
+  };
+}
+
+/**
+ * The `workerContext` block of `taskctl.json`. Absent stays `undefined`, so
+ * the worker's own default applies (both on); an object fills each switch it
+ * leaves out with `true`. Anything else is a config error, never a silent
+ * default: `"spec": "false"` meant to turn the spec off.
+ */
+function workerContextSwitches(raw: unknown, path: string): WorkerConfig["workerContext"] {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`config ${path}: field "workerContext" must be an object`);
+  }
+  const record = raw as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (key !== "spec" && key !== "preferences") {
+      throw new Error(`config ${path}: unknown workerContext field "${key}"`);
+    }
+  }
+  const spec = record.spec === undefined ? true : record.spec;
+  if (typeof spec !== "boolean") {
+    throw new Error(`config ${path}: workerContext.spec must be a boolean`);
+  }
+  const preferences = record.preferences === undefined ? true : record.preferences;
+  if (typeof preferences !== "boolean") {
+    throw new Error(`config ${path}: workerContext.preferences must be a boolean`);
+  }
+  return { spec, preferences };
+}
+
+/**
+ * The `fixedSources` list of `taskctl.json`: files the worker is given as
+ * they stand. Absent stays `undefined`, so nothing is read; an empty list is
+ * off too. Each path is made absolute the way `tasksDir` is, since the
+ * worker's cwd is its workdir and a relative path would point elsewhere
+ * there. `~` is not expanded, and a file need not exist: whether a source can
+ * be read is settled when it is read, per attempt, not by refusing the whole
+ * configuration.
+ */
+function fixedSourcePaths(raw: Record<string, unknown>, path: string): string[] | undefined {
+  const sources = stringArray(raw, "fixedSources", path);
+  return sources === undefined ? undefined : sources.map((source) => resolve(source));
+}
+
+/** The settings a `memory` block of `taskctl.json` may carry. */
+const MEMORY_KEYS = new Set(["backend", "command", "wing", "excludeWings", "rooms", "minSimilarity", "maxItems", "maxChars", "itemChars", "timeoutMs"]);
+
+/**
+ * The `memory` block of `taskctl.json`. Absent stays `undefined`, so memory
+ * is off; an object fills each setting it leaves out with its default, the
+ * backend included — `none`, so memory stays off until a backend is named.
+ * Anything else is a config error, never a silent default, and every message
+ * names the block: `memory` is optional, and a typo in it must not quietly
+ * turn recall off or change what it keeps.
+ */
+function memorySettings(raw: unknown, path: string): WorkerConfig["memory"] {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`config ${path}: field "memory" must be an object`);
+  }
+  const record = raw as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (!MEMORY_KEYS.has(key)) {
+      throw new Error(`config ${path}: unknown memory field "${key}"`);
+    }
+  }
+  /** Refuse a setting that is not what it must be; the message names it. */
+  function refuse(key: string, must: string): never {
+    throw new Error(`config ${path}: memory.${key} must be ${must}`);
+  }
+  const stringList = (value: unknown): value is string[] =>
+    Array.isArray(value) && value.every((item) => typeof item === "string" && item.trim().length > 0);
+  const positive = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value > 0;
+
+  // A setting left out is its default. `null` is a value, and is refused like any other wrong one.
+  const backend = record.backend === undefined ? "none" : record.backend;
+  if (backend !== "none" && backend !== "mempalace") refuse("backend", '"none" or "mempalace"');
+  const command = record.command === undefined ? ["mempalace-mcp"] : record.command;
+  if (!stringList(command) || command.length === 0) refuse("command", "a non-empty array of non-empty strings");
+  const wing = record.wing;
+  if (wing !== undefined && (typeof wing !== "string" || wing.length === 0)) refuse("wing", "a non-empty string");
+  const excludeWings = record.excludeWings === undefined ? [] : record.excludeWings;
+  if (!stringList(excludeWings)) refuse("excludeWings", "an array of non-empty strings");
+  const rooms = record.rooms === undefined ? ["pitfall", "pattern", "decision"] : record.rooms;
+  // Not empty: with no room allowed, every hit is filtered out and recall would answer "no hits" forever without saying why.
+  if (!stringList(rooms) || rooms.length === 0) refuse("rooms", "a non-empty array of non-empty strings");
+  // Its own check: `number` insists on a positive value, and 0 is a setting here — keep everything.
+  const minSimilarity = record.minSimilarity === undefined ? 0.55 : record.minSimilarity;
+  if (typeof minSimilarity !== "number" || !(minSimilarity >= 0 && minSimilarity <= 1)) refuse("minSimilarity", "a number from 0 to 1");
+  const maxItems = record.maxItems === undefined ? 5 : record.maxItems;
+  if (!positive(maxItems) || !Number.isInteger(maxItems)) refuse("maxItems", "a positive integer");
+  const maxChars = record.maxChars === undefined ? 2_000 : record.maxChars;
+  if (!positive(maxChars) || !Number.isInteger(maxChars)) refuse("maxChars", "a positive integer");
+  const itemChars = record.itemChars === undefined ? 400 : record.itemChars;
+  if (!positive(itemChars) || !Number.isInteger(itemChars)) refuse("itemChars", "a positive integer");
+  const timeoutMs = record.timeoutMs === undefined ? 20_000 : record.timeoutMs;
+  if (!positive(timeoutMs)) refuse("timeoutMs", "a positive finite number");
+  return {
+    backend, command: [...command], ...(wing === undefined ? {} : { wing }),
+    excludeWings: [...excludeWings], rooms: [...rooms],
+    minSimilarity, maxItems, maxChars, itemChars, timeoutMs,
   };
 }
 
@@ -1475,6 +1941,30 @@ function nonNegativeInteger(raw: Record<string, unknown>, key: string, path: str
   if (value === undefined) return undefined;
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
     throw new Error(`config ${path}: field "${key}" must be a non-negative integer`);
+  }
+  return value;
+}
+
+/** A switch: `true` or `false`, and nothing else. Absent stays absent, so the default applies. */
+function boolean(raw: Record<string, unknown>, key: string, path: string): boolean | undefined {
+  const value = raw[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new Error(`config ${path}: field "${key}" must be a boolean`);
+  }
+  return value;
+}
+
+/**
+ * A price cap whose zero is a setting (nothing may cost anything) rather than
+ * an omission, such as `maxCostPerMillion`. `number` insists on a positive
+ * value, so zero is read here before that rule applies.
+ */
+function nonNegativeNumber(raw: Record<string, unknown>, key: string, path: string): number | undefined {
+  const value = raw[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(`config ${path}: field "${key}" must be a non-negative finite number`);
   }
   return value;
 }

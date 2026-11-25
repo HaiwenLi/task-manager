@@ -6,6 +6,8 @@ import { waitReason } from "./eligibility.js";
 import { dependencySummary } from "./dependencies.js";
 import { latestNote, writeNote, type HandoffNote } from "./handoff.js";
 import { startAcceptance, type AcceptanceResult } from "./acceptance.js";
+import { readContextSections, readFixedSources, sourcesDetail, type ContextSections } from "./context.js";
+import { createMempalaceBackend, runRecall, type MemoryBackend, type MemorySettings } from "./memory.js";
 import { buildWorkerPrompt } from "./protocol.js";
 import type { TaskStore } from "./task-store.js";
 import type { Task, TaskExecution } from "./task-file.js";
@@ -19,7 +21,8 @@ import {
 import { definitionDigest, readAttempt, readDefinitionSnapshot, readRuntime, writeDefinitionSnapshot, writeRuntime, type AttemptRecord } from "./runtime.js";
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
-import { chainPosition, configChain, modelChain, readModelRotation, resetChainCycles, rotateModel, type Handover, type ModelRole } from "./models.js";
+import { chainPosition, readModelRotation, resetChainCycles, rotateModel, reviewerChain as configuredReviewerChain, taskChain, type Handover, type ModelRole } from "./models.js";
+import { checkModels, noteReported, renderVerdicts, reviewerModels, workerModels, type ModelVerdict } from "./budget.js";
 import { classifyDispatchFailure, quotaBackoffMs } from "./dispatch.js";
 import { failureFingerprint } from "./fingerprint.js";
 import { startReview, type CriterionResult, type ReviewEvidence, type ReviewResult } from "./review.js";
@@ -104,6 +107,36 @@ export type WorkerConfig = {
    * `artifacts` block of `taskctl.json`.
    */
   artifacts?: ArtifactsConfig;
+  /**
+   * Which context a worker session is given beside the task: the approved
+   * spec, and the owner's preferences with the relevant corrections. Absent
+   * means both. Resolved from the `workerContext` block of `taskctl.json`.
+   */
+  workerContext?: { spec: boolean; preferences: boolean };
+  /**
+   * Files holding the owner's own rules (how text is to be written, what must
+   * never happen), read by path for every attempt and given to the worker as
+   * they stand: never searched for, never ranked. Absent or empty means off.
+   * Resolved from the `fixedSources` list of `taskctl.json`.
+   */
+  fixedSources?: string[];
+  /**
+   * Memory recall for an attempt: the settings with the backend switch.
+   * Absent, or a backend of `none`, means off — no recall, no record, no
+   * journal line, no child process. Resolved from the `memory` block of
+   * `taskctl.json`.
+   */
+  memory?: MemorySettings;
+  /**
+   * The budget guard's policy, each key optional and absent by default. With
+   * all four absent only a model the backend reports as free may run, so a
+   * config written before the keys existed means exactly that. What each key
+   * allows is in `src/budget.ts`.
+   */
+  allowedProviders?: string[];
+  allowedModels?: string[];
+  allowPaidModels?: boolean;
+  maxCostPerMillion?: number;
 };
 export type WorkerStore = Pick<TaskStore, "list" | "setStatus" | "appendSession" | "incRetries" | "readDoneMarker" | "clearDoneMarker" | "incReviewRounds">;
 export type WorkerDeps = {
@@ -111,11 +144,32 @@ export type WorkerDeps = {
   acceptance?: (command: string, cwd: string) => Promise<AcceptanceResult>;
   /** Test seam: judge the evidence without starting an agent session. */
   review?: (evidence: ReviewEvidence) => Promise<ReviewResult>;
+  /** Test seam: what answers instead of the MemPalace server; production leaves it absent. */
+  memory?: MemoryBackend;
   onEvent?: (evt: WorkerEvent) => void;
 };
-export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error";
+/**
+ * `refused` is reported once per process for a task and the reason it was
+ * refused, which is what its detail holds (the guard's verdicts): the same
+ * verdicts at a later offer say nothing new, other verdicts are news.
+ */
+export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error" | "refused";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
-export type TaskOutcome = "done" | "blocked" | "skipped" | "open" | "awaiting-human";
+/**
+ * `refused`: the budget guard said no, so no model session started and no
+ * attempt record was written — that is what a refusal guarantees, whichever
+ * of its two paths refused. The task stays as the board has it (`open`, and
+ * unclaimed once the attempt has returned), so it is neither progress nor a
+ * reason to wait for a human; it needs no recovery.
+ *
+ * `runTask` judges twice, and only the first refusal writes nothing at all.
+ * Before the claim, on the snapshot the caller passed: nothing is claimed
+ * and nothing written. Right after the workspace is reserved, on the task as
+ * the board then holds it: the claim's lock record and the reservation were
+ * written and are released again — and the `execution-state-invalid` line
+ * stays, on the rare task whose execution state could not be read.
+ */
+export type TaskOutcome = "done" | "blocked" | "skipped" | "open" | "awaiting-human" | "refused";
 export type RunTaskOptions = {
   reviewOnly?: boolean;
   /** Batch-only input; ordinary runs keep the task-local restore behavior. */
@@ -173,6 +227,8 @@ type Run = {
   dispatchFailures: Map<string, string>;
   /** What each dependency produced; computed once per attempt (see `dependenciesOf`). */
   dependencies?: string | null;
+  /** The context sections this attempt was given; read once per attempt (see `contextOf`). */
+  context?: WorkerContext;
   /** The context budget was already reported as unreadable for this attempt. */
   budgetUnavailableNoted: boolean;
   /** The lock heartbeat's first write failure was already journaled for this attempt. */
@@ -195,11 +251,38 @@ export async function runWorker(cfg: WorkerConfig, deps: WorkerDeps): Promise<{ 
   return result;
 }
 
+/**
+ * Report a refusal, once per process for a task and the reason it was refused.
+ *
+ * The key is the guard's verdict lines, not only the models they name: a task
+ * first refused because the catalogue could not be read is reported again when
+ * the same models are later refused as paid, while the same verdicts at every
+ * wake of a queue are said once.
+ */
+function reportRefusal(deps: WorkerDeps, taskId: string, refused: readonly ModelVerdict[]): void {
+  const detail = renderVerdicts(refused);
+  if (noteReported(taskId, [detail])) deps.onEvent?.({ type: "refused", taskId, detail });
+}
+
 export async function runTask(
   cfg: WorkerConfig, deps: WorkerDeps, task: Task, workerId: string, options: RunTaskOptions = {},
 ): Promise<TaskOutcome> {
   // Even callers reusing a worker label get a distinct fencing generation.
   const owner = `${workerId}:${randomUUID()}`;
+  // The budget guard, before anything is claimed: every model this attempt
+  // may run on is judged first, and a refusal here leaves the task `open`,
+  // with nothing written into its directory and no session started. A
+  // review-only recovery runs the reviewer alone, so the worker's models are
+  // not judged. This is the snapshot the caller passed; the task is judged
+  // again below, as the board holds it once the claim has been made, where a
+  // refusal comes after the claim was written and releases it.
+  const refused = await checkModels(cfg, deps.adapter, options.reviewOnly
+    ? { reviewer: reviewerModels(cfg) }
+    : { worker: workerModels(cfg, task), reviewer: reviewerModels(cfg) });
+  if (refused.length > 0) {
+    reportRefusal(deps, task.id, refused);
+    return "refused";
+  }
   if (!await claim(cfg.tasksDir, task.id, owner, cfg.lockTtlMs)) return "skipped";
   let notifyLost!: () => void;
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
@@ -276,6 +359,31 @@ export async function runTask(
     if (!reservation) return await block(r, "workspace reserved by another or uncertain execution; reconcile before retry");
     r.record.workspace = reservation.cwd;
     r.cfg = { ...cfg, workdir: reservation.cwd };
+    // Judged again, on what this attempt will really run. The first guard took
+    // the snapshot the caller passed, and the task was re-read after the claim
+    // (`r.task`): a `model:` edited onto it in between must not run unjudged.
+    // The catalogue is remembered, so wherever the first guard could read it
+    // this is a second judgement, not a second call; and it is read in the
+    // directory the session starts in. No session has started and no attempt
+    // record exists yet: so far this attempt has written the claim's lock
+    // record and the workspace reservation, and nothing more unless the
+    // execution state could not be read above.
+    const refusedHere = await checkModels(r.cfg, deps.adapter, r.reviewOnly
+      ? { reviewer: reviewerModels(r.cfg) }
+      : { worker: workerModels(r.cfg, r.task), reviewer: reviewerModels(r.cfg) });
+    if (refusedHere.length > 0) {
+      reportRefusal(deps, r.task.id, refusedHere);
+      // On this path the claim's lock record was written (`claim`, above) and
+      // is released again by the `finally`. The workspace reservation is given
+      // back here: the `finally` releases only the reservation of a record
+      // that settled, and no record was written for this attempt. The task is
+      // left exactly as the board holds it. Unlike a refusal before the claim,
+      // this one is not "nothing was written": the two above were written and
+      // released again, and the `execution-state-invalid` line stays when the
+      // execution state could not be read. No session started.
+      await reservation.release();
+      return "refused";
+    }
     emit(r, task.status === "running" ? "takeover" : "claimed");
     await owned(r, async () => {
       await writeRuntime(cfg.tasksDir, task.id, "attempt.json", r.record);
@@ -484,12 +592,10 @@ async function controlled<T>(
   } finally { r.execution = undefined; if (timer) clearTimeout(timer); }
 }
 
-/** The worker's chain: the task's own model (else the configured chain), then fallbacks. */
-const workerChain = (r: Run): string[] => r.task.model === undefined
-  ? configChain(r.cfg.model, r.cfg.modelChain, r.cfg.modelFallbacks)
-  : modelChain(r.task.model, [...(r.cfg.modelChain ?? []), ...(r.cfg.modelFallbacks ?? [])]);
-/** The reviewer's chain: its own model, then its fallbacks — never the task's silently. */
-const reviewerChain = (r: Run): string[] => modelChain(r.cfg.reviewerModel, r.cfg.reviewerModelFallbacks);
+/** The worker's chain, the one definition of it: the task's own model (else the configured chain), then fallbacks. See `taskChain`. */
+const workerChain = (r: Run): string[] => taskChain(r.cfg, r.task);
+/** The reviewer's chain for this attempt: the one definition of it (`reviewerChain` in `./models.ts`), which the budget guard judges too. */
+const reviewerChain = (r: Run): string[] => configuredReviewerChain(r.cfg);
 
 /**
  * The model a role should use now, per the rotation recorded for this task.
@@ -854,6 +960,109 @@ async function dependenciesOf(r: Run): Promise<string | null> {
   return r.dependencies;
 }
 
+/**
+ * The context sections one attempt was given: what `readContextSections`
+ * reads from disk, the fixed sources read by file, and — when memory is on —
+ * what recall found, as the lines the prompt shows. An absent `memory` is no
+ * memory section, and an absent `fixedSources` is no fixed-sources section.
+ */
+export type WorkerContext = ContextSections & { fixedSources?: string; memory?: string };
+
+/**
+ * The context sections of this attempt, read once for the whole attempt: a
+ * session of many turns does not read three files, or ask the memory backend,
+ * on every one of them, and the journal says `profile-truncated` once, not
+ * once per turn.
+ */
+async function contextOf(r: Run): Promise<WorkerContext> {
+  if (r.context === undefined) r.context = await readSections(r);
+  return r.context;
+}
+
+/**
+ * Read the context sections, and the one place that read is guarded.
+ *
+ * The spec, the profile and the corrections are context, not state: a file
+ * that cannot be read says nothing about the work. So anything but a lost
+ * lock is journaled once and the attempt goes on with whatever sections were
+ * read — none, when the read throws as a whole. Without the guard the error
+ * lands in the attempt's error handling and the task is `blocked` over a file
+ * that is only context.
+ *
+ * Memory recall is the last of these steps, and only when a backend is named.
+ * It is not a `controlled` step: `runRecall` bounds itself by its own
+ * deadline, ends its own child and never throws, so nothing here can park the
+ * task. A memory that cannot be reached costs the attempt its memory section
+ * — never `blocked` — and leaves its reason in the record and the journal.
+ *
+ * The fixed sources sit between the two, and only when some are named. They
+ * are read by file, whatever the `workerContext` switches say: they are the
+ * owner's own rules, not this task's context. `readFixedSources` never
+ * throws — a file that is missing or cannot be read is a state, not an error
+ * — so the one line this adds to the journal is always written, all files
+ * missing included: a rule the owner counts on not reaching the worker is
+ * worth a record.
+ */
+async function readSections(r: Run): Promise<WorkerContext> {
+  const flags = r.cfg.workerContext ?? { spec: true, preferences: true };
+  // What was read before an error survives it. That is nothing when the read
+  // itself is what threw: the three files are read in one go.
+  let sections: WorkerContext = { profileTruncatedChars: 0 };
+  try {
+    sections = await readContextSections(r.cfg.tasksDir, r.task, flags);
+    if (sections.profileTruncatedChars > 0) {
+      // The section is the line that says it was cut, then the part that was kept.
+      const kept = sections.profile!.length - sections.profile!.indexOf("\n") - 1;
+      await noteContext(r, "profile-truncated", `profile cut; kept the newest ${kept} characters`);
+    }
+    if (r.cfg.fixedSources !== undefined && r.cfg.fixedSources.length > 0) {
+      const { text, files } = await readFixedSources(r.cfg.fixedSources);
+      await noteContext(r, "sources", sourcesDetail(files));
+      // Nothing was read, not even a clipped file: then there is no section to give.
+      if (text !== undefined) sections.fixedSources = text;
+    }
+    // Recall is off until a backend is named. What it finds is the last
+    // section, and what was read before it is already in hand: the step sits
+    // inside this guard like the reads above it.
+    if (r.cfg.memory?.backend === "mempalace") {
+      const memory = await runRecall(
+        r.cfg.memory,
+        r.deps.memory ?? createMempalaceBackend(r.cfg.memory),
+        {
+          title: r.task.title, description: r.task.description,
+          // Read again, and whole: the query wants the spec's goal, which the
+          // clipped section may have lost with the middle.
+          spec: (await readSpec(r.cfg.tasksDir, r.task.id)) ?? null,
+          at: new Date().toISOString(),
+        },
+        {
+          // Through the ownership guard, like every other write of the attempt.
+          write: (record) => owned(r, () => writeRuntime(r.cfg.tasksDir, r.task.id, "recall.json", record)),
+          journal: (event, detail) => owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, { stage: "worker", event, detail })),
+        },
+      );
+      // `null` is every other outcome: nothing kept, or the backend could not answer.
+      if (memory !== null) sections.memory = memory;
+    }
+  } catch (err) {
+    if (err instanceof OwnershipLostError) throw err;
+    await noteContext(r, "context-unavailable", err instanceof Error ? err.message : String(err));
+  }
+  return sections;
+}
+
+/**
+ * Journal one fact about the context. The journal is a record, not state: a
+ * line that cannot be written is lost and the attempt goes on — unless the
+ * write failed because the lock is no longer this attempt's.
+ */
+async function noteContext(r: Run, event: string, detail: string): Promise<void> {
+  await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, { stage: "worker", event, detail }))
+    .catch((err: unknown) => {
+      if (err instanceof OwnershipLostError) throw err;
+    });
+}
+
 async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
   let sessionId: string | undefined;
   let recordedSession = "", sessionsUsed = r.task.sessions.length, turns = 0;
@@ -872,12 +1081,19 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
   // Dependencies are done before the claim and cannot change under it, so
   // their summary is read once for the whole attempt, not once per turn.
   const dependencies = await dependenciesOf(r);
+  // The same holds for the context sections: read once, not once per turn.
+  const context = await contextOf(r);
   for (;;) {
     const note = await latestNote(r.cfg.tasksDir, r.task.id);
     const protocol = buildWorkerPrompt(r.task, {
       handoff: note?.markdown, workdir: r.cfg.workdir, tasksDir: r.cfg.tasksDir,
       taskDir: taskDirOf(r.cfg.tasksDir, r.task.id), logDir: logDirOf(r.cfg.tasksDir, r.task.id),
       ...(dependencies === null ? {} : { dependencies }),
+      ...(context.spec === undefined ? {} : { spec: context.spec }),
+      ...(context.profile === undefined ? {} : { profile: context.profile }),
+      ...(context.feedback === undefined ? {} : { feedback: context.feedback }),
+      ...(context.fixedSources === undefined ? {} : { fixedSources: context.fixedSources }),
+      ...(context.memory === undefined ? {} : { memory: context.memory }),
     });
     const prompt = r.batch === undefined ? protocol : `${r.batch.preamble}${protocol}`;
     let model: string | undefined;

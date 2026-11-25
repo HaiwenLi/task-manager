@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { join } from "node:path";
 import { CONFIG_KEYS, resolveConfig } from "../src/cli.js";
 
 describe("resolveConfig", () => {
@@ -128,5 +129,136 @@ describe("resolveConfig", () => {
 
   it("still only accepts the opencode agent", () => {
     expect(() => resolveConfig({ agent: "kimi" }, "taskctl.json")).toThrow(/unknown agent/);
+  });
+
+  it("accepts workerContext switches and fills the absent ones", () => {
+    // Absent stays absent: the worker's own default (both on) then applies.
+    expect(resolveConfig({}, "taskctl.json").workerContext).toBeUndefined();
+    expect(resolveConfig({ workerContext: {} }, "taskctl.json").workerContext).toEqual({ spec: true, preferences: true });
+    expect(resolveConfig({ workerContext: { spec: false } }, "taskctl.json").workerContext).toEqual({ spec: false, preferences: true });
+    expect(resolveConfig({ workerContext: { preferences: false } }, "taskctl.json").workerContext).toEqual({ spec: true, preferences: false });
+    expect(resolveConfig({ workerContext: { spec: false, preferences: false } }, "taskctl.json").workerContext).toEqual({ spec: false, preferences: false });
+  });
+
+  it("rejects a workerContext that is not an object of booleans", () => {
+    expect(() => resolveConfig({ workerContext: "no" }, "taskctl.json")).toThrow(/workerContext/);
+    expect(() => resolveConfig({ workerContext: null }, "taskctl.json")).toThrow(/workerContext/);
+    expect(() => resolveConfig({ workerContext: [] }, "taskctl.json")).toThrow(/workerContext/);
+    expect(() => resolveConfig({ workerContext: { spec: "yes" } }, "taskctl.json")).toThrow(/workerContext/);
+    expect(() => resolveConfig({ workerContext: { spec: null } }, "taskctl.json")).toThrow(/workerContext/);
+    expect(() => resolveConfig({ workerContext: { other: true } }, "taskctl.json")).toThrow(/workerContext/);
+  });
+
+  it("memory is off until a backend is named, and the settings have defaults", () => {
+    // Absent stays absent: no memory block, nothing to resolve.
+    expect(resolveConfig({}, "taskctl.json").memory).toBeUndefined();
+    // A block that names no backend is off, and still has every setting.
+    expect(resolveConfig({ memory: {} }, "taskctl.json").memory).toMatchObject({ backend: "none" });
+    expect(resolveConfig({ memory: {} }, "taskctl.json").memory).toEqual({
+      backend: "none", command: ["mempalace-mcp"], excludeWings: [], rooms: ["pitfall", "pattern", "decision"],
+      minSimilarity: 0.55, maxItems: 5, maxChars: 2000, itemChars: 400, timeoutMs: 20000,
+    });
+    expect(resolveConfig({ memory: { backend: "mempalace" } }, "taskctl.json").memory).toEqual({
+      backend: "mempalace", command: ["mempalace-mcp"], excludeWings: [], rooms: ["pitfall", "pattern", "decision"],
+      minSimilarity: 0.55, maxItems: 5, maxChars: 2000, itemChars: 400, timeoutMs: 20000,
+    });
+    expect(resolveConfig({ memory: { minSimilarity: 0, wing: "IDT" } }, "taskctl.json").memory).toMatchObject({ minSimilarity: 0, wing: "IDT" });
+  });
+
+  it("keeps each memory setting as written, and a wing only when one is named", () => {
+    // 0 and 1 are both ends of the similarity range, so both are settings rather than omissions.
+    expect(resolveConfig({ memory: { backend: "mempalace", minSimilarity: 1 } }, "taskctl.json").memory).toMatchObject({ minSimilarity: 1 });
+    expect(resolveConfig({ memory: { minSimilarity: 0 } }, "taskctl.json").memory).not.toHaveProperty("wing");
+    expect(resolveConfig({
+      memory: {
+        backend: "mempalace", command: ["node", "server.mjs"], wing: "IDT", excludeWings: ["dify_deploy"], rooms: ["pitfall"],
+        minSimilarity: 0.6, maxItems: 3, maxChars: 1500, itemChars: 200, timeoutMs: 5000,
+      },
+    }, "taskctl.json").memory).toEqual({
+      backend: "mempalace", command: ["node", "server.mjs"], wing: "IDT", excludeWings: ["dify_deploy"], rooms: ["pitfall"],
+      minSimilarity: 0.6, maxItems: 3, maxChars: 1500, itemChars: 200, timeoutMs: 5000,
+    });
+  });
+
+  it("rejects a memory block it cannot honour", () => {
+    expect(() => resolveConfig({ memory: { backend: "not-a-backend" } }, "taskctl.json")).toThrow(/memory/);
+    expect(() => resolveConfig({ memory: { other: true } }, "taskctl.json")).toThrow(/memory/);
+    expect(() => resolveConfig({ memory: { minSimilarity: 1.5 } }, "taskctl.json")).toThrow(/memory/);
+    expect(() => resolveConfig({ memory: { maxItems: 0 } }, "taskctl.json")).toThrow(/memory/);
+    expect(() => resolveConfig({ memory: { command: [] } }, "taskctl.json")).toThrow(/memory/);
+    // No room allowed means every hit is filtered out: recall would answer "no hits" forever without saying why.
+    expect(() => resolveConfig({ memory: { rooms: [] } }, "taskctl.json")).toThrow(/memory/);
+  });
+
+  it("rejects every other malformed memory block, naming the setting each time", () => {
+    const bad = (memory: unknown) => () => resolveConfig({ memory }, "taskctl.json");
+    expect(bad("no")).toThrow(/field "memory" must be an object/);
+    expect(bad(null)).toThrow(/field "memory" must be an object/);
+    expect(bad([])).toThrow(/field "memory" must be an object/);
+    expect(bad({ backend: 1 })).toThrow(/memory\.backend/);
+    expect(bad({ command: "mempalace-mcp" })).toThrow(/memory\.command/);
+    expect(bad({ command: [""] })).toThrow(/memory\.command/);
+    expect(bad({ command: [1] })).toThrow(/memory\.command/);
+    expect(bad({ wing: "" })).toThrow(/memory\.wing/);
+    expect(bad({ wing: 7 })).toThrow(/memory\.wing/);
+    expect(bad({ excludeWings: "dify_deploy" })).toThrow(/memory\.excludeWings/);
+    expect(bad({ excludeWings: [""] })).toThrow(/memory\.excludeWings/);
+    expect(bad({ rooms: "pitfall" })).toThrow(/memory\.rooms/);
+    expect(bad({ rooms: ["pitfall", ""] })).toThrow(/memory\.rooms/);
+    expect(bad({ minSimilarity: -0.1 })).toThrow(/memory\.minSimilarity/);
+    expect(bad({ minSimilarity: "0.6" })).toThrow(/memory\.minSimilarity/);
+    expect(bad({ maxItems: 2.5 })).toThrow(/memory\.maxItems/);
+    expect(bad({ maxChars: 0 })).toThrow(/memory\.maxChars/);
+    expect(bad({ itemChars: 0 })).toThrow(/memory\.itemChars/);
+    expect(bad({ timeoutMs: 0 })).toThrow(/memory\.timeoutMs/);
+    expect(bad({ timeoutMs: -1 })).toThrow(/memory\.timeoutMs/);
+    expect(bad({ other: true })).toThrow(/unknown memory field "other"/);
+  });
+
+  it("parses the budget keys and accepts a zero price cap", () => {
+    const cfg = resolveConfig({ allowedProviders: ["plan"], allowedModels: ["zen/p"], allowPaidModels: true, maxCostPerMillion: 0 }, "taskctl.json");
+    expect([cfg.allowedProviders, cfg.allowedModels, cfg.allowPaidModels, cfg.maxCostPerMillion]).toEqual([["plan"], ["zen/p"], true, 0]);
+    const off = resolveConfig({}, "taskctl.json");
+    expect([off.allowedProviders, off.allowedModels, off.allowPaidModels, off.maxCostPerMillion]).toEqual([undefined, undefined, undefined, undefined]);
+  });
+  it("rejects a bad price cap and a bad switch", () => {
+    expect(() => resolveConfig({ maxCostPerMillion: -1 }, "taskctl.json")).toThrow(/maxCostPerMillion/);
+    expect(() => resolveConfig({ maxCostPerMillion: "3" }, "taskctl.json")).toThrow(/maxCostPerMillion/);
+    expect(() => resolveConfig({ allowPaidModels: "yes" }, "taskctl.json")).toThrow(/allowPaidModels/);
+  });
+  it("names each budget key a config gets wrong", () => {
+    // Each message names its key: a config that is refused must say which setting was refused.
+    expect(() => resolveConfig({ allowedProviders: "plan" }, "taskctl.json")).toThrow(/allowedProviders.*array of non-empty strings/);
+    expect(() => resolveConfig({ allowedModels: ["zen/p", ""] }, "taskctl.json")).toThrow(/allowedModels.*array of non-empty strings/);
+    expect(() => resolveConfig({ allowPaidModels: 1 }, "taskctl.json")).toThrow(/allowPaidModels.*boolean/);
+    // `null` is a value, and is refused like any other wrong one.
+    expect(() => resolveConfig({ allowPaidModels: null }, "taskctl.json")).toThrow(/allowPaidModels.*boolean/);
+    // A price need not be a whole number of dollars; it must be a number.
+    expect(resolveConfig({ maxCostPerMillion: 1.5 }, "taskctl.json").maxCostPerMillion).toBe(1.5);
+    expect(() => resolveConfig({ maxCostPerMillion: Number.NaN }, "taskctl.json")).toThrow(/maxCostPerMillion.*non-negative/);
+    expect(() => resolveConfig({ maxCostPerMillion: Number.POSITIVE_INFINITY }, "taskctl.json")).toThrow(/maxCostPerMillion.*non-negative/);
+  });
+
+  it("reads fixed sources as a list of files, and none by default", () => {
+    // Absent stays absent: no source is read, and the worker's prompt is the one it always was.
+    expect(resolveConfig({}, "taskctl.json").fixedSources).toBeUndefined();
+    // An empty list is off too, and stays a list.
+    expect(resolveConfig({ fixedSources: [] }, "taskctl.json").fixedSources).toEqual([]);
+    // Each path is made absolute against the working directory, the way tasksDir is: the worker's cwd is its workdir.
+    const absolute = join(process.cwd(), "rules", "contract.md");
+    expect(resolveConfig({ fixedSources: ["rules/voice.md", absolute] }, "taskctl.json").fixedSources)
+      .toEqual([join(process.cwd(), "rules", "voice.md"), absolute]);
+  });
+
+  it("refuses a fixed-sources list that is anything but non-empty strings, and still refuses a near miss", () => {
+    const bad = (fixedSources: unknown) => () => resolveConfig({ fixedSources }, "taskctl.json");
+    const message = 'config taskctl.json: field "fixedSources" must be an array of non-empty strings';
+    expect(bad("voice.md")).toThrowError(new Error(message));
+    expect(bad([""])).toThrowError(new Error(message));
+    expect(bad(["  \t\n"])).toThrowError(new Error(message));
+    expect(bad([1])).toThrowError(new Error(message));
+    expect(bad(null)).toThrowError(new Error(message));
+    // The allowlist grew by exactly this key: one letter short is still unknown.
+    expect(() => resolveConfig({ fixedSource: ["voice.md"] }, "taskctl.json")).toThrow(/unknown field "fixedSource"/);
   });
 });

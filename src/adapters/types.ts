@@ -35,6 +35,24 @@ export type SessionUsageSnapshot = {
 
 export type SessionReuseStatus = "reusable" | "active" | "unavailable";
 
+/** What a backend reports for a model's price, per million tokens. */
+export type CatalogueCost = { input: number; output: number };
+
+/**
+ * One model of the backend's model catalogue (`opencode api model.list`),
+ * rebuilt from named fields only: a list entry also carries credentials
+ * (`settings.apiKey`, `headers`), so nothing else of it is kept or passed on.
+ *
+ * - `ref` is `providerID/id`; `modelID` is the upstream name, the same as `id`
+ *   for most models.
+ * - `cost` is empty when the entry reports no rows, and also when any row of
+ *   it is not two finite numbers: an entry that does not say the whole of what
+ *   it costs says nothing usable, so it is never read as free. Empty means
+ *   "this model does not say what it costs"; all-zero means free.
+ * - `enabled` is what the backend says, and `true` when it says nothing.
+ */
+export type CatalogueModel = { ref: string; providerID: string; id: string; modelID: string; variants: string[]; cost: CatalogueCost[]; enabled: boolean };
+
 export interface AgentAdapter {
   prompt(args: {
     sessionId?: string;
@@ -70,4 +88,30 @@ export interface AgentAdapter {
   sessionUsage?(sessionId: string): Promise<SessionUsageSnapshot>;
   /** Best-effort proof that a persisted session is idle and safe to continue. */
   canResumeSession?(sessionId: string, expected: { model: string; cwd: string }): Promise<SessionReuseStatus>;
+  /**
+   * Every model the backend lists with the cost it reports: one entry per
+   * `providerID/id`, sorted by ref. Rejects when the call fails and when the
+   * answer holds no models — neither is a truth about the backend — and
+   * remembers neither. Optional: an adapter without it is not budget-guarded,
+   * so the fakes that never list models stay as they are.
+   *
+   * `cwd` is the directory the session that would run on these models starts
+   * in, which is the directory the backend is asked in: it finds its own
+   * configuration from there and answers by it (the real service named another
+   * default model and another list in a directory with its own `opencode.json`,
+   * 2026-11-25). Absent is the process's own directory.
+   *
+   * A rejection never quotes what the backend printed, because its stderr can
+   * quote configuration: its message is the operation and what went wrong by
+   * code — an exit code, unparsable output, a spawn error's code — and the
+   * original error is its `cause`. The budget guard puts the first 200
+   * characters of a message into its reason, the journal and the log.
+   */
+  modelCatalog?(cwd?: string): Promise<CatalogueModel[]>;
+  /**
+   * The backend's default model as `providerID/id`, `null` when it has none.
+   * Rejects when the answer cannot be read, and remembers nothing. `cwd` and
+   * the rejection are as for {@link AgentAdapter.modelCatalog}.
+   */
+  defaultModelRef?(cwd?: string): Promise<string | null>;
 }

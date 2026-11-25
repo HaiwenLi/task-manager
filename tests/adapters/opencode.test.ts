@@ -1,9 +1,11 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { OpenCodeAdapter } from "../../src/adapters/opencode.js";
+import type { CatalogueModel } from "../../src/adapters/types.js";
+import { classify } from "../../src/budget.js";
 
 /**
  * The fake opencode CLI, driven through the preflight-ruled constructor
@@ -35,6 +37,9 @@ afterEach(async () => {
   delete process.env.FAKE_SESSION_MODEL_IN_GET;
   delete process.env.FAKE_MESSAGE_LIST_FAILS;
   delete process.env.FAKE_MODEL_LIST_FAILS_ONCE;
+  delete process.env.FAKE_MODEL_LIST_EMPTY_ONCE;
+  delete process.env.FAKE_MODEL_DEFAULT_FAILS_ONCE;
+  delete process.env.FAKE_MODEL_DEFAULT_NONE;
   await rm(cwd, { recursive: true, force: true });
 });
 
@@ -351,5 +356,240 @@ describe("OpenCodeAdapter session status and usage", () => {
 
     await expect(adapter.sessionUsage("ses_fake123")).resolves.toMatchObject({ input: 1000, output: 200 });
     await expect(adapter.canResumeSession("ses_fake123", { model: "anthropic/sonnet", cwd })).resolves.toBe("unavailable");
+  });
+});
+
+/**
+ * An adapter whose `api <operation>` answers one fixed envelope, for shapes
+ * the shared fake does not have. Like the fake, it is `node` itself with the
+ * script riding in `binArgsPrefix` (`node -e <script> api <operation>`).
+ */
+function answering(operation: string, data: string): OpenCodeAdapter {
+  const script = `if (process.argv.includes(${JSON.stringify(operation)})) process.stdout.write(JSON.stringify({ location: { directory: "." }, data: ${data} })); else process.exitCode = 2;`;
+  return new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: ["-e", script] });
+}
+
+describe("OpenCodeAdapter.modelCatalog", () => {
+  it("tells an empty cost list from a zero cost", async () => {
+    const adapter = makeAdapter();
+    const catalogue = await adapter.modelCatalog!();
+    expect(catalogue.find((m) => m.ref === "anthropic/sonnet")).toMatchObject({ cost: [{ input: 0, output: 0 }], enabled: true, variants: [] });
+    expect(catalogue.find((m) => m.ref === "anthropic/opus")).toMatchObject({ cost: [{ input: 15, output: 75 }] });
+    expect(catalogue.find((m) => m.ref === "ollama/local-model")?.cost).toEqual([]);
+    expect(catalogue.find((m) => m.ref === "openai/gpt")?.variants).toEqual(["low", "high"]);
+  });
+
+  it("keys the catalogue by provider and id and keeps the modelID", async () => {
+    const adapter = makeAdapter();
+    const ofP = (await adapter.modelCatalog!()).filter((m) => m.providerID === "p");
+    expect(ofP).toHaveLength(1);
+    expect(ofP[0]).toMatchObject({ ref: "p/k", id: "k", modelID: "k-alias" });
+  });
+
+  it("never exposes credentials from the catalogue", async () => {
+    const adapter = makeAdapter();
+    const text = JSON.stringify(await adapter.modelCatalog!());
+    expect(text).not.toMatch(/apiKey|headers|sk-/);
+  });
+
+  it("rejects when the fetch fails, remembers nothing, and recovers", async () => {
+    // FAKE_MODEL_LIST_FAILS_ONCE naming a fresh marker file, as the failed-fetch test above does
+    process.env.FAKE_MODEL_LIST_FAILS_ONCE = join(cwd, "model-list-failed.once");
+    const adapter = makeAdapter();
+    const failure = await adapter.modelCatalog!().catch((error: unknown) => error);
+    // The operation and the exit code, and not one word of what the service printed: its stderr can quote
+    // configuration, and the budget guard puts the start of this message into its reason, the journal and the log.
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("opencode api model.list failed: exit 1");
+    expect((failure as Error).message).not.toContain("service unreachable");
+    // The original is kept as the cause, for whoever reads the failure up close.
+    expect((failure as Error).cause).toBeInstanceOf(Error);
+    expect(((failure as Error).cause as Error).message).toContain("service unreachable");
+    expect((await adapter.modelCatalog!()).length).toBeGreaterThan(0);
+  });
+
+  it("treats an answer with no models as a failure and asks again", async () => {
+    // FAKE_MODEL_LIST_EMPTY_ONCE naming a fresh marker file
+    process.env.FAKE_MODEL_LIST_EMPTY_ONCE = join(cwd, "model-list-empty.once");
+    const adapter = makeAdapter();
+    await expect(adapter.modelCatalog!()).rejects.toThrow(/no models/);
+    expect((await adapter.modelCatalog!()).length).toBeGreaterThan(0);
+  });
+
+  // Beyond the plan's five catalogue tests: shapes it states for the two
+  // methods that the shared fake cannot show by itself.
+
+  it("answers one entry per provider and id, sorted by ref, built from the named fields only", async () => {
+    const catalogue = await makeAdapter().modelCatalog!();
+    expect(catalogue.map((m) => m.ref)).toEqual(["anthropic/opus", "anthropic/sonnet", "ollama/local-model", "openai/gpt", "p/k"]);
+    // local-model names no modelID, no enabled and no variants: modelID is its id (as for most models), enabled is true, variants and cost are empty.
+    expect(catalogue.find((m) => m.ref === "ollama/local-model")).toStrictEqual({
+      ref: "ollama/local-model", providerID: "ollama", id: "local-model", modelID: "local-model", variants: [], cost: [], enabled: true,
+    });
+    for (const model of catalogue) {
+      expect(Object.keys(model).sort()).toEqual(["cost", "enabled", "id", "modelID", "providerID", "ref", "variants"]);
+    }
+  });
+
+  it("reads the same memoised model.list as the context and variant lookups", async () => {
+    const log = join(cwd, "api-calls.log");
+    process.env.FAKE_API_LOG = log;
+    const adapter = makeAdapter();
+
+    await expect(adapter.contextLimit("openai/gpt")).resolves.toBe(128000);
+    await adapter.resolveModel("anthropic/sonnet", "high");
+    expect((await adapter.modelCatalog!()).length).toBeGreaterThan(0);
+    expect((await adapter.modelCatalog!()).length).toBeGreaterThan(0);
+
+    const calls = (await readFile(log, "utf8")).trim().split(/\r?\n/);
+    expect(calls.filter((line) => line === "api model.list")).toHaveLength(1);
+  });
+
+  it("rejects when model.list answers something that is not a list of models", async () => {
+    await expect(answering("model.list", JSON.stringify({ id: "x" })).modelCatalog!()).rejects.toThrow(/no models/);
+    await expect(answering("model.list", "null").modelCatalog!()).rejects.toThrow(/no models/);
+  });
+
+  it("keeps a disabled model disabled, and answers no cost at all when any cost row is not two finite numbers", async () => {
+    const listed = async (cost: unknown): Promise<CatalogueModel[]> => answering("model.list", JSON.stringify([{
+      id: "x", providerID: "p", enabled: false,
+      settings: { apiKey: "sk-FAKE-not-a-real-key" }, headers: { authorization: "Bearer FAKE-not-a-real-token" },
+      cost,
+    }])).modelCatalog!();
+    const entry = { ref: "p/x", providerID: "p", id: "x", modelID: "x", variants: [], enabled: false };
+    // A cache object on a cost row is ignored (the real service has it).
+    expect(await listed([{ input: 1, output: 2, cache: { read: 0.1 } }])).toStrictEqual([{ ...entry, cost: [{ input: 1, output: 2 }] }]);
+    // A row without two finite prices is no row, and an entry that loses a row says nothing about what it costs.
+    // The first of these was read as free: the row that stayed said 0, and the row that said the price was dropped.
+    for (const cost of [[{ input: 0, output: 0 }, { input: 3 }], [{ input: 1, output: 2, cache: { read: 0.1 } }, { input: "1", output: 2 }, { input: 3 }, null]]) {
+      const catalogue = await listed(cost);
+      expect(catalogue).toStrictEqual([{ ...entry, cost: [] }]);
+      // Which is what the budget guard classifies as unknown: never free, and not allowed unless named.
+      expect(classify("p/x", catalogue, {})).toMatchObject({ costClass: "unknown", dollarsPerMillion: null, allowed: false });
+    }
+  });
+
+  it("answers an empty map to a lookup that saw an empty answer, and asks again", async () => {
+    // The private lookup keeps what it does for a failed fetch: the call that
+    // saw the empty answer finds nothing, and the next one asks the service
+    // again instead of keeping the empty answer for the life of the adapter.
+    const log = join(cwd, "api-calls.log");
+    process.env.FAKE_API_LOG = log;
+    process.env.FAKE_MODEL_LIST_EMPTY_ONCE = join(cwd, "model-list-empty.once");
+    const adapter = makeAdapter();
+
+    await expect(adapter.contextLimit("anthropic/sonnet")).rejects.toThrow(/unknown/i);
+    await expect(adapter.contextLimit("anthropic/sonnet")).resolves.toBe(200000);
+
+    expect((await readFile(log, "utf8")).trim().split(/\r?\n/)).toEqual(["api model.list", "api model.list"]);
+  });
+});
+
+describe("OpenCodeAdapter.defaultModelRef", () => {
+  it("reports the backend default model", async () => {
+    expect(await makeAdapter().defaultModelRef!()).toBe("anthropic/sonnet");
+  });
+
+  it("answers null when the backend has no default model", async () => {
+    process.env.FAKE_MODEL_DEFAULT_NONE = "1";
+    await expect(makeAdapter().defaultModelRef!()).resolves.toBeNull();
+  });
+
+  it("rejects when the default cannot be read, remembers nothing, and recovers", async () => {
+    const log = join(cwd, "api-calls.log");
+    process.env.FAKE_API_LOG = log;
+    process.env.FAKE_MODEL_DEFAULT_FAILS_ONCE = join(cwd, "model-default-failed.once");
+    const adapter = makeAdapter();
+
+    const failure = await adapter.defaultModelRef!().catch((error: unknown) => error);
+    // The rule for the list holds for the default too: what went wrong, by code, and none of the service's stderr.
+    expect((failure as Error).message).toBe("opencode api model.default failed: exit 1");
+    expect((failure as Error).message).not.toContain("service unreachable");
+    expect(((failure as Error).cause as Error).message).toContain("service unreachable");
+    await expect(adapter.defaultModelRef!()).resolves.toBe("anthropic/sonnet");
+
+    // Asked twice: the failure was not remembered.
+    expect((await readFile(log, "utf8")).trim().split(/\r?\n/)).toEqual(["api model.default", "api model.default"]);
+  });
+
+  it("rejects, without quoting the answer, when the default is not a model record", async () => {
+    for (const data of ['{ "settings": { "apiKey": "sk-FAKE-not-a-real-key" } }', '"sonnet"', "undefined"]) {
+      const error = await answering("model.default", data).defaultModelRef!().catch((err: unknown) => err);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/model\.default/);
+      // A record carries credentials like a list entry, so the rejection never quotes it.
+      expect((error as Error).message).not.toMatch(/apiKey|sk-/);
+    }
+  });
+});
+
+/** An adapter whose `api <operation>` prints `text` as it is, envelope or not. */
+function printing(operation: string, text: string): OpenCodeAdapter {
+  const script = `if (process.argv.includes(${JSON.stringify(operation)})) process.stdout.write(${JSON.stringify(text)}); else process.exitCode = 2;`;
+  return new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: ["-e", script] });
+}
+
+describe("what a failed catalogue call says", () => {
+  it("names an answer it cannot parse, and a binary it cannot spawn, by code alone", async () => {
+    // What the service printed can quote configuration, on stdout as on stderr: none of it is repeated.
+    const text = "ConfigError: apiKey sk-FAKE-not-a-real-key was rejected\n";
+    const unparsableList = await printing("model.list", text).modelCatalog!().catch((error: unknown) => error);
+    const unparsableDefault = await printing("model.default", text).defaultModelRef!().catch((error: unknown) => error);
+    expect((unparsableList as Error).message).toBe("opencode api model.list failed: printed unparsable output");
+    expect((unparsableDefault as Error).message).toBe("opencode api model.default failed: printed unparsable output");
+
+    // A binary that cannot be spawned at all: Node's own error, of which only the code is quoted.
+    const missing = new OpenCodeAdapter({ bin: "taskctl-no-such-binary" });
+    const noList = await missing.modelCatalog!().catch((error: unknown) => error);
+    const noDefault = await missing.defaultModelRef!().catch((error: unknown) => error);
+    expect((noList as Error).message).toBe("opencode api model.list failed: ENOENT");
+    expect((noDefault as Error).message).toBe("opencode api model.default failed: ENOENT");
+
+    for (const failure of [unparsableList, unparsableDefault, noList, noDefault]) {
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).not.toMatch(/apiKey|sk-|ConfigError|service unreachable/);
+      // The original is the cause.
+      expect((failure as Error).cause).toBeInstanceOf(Error);
+    }
+  });
+});
+
+describe("the directory the catalogue is asked in", () => {
+  it("asks in the directory it is given, and keeps one listing per directory", async () => {
+    // The real service answers by the directory it is asked in: a directory with its own `opencode.json` got another
+    // default model and another list (2026-11-25). The fake marks such a directory with a file named `paid-default`.
+    const log = join(cwd, "api-calls.log");
+    process.env.FAKE_API_LOG = log;
+    const plain = join(cwd, "plain");
+    const paid = join(cwd, "paid");
+    await mkdir(plain);
+    await mkdir(paid);
+    await writeFile(join(paid, "paid-default"), "", "utf8");
+    const adapter = makeAdapter();
+    const calls = async (operation: string): Promise<string[]> =>
+      (await readFile(log, "utf8")).trim().split(/\r?\n/).filter((line) => line === `api ${operation}`);
+
+    expect(await adapter.defaultModelRef!(plain)).toBe("anthropic/sonnet");
+    expect(await adapter.defaultModelRef!(paid)).toBe("anthropic/opus");
+    // No directory is the process's own, as it always was.
+    expect(await adapter.defaultModelRef!()).toBe("anthropic/sonnet");
+
+    const refs = async (directory?: string): Promise<string[]> => (await adapter.modelCatalog!(directory)).map((model) => model.ref);
+    expect(await refs(paid)).toContain("anthropic/only-in-paid");
+    expect(await refs(plain)).not.toContain("anthropic/only-in-paid");
+
+    // One listing per directory, however often it is asked...
+    await adapter.modelCatalog!(paid);
+    await adapter.modelCatalog!(paid);
+    await adapter.modelCatalog!(plain);
+    expect(await calls("model.list")).toHaveLength(2);
+    // ...and the variant and context lookups share the listing of the directory they run in.
+    await adapter.resolveModel("anthropic/sonnet", "high");
+    await expect(adapter.contextLimit("openai/gpt")).resolves.toBe(128000);
+    expect((await adapter.modelCatalog!()).length).toBeGreaterThan(0);
+    expect(await calls("model.list")).toHaveLength(3);
+
+    // The default is asked every time: it is never remembered.
+    expect(await calls("model.default")).toHaveLength(3);
   });
 });

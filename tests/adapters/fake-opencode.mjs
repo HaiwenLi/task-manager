@@ -12,7 +12,12 @@
 //                                  outcome/time/title/location only
 //   api session.message.list    → {"data":[…]} newest first; each assistant
 //                                  message carries model {providerID, id}
-//   api model.list              → one JSON object {"data":[…]}
+//   api model.list              → one JSON object {"data":[…]} with one record
+//                                  per model: {id, modelID, providerID, cost,
+//                                  enabled, variants: [{id}], settings,
+//                                  headers, …} (verified 2026-11-25)
+//   api model.default           → one JSON object {"location":…,"data":{…}}
+//                                  whose data is one such record
 //
 // Extra test hooks, all optional and inherited via process.env:
 //   FAKE_ARGV_FILE   — path to write the received argv (JSON array) to, so
@@ -49,7 +54,37 @@
 //                      before 2.4 did
 //   FAKE_MESSAGE_LIST_FAILS — `api session.message.list` fails: a service
 //                      without the operation
+//   FAKE_MODEL_LIST_FAILS_ONCE — `api model.list` fails once: name a marker
+//                      file, the first call fails while creating it and every
+//                      later call answers normally
+//   FAKE_MODEL_LIST_EMPTY_ONCE — the same, but the first call answers an
+//                      empty list with exit code 0: the real service did that
+//                      once where three later probes answered 124 models
+//                      each (2026-11-25), so empty is not taken for truth
+//   FAKE_MODEL_DEFAULT_FAILS_ONCE — `api model.default` fails once, the same
+//                      way as FAKE_MODEL_LIST_FAILS_ONCE
+//   FAKE_MODEL_DEFAULT_NONE — `api model.default` answers `data: null`: a
+//                      backend without a default model
+//   paid-default (a file in the directory the fake is started in) — that
+//                      directory stands for one with its own `opencode.json`,
+//                      where the real service answered another default model
+//                      and another list (2026-11-25): `api model.default`
+//                      answers anthropic/opus, and `api model.list` lists one
+//                      model more
 import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+
+// Every model record the real service answers carries credentials
+// (`settings.apiKey`, `headers`). The values are fake: the adapter has to
+// rebuild each catalogue entry from named fields only, which is what the
+// catalogue tests check.
+const credentials = {
+  settings: { apiKey: "sk-FAKE-not-a-real-key" },
+  headers: { authorization: "Bearer FAKE-not-a-real-token" },
+};
+
+// The answers of `api model.*` depend on the directory the fake is started
+// in, as the real service's do: it finds its configuration from there.
+const paidDefault = existsSync("paid-default");
 
 const argv = process.argv.slice(2);
 
@@ -187,21 +222,63 @@ if (subcommand === "run") {
 } else if (subcommand === "api" && operation === "model.list") {
   // A failed fetch must not be remembered: name a marker file in
   // FAKE_MODEL_LIST_FAILS_ONCE and the first call fails while creating it;
-  // every later call answers normally.
+  // every later call answers normally. FAKE_MODEL_LIST_EMPTY_ONCE works the
+  // same way, but the first call answers an empty list with exit code 0: the
+  // real service did that once where three later probes answered 124 models
+  // each (2026-11-25), so an empty answer is not taken for truth either.
   const failOnce = process.env.FAKE_MODEL_LIST_FAILS_ONCE;
+  const emptyOnce = process.env.FAKE_MODEL_LIST_EMPTY_ONCE;
   if (failOnce && !existsSync(failOnce)) {
     writeFileSync(failOnce, "failed once", "utf8");
     process.stderr.write(`UnknownError: service unreachable\n`);
     process.exitCode = 1;
+  } else if (emptyOnce && !existsSync(emptyOnce)) {
+    writeFileSync(emptyOnce, "answered empty once", "utf8");
+    process.stdout.write(`${JSON.stringify({ data: [] })}\n`);
+    process.exitCode = 0;
   } else {
+  // One record per model with the cost it reports: all-zero is a free model,
+  // a missing cost field is a model whose cost the service does not say, a
+  // positive cost is a priced one. A cost row may carry a `cache` object.
   process.stdout.write(
     `${JSON.stringify({
       data: [
-        { id: "sonnet", providerID: "anthropic", limit: { context: 200000, output: 16000 } },
+        { id: "sonnet", providerID: "anthropic", cost: [{ input: 0, output: 0 }], limit: { context: 200000, output: 16000 }, ...credentials },
+        // Listed only in a directory that holds `paid-default`.
+        ...(paidDefault ? [{ id: "only-in-paid", providerID: "anthropic", cost: [{ input: 3, output: 15 }] }] : []),
         // A model that publishes effort variants (like the coding plans do).
-        { id: "gpt", providerID: "openai", variants: [{ id: "low" }, { id: "high" }], limit: { context: 128000, output: 8000 } },
-        { id: "local-model", providerID: "ollama", limit: { context: 8192, output: 4096 } },
+        { id: "gpt", providerID: "openai", variants: [{ id: "low" }, { id: "high" }], cost: [{ input: 0, output: 0 }], limit: { context: 128000, output: 8000 }, ...credentials },
+        { id: "local-model", providerID: "ollama", limit: { context: 8192, output: 4096 }, ...credentials },
+        { id: "opus", providerID: "anthropic", cost: [{ input: 15, output: 75 }], ...credentials },
+        // Listed under an upstream name too: one model, one catalogue entry.
+        { id: "k", modelID: "k-alias", providerID: "p", cost: [{ input: 0, output: 0 }], ...credentials },
       ],
+    })}\n`,
+  );
+  process.exitCode = 0;
+  }
+} else if (subcommand === "api" && operation === "model.default") {
+  // The backend's default model, in the real service's envelope: `location` is
+  // the caller's directory and the adapter ignores it; `data` is one model
+  // record, credentials included. FAKE_MODEL_DEFAULT_NONE answers a backend
+  // without a default (`data: null`); FAKE_MODEL_DEFAULT_FAILS_ONCE fails the
+  // first call the way FAKE_MODEL_LIST_FAILS_ONCE does. In a directory that
+  // holds `paid-default` the default is the paid anthropic/opus.
+  const failOnce = process.env.FAKE_MODEL_DEFAULT_FAILS_ONCE;
+  if (failOnce && !existsSync(failOnce)) {
+    writeFileSync(failOnce, "failed once", "utf8");
+    process.stderr.write(`UnknownError: service unreachable\n`);
+    process.exitCode = 1;
+  } else if (process.env.FAKE_MODEL_DEFAULT_NONE) {
+    process.stdout.write(`${JSON.stringify({ location: { directory: "." }, data: null })}\n`);
+    process.exitCode = 0;
+  } else {
+  process.stdout.write(
+    `${JSON.stringify({
+      location: { directory: "." },
+      data: paidDefault
+        ? { id: "opus", providerID: "anthropic", modelID: "opus", ...credentials }
+        : { id: "sonnet", providerID: "anthropic", modelID: "sonnet", ...credentials },
     })}\n`,
   );
   process.exitCode = 0;

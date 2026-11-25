@@ -198,17 +198,23 @@ describe("the lock heartbeat", () => {
     // is forged across more than one heartbeat period (50 ms), because a
     // heartbeat that lands in between writes its own record back.
     let finished = false;
+    let loopDone!: () => void;
+    const settled = new Promise<void>((resolve) => { loopDone = resolve; });
     const lock = join(tasks, "a", "lock.json");
     const takenOver: AgentAdapter = {
       prompt: async () => {
-        for (let i = 0; i < 8; i++) {
-          await writeFile(`${lock}.forged`, JSON.stringify({ worker: "someone-else", heartbeat: Date.now() }), "utf8");
-          await renameWithRetry(`${lock}.forged`, lock);
-          await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        try {
+          for (let i = 0; i < 8; i++) {
+            await writeFile(`${lock}.forged`, JSON.stringify({ worker: "someone-else", heartbeat: Date.now() }), "utf8");
+            await renameWithRetry(`${lock}.forged`, lock);
+            await new Promise<void>((resolve) => setTimeout(resolve, 10));
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 400));
+          finished = true;
+          return { sessionId: "ses-a", exitCode: 0, text: "done" };
+        } finally {
+          loopDone();
         }
-        await new Promise<void>((resolve) => setTimeout(resolve, 400));
-        finished = true;
-        return { sessionId: "ses-a", exitCode: 0, text: "done" };
       },
       contextUsage: async () => 0, contextLimit: async () => 100,
     };
@@ -217,6 +223,11 @@ describe("the lock heartbeat", () => {
     expect(finished).toBe(false);
     expect(await readFile(lock, "utf8")).toContain("someone-else");
     expect(await store.get("a")).toMatchObject({ status: "running", sessions: [] });
+    // The attempt was cut off while the fake's loop was still forging the lock.
+    // Let the loop run out before `afterEach` removes the directory: a write that
+    // lands during the removal fails it with ENOTEMPTY, which made this test
+    // fail every other run on Windows without saying anything about the lock.
+    await settled;
   });
 });
 

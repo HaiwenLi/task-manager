@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { resolve } from "node:path";
-import type { AgentAdapter, SessionReuseStatus, SessionUsageSnapshot } from "./types.js";
+import type { AgentAdapter, CatalogueCost, CatalogueModel, SessionReuseStatus, SessionUsageSnapshot } from "./types.js";
 import { processExecution, type Execution } from "../execution.js";
 
 /** One prompt() turn — the execution-plane call and its result. */
@@ -30,6 +30,18 @@ type ApiEnvelope = { data?: unknown };
 type JsonObject = Record<string, unknown>;
 
 /**
+ * What one answered `model.list` holds, built from named fields only: the
+ * lookup behind variants and context limits, and the catalogue the budget
+ * guard reads.
+ */
+type ModelListing = {
+  /** Keyed by `providerID/id` and by `providerID/modelID`: what the variant and context lookups search. */
+  lookup: Map<string, { variants: Set<string>; context?: number }>;
+  /** One entry per `providerID/id`, sorted by ref. */
+  catalogue: CatalogueModel[];
+};
+
+/**
  * The v0.1 agent: OpenCode, driven through its two CLI planes.
  *
  * - Execution plane: `opencode run --format json … --auto <message>` streams
@@ -47,15 +59,20 @@ type JsonObject = Record<string, unknown>;
  * Every child is spawned as an explicit `spawn(file, args)` array with
  * `shell: false` — never a shell string — and every child's stderr is
  * drained (a verbose child would otherwise fill the pipe buffer and hang);
- * failed turns and api rejections carry a capped stderr tail as context.
+ * failed turns and api rejections carry a capped stderr tail as context —
+ * except the two catalogue calls, whose rejections repeat nothing the
+ * service printed (`modelCatalog`, `defaultModelRef`).
  * `binArgsPrefix` (used by the test double: `["node", "<script>", …]`) is
  * prepended to every invocation.
  */
 export class OpenCodeAdapter implements AgentAdapter {
   private readonly bin: string;
   private readonly binArgsPrefix: string[];
-  /** Model metadata for variant/context lookups; fetched once per adapter. */
-  private modelList?: Promise<Map<string, { variants: Set<string>; context?: number }>>;
+  /**
+   * The model listings behind variant/context lookups and the cost catalogue,
+   * one per directory the service was asked in (see `modelListing`).
+   */
+  private readonly modelLists = new Map<string, Promise<ModelListing>>();
 
   constructor(opts: { bin?: string; binArgsPrefix?: string[] } = {}) {
     this.bin = opts.bin ?? "opencode";
@@ -99,41 +116,128 @@ export class OpenCodeAdapter implements AgentAdapter {
   }
 
   /**
-   * `opencode api model.list`, fetched once and kept while it holds. Only an
-   * answered fetch is kept: a failed one answers "nothing known" to the call
-   * that saw it, but it must not disable variant and context lookups for the
-   * life of a long-lived watcher — the next call asks the service again.
+   * `opencode api model.list`, asked in `cwd` — the process's own directory
+   * when none is given — and kept per directory while it holds an answer: the
+   * service finds its configuration from the directory it runs in and answers
+   * by it, so one listing does not stand for every directory (2026-11-25: a
+   * directory with its own `opencode.json` was answered another default model
+   * and another list). A failed fetch, and one that holds no models, is not
+   * kept: the `catch` below clears the memo, so the next call asks the service
+   * again. A long-lived watcher must neither lose its variant and context
+   * lookups for the life of the process nor keep an empty catalogue: on
+   * 2026-11-25 one probe of the real service saw no entries where three later
+   * probes saw 124 each.
+   *
+   * Only named fields are read out of an entry. The service's entries carry
+   * credentials (`settings.apiKey`, `headers`), so nothing else is kept and
+   * nothing else reaches a caller; nor is the text of a failed call, whose
+   * stderr can quote the same configuration.
    */
-  private modelCatalogue(): Promise<Map<string, { variants: Set<string>; context?: number }>> {
-    const fetched = (this.modelList ??= this.api("model.list").then((envelope) => {
-      const catalogue = new Map<string, { variants: Set<string>; context?: number }>();
-      if (Array.isArray(envelope.data)) {
-        for (const entry of envelope.data) {
-          const object = asObject(entry);
-          const providerID = object?.providerID;
-          const id = object?.id;
-          const modelID = object?.modelID;
-          const variants = Array.isArray(object?.variants)
-            ? object.variants.flatMap((variant) => {
-                const name = asObject(variant)?.id;
-                return typeof name === "string" ? [name] : [];
-              })
-            : [];
-          const rawContext = asObject(object?.limit)?.context;
-          const context = typeof rawContext === "number" && Number.isFinite(rawContext) ? rawContext : undefined;
-          const names = [id, modelID].filter((name): name is string => typeof name === "string");
-          for (const name of names) {
-            const key = typeof providerID === "string" ? `${providerID}/${name}` : name;
-            if (!catalogue.has(key)) catalogue.set(key, { variants: new Set(variants), ...(context === undefined ? {} : { context }) });
-          }
+  private modelListing(cwd?: string): Promise<ModelListing> {
+    const directory = cwd ?? process.cwd();
+    const kept = this.modelLists.get(directory);
+    if (kept !== undefined) return kept;
+    const fetched = this.catalogueCall("model.list", directory).then((envelope): ModelListing => {
+      if (!Array.isArray(envelope?.data) || envelope.data.length === 0) {
+        throw new Error("opencode api model.list answered no models");
+      }
+      const lookup = new Map<string, { variants: Set<string>; context?: number }>();
+      const entries = new Map<string, CatalogueModel>();
+      for (const entry of envelope.data) {
+        const object = asObject(entry);
+        const providerID = object?.providerID;
+        const id = object?.id;
+        const modelID = object?.modelID;
+        const variants = Array.isArray(object?.variants)
+          ? object.variants.flatMap((variant) => {
+              const name = asObject(variant)?.id;
+              return typeof name === "string" ? [name] : [];
+            })
+          : [];
+        const rawContext = asObject(object?.limit)?.context;
+        const context = typeof rawContext === "number" && Number.isFinite(rawContext) ? rawContext : undefined;
+        const names = [id, modelID].filter((name): name is string => typeof name === "string");
+        for (const name of names) {
+          const key = typeof providerID === "string" ? `${providerID}/${name}` : name;
+          if (!lookup.has(key)) lookup.set(key, { variants: new Set(variants), ...(context === undefined ? {} : { context }) });
+        }
+        // One entry per `providerID/id`: a model the list also names by its
+        // upstream name stays one entry, and that name is its `modelID`.
+        if (typeof providerID === "string" && typeof id === "string" && !entries.has(`${providerID}/${id}`)) {
+          entries.set(`${providerID}/${id}`, {
+            ref: `${providerID}/${id}`,
+            providerID,
+            id,
+            modelID: typeof modelID === "string" ? modelID : id,
+            variants,
+            // Every row must carry two finite numbers, or the entry says nothing about what it costs.
+            cost: Array.isArray(object?.cost) ? costOf(object.cost) : [],
+            enabled: object?.enabled !== false,
+          });
         }
       }
-      return catalogue;
-    }));
-    void fetched.catch(() => {
-      if (this.modelList === fetched) this.modelList = undefined;
+      return { lookup, catalogue: [...entries.values()].sort((a, b) => (a.ref < b.ref ? -1 : a.ref > b.ref ? 1 : 0)) };
     });
-    return fetched.catch(() => new Map<string, { variants: Set<string>; context?: number }>());
+    this.modelLists.set(directory, fetched);
+    // Only its own entry: a later fetch for the directory must not be undone by this one settling late.
+    void fetched.catch(() => {
+      if (this.modelLists.get(directory) === fetched) this.modelLists.delete(directory);
+    });
+    return fetched;
+  }
+
+  /**
+   * The lookup behind variant and context limits. A failed fetch — and an
+   * empty answer, which the fetch treats as one — answers "nothing known" to
+   * the call that saw it, so an unknown model is still an error there; the
+   * next call asks the service again.
+   */
+  private modelCatalogue(): Promise<Map<string, { variants: Set<string>; context?: number }>> {
+    return this.modelListing().then(
+      (listing) => listing.lookup,
+      () => new Map<string, { variants: Set<string>; context?: number }>(),
+    );
+  }
+
+  /**
+   * Every model the backend lists, as `providerID/id` with the cost it
+   * reports, asked in `cwd`. Unlike the private lookup this rejects when the
+   * call fails and when the answer holds no models: the budget guard must not
+   * take either for truth, and neither is remembered. The rejection names what
+   * went wrong by code and repeats nothing the service printed.
+   */
+  modelCatalog(cwd?: string): Promise<CatalogueModel[]> {
+    return this.modelListing(cwd).then((listing) => listing.catalogue);
+  }
+
+  /**
+   * One control-plane call for the catalogue, rejecting without a word of what
+   * the service printed (`unquoted`): its stderr can quote configuration, and
+   * the budget guard puts the start of a message into its reason, the journal
+   * and the log.
+   */
+  private catalogueCall(operation: "model.list" | "model.default", cwd?: string): Promise<ApiEnvelope> {
+    return this.api(operation, [], cwd).catch((cause: unknown) => { throw unquoted(operation, cause); });
+  }
+
+  /**
+   * The backend's default model as `providerID/id`, from one `opencode api
+   * model.default` call in `cwd`: `null` when the backend has none. Anything
+   * else rejects — a failed call, or an answer that is not a model record — and
+   * is not remembered. The record carries the same credentials as a list entry
+   * and a failed call's stderr can quote configuration, so the rejection quotes
+   * neither.
+   */
+  async defaultModelRef(cwd?: string): Promise<string | null> {
+    const data = asObject(await this.catalogueCall("model.default", cwd))?.data;
+    if (data === null) return null;
+    const record = asObject(data);
+    const providerID = record?.providerID;
+    const id = record?.id;
+    if (typeof providerID !== "string" || providerID.length === 0 || typeof id !== "string" || id.length === 0) {
+      throw new Error("opencode api model.default answered no providerID/id");
+    }
+    return `${providerID}/${id}`;
   }
 
   /** Run one agent turn and collect the session id, final text and exit code. */
@@ -433,17 +537,21 @@ export class OpenCodeAdapter implements AgentAdapter {
    * `{"location":…,"data":…}` envelope. stdout is one JSON object, parsed
    * whole; a non-zero exit or unparsable output rejects — the caller's
    * budget math must never run on silently empty telemetry.
+   *
+   * `cwd` is the directory the call runs in. Only the catalogue calls pass
+   * one: the directory a session would start in, since the service finds its
+   * configuration from there and answers by it. Every other call has none and
+   * runs where the process runs.
    */
-  private api(operation: string, params: string[] = []): Promise<ApiEnvelope> {
+  private api(operation: string, params: string[] = [], cwd: string = process.cwd()): Promise<ApiEnvelope> {
     const argv = [
       ...this.binArgsPrefix,
       "api",
       operation,
       ...params.flatMap((param) => ["--param", param]),
     ];
-    // No per-call cwd exists on the control plane; pin the process cwd so
-    // every spawn still carries an explicit working directory.
-    const child = spawn(this.bin, argv, { cwd: process.cwd(), shell: false });
+    // Every spawn carries an explicit working directory.
+    const child = spawn(this.bin, argv, { cwd, shell: false });
 
     return new Promise<ApiEnvelope>((resolve, reject) => {
       child.stdin?.end();
@@ -462,17 +570,46 @@ export class OpenCodeAdapter implements AgentAdapter {
       child.on("error", reject);
       child.on("close", (code) => {
         if (code !== 0) {
-          reject(new Error(`opencode api ${operation} exited with code ${code ?? "null"}${stderr()}`));
+          reject(new ApiCallError(`opencode api ${operation} exited with code ${code ?? "null"}${stderr()}`, `exit ${code ?? "null"}`));
           return;
         }
         try {
           resolve(JSON.parse(stdout()) as ApiEnvelope);
         } catch (err) {
-          reject(new Error(`opencode api ${operation} printed unparsable output: ${(err as Error).message}`));
+          reject(new ApiCallError(`opencode api ${operation} printed unparsable output: ${(err as Error).message}`, "printed unparsable output"));
         }
       });
     });
   }
+}
+
+/**
+ * A control-plane call that did not answer. The message may carry a tail of
+ * the service's stderr, which is worth reading for a failed turn; `outcome` is
+ * the same failure in the adapter's own words — an exit code, or that the
+ * output was not JSON — and carries nothing the service printed.
+ */
+class ApiCallError extends Error {
+  constructor(message: string, readonly outcome: string) {
+    super(message);
+  }
+}
+
+/**
+ * The failure of `opencode api <operation>` as a new error whose message is
+ * the operation and what went wrong by code, and nothing the service printed:
+ * its stderr can quote configuration, and the budget guard puts the first 200
+ * characters of a message into its reason, the journal and the log. The
+ * original error is the `cause`.
+ */
+function unquoted(operation: string, cause: unknown): Error {
+  const outcome = cause instanceof ApiCallError
+    ? cause.outcome
+    // A spawn failure is Node's own error; its `code` says what went wrong (`ENOENT`: no such binary).
+    : typeof (cause as { code?: unknown } | null)?.code === "string"
+      ? (cause as { code: string }).code
+      : "unknown error";
+  return new Error(`opencode api ${operation} failed: ${outcome}`, { cause });
 }
 
 /** Cap for stderr snippets attached to failed turns and api rejections. */
@@ -486,6 +623,27 @@ function withStderr(text: string, stderr: string): string {
 /** The informative tail of a stderr stream, capped to {@link STDERR_SNIPPET_MAX}. */
 function stderrSnippet(stderr: string): string {
   return stderr.length <= STDERR_SNIPPET_MAX ? stderr : `…${stderr.slice(-STDERR_SNIPPET_MAX)}`;
+}
+
+/**
+ * What an entry's cost rows say, or nothing. A row counts only when it carries
+ * two finite numbers (a `cache` object on it is not a price), and an entry
+ * with any other row says nothing about what it costs: an empty `cost`, which
+ * the budget guard reads as unknown. Dropping the row alone read
+ * `[{ input: 0, output: 0 }, { input: 3 }]` as a free model.
+ */
+function costOf(rows: readonly unknown[]): CatalogueCost[] {
+  const prices = rows.map(priceOf);
+  return prices.every((price) => price !== undefined) ? (prices as CatalogueCost[]) : [];
+}
+
+/** The price a cost row reports, or `undefined` for a row without two finite numbers. */
+function priceOf(row: unknown): CatalogueCost | undefined {
+  const input = asObject(row)?.input;
+  const output = asObject(row)?.output;
+  return typeof input === "number" && Number.isFinite(input) && typeof output === "number" && Number.isFinite(output)
+    ? { input, output }
+    : undefined;
 }
 
 /** A finite number counts; anything missing or exotic is 0 tokens. */
