@@ -330,6 +330,8 @@ npx tsx src/main.ts run [--log <file>] [--config taskctl.json]
 
 **故障隔离**：控制器内部错误只影响所在任务——该尝试结算、工作区释放、任务 `blocked` 并发出 `controller-error` 事件，其余任务照常排空；此时 `run` 仍排空看板，但退出码为 1。任务被预算护栏拒绝时同样是排空看板、退出码 1，见「已知陷阱」。预期内的情况不算内部错误：复核超时（已确认停止）只保留待复核的现场（`review-pending.json`，用 `taskctl retry --review-only` 恢复），验收时模型进入冷却不影响已完成的回合。
 
+**退出码**：`0` 跑完（包括有任务以 `blocked` 或 `awaiting-human` 结束）；`1` 运行错误，或有任务因控制器内部错误而 `blocked`，或有任务被预算护栏拒绝；`2` 用法错误；`3` 因模型不可用停下——每个模型的原因、几轮、多久、还在等的任务都会打印出来，没有任何任务被 `blocked`，改好 `modelChain`（需要的话补上 `allowedModels`，先用 `taskctl models` 看判定）后直接再跑一次即可（见「模型拒绝与轮次」）。因模型不可用停下时一律是 `3`：同一次执行里有任务被护栏拒绝、或有任务因控制器内部错误而 `blocked` 也一样，护栏那几行和控制器错误照常打印在报告旁边。`run` 等模型窗口时先打印一行 `[<id>] model-wait waiting …`。
+
 同一实际工作目录（含路径别名）不可并行执行；共享 Git common directory 的 worktree 暂按串行处理。当前不自动创建/合并 worktree。验收前后对源码产物做摘要；验收命令改变产物会要求复核，不会把旧检查套到新版本。摘要排除 Git 内部、依赖目录及任务运行时目录（另可用 `artifactIgnore` 忽略任务自产物的路径，见下节）；详见 `src/workspace.ts`。
 
 **控制器日志（`--log`）**：`--log <file>` 把每个 `[<id>] …` 事件行连时间戳 tee 进指定文件（stdout 照常输出；文件目录不存在会自动创建）。不指定时，每个任务的事件行缺省写进它自己的 `tasks/<id>/logs/run-<ISO>.log`（ISO 是本次 run 的启动时刻，`:` 换成 `-` 以便 Windows 文件名）。这取代了以前"外部 `Tee-Object` 到仓库根目录"的做法——控制器日志从此落在任务目录里，不再污染工作区。日志写失败只忽略，不会拖垮 run。

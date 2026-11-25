@@ -167,7 +167,7 @@ export type WorkerDeps = {
  * refused, which is what its detail holds (the guard's verdicts): the same
  * verdicts at a later offer say nothing new, other verdicts are news.
  */
-export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "model-deferred" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error" | "refused" | "outage";
+export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "model-deferred" | "model-wait" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error" | "refused" | "outage";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
 /**
  * `refused`: the budget guard said no, so no model session started and no

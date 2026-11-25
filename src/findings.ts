@@ -24,6 +24,8 @@ const INTERESTING: Record<string, string> = {
   "turn-failed": "回合失败",
   "model-fallback": "模型降级",
   "model-fallback-failed": "降级无法记录",
+  "model-deferred": "等模型窗口（被推迟）",
+  "model-outage": "模型不可用，整次运行停止",
   "render-unavailable": "渲染检查跑不起来",
   "definition-drift": "执行期任务定义被改，本次验收作废",
   "spec-invalid": "spec 没有可判定的验收标准",

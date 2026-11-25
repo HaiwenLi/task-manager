@@ -34,6 +34,7 @@ import { runSelfCheck } from "./self-check.js";
 import { runBatch } from "./batch.js";
 import { judgeRefs, policyOf, renderVerdicts, reviewerModels, workerModels, type ModelVerdict } from "./budget.js";
 import { modelRoundsOf, modelWaitHold, newRunContext, readModelWait } from "./model-wait.js";
+import { outageReport, renderOutageReport } from "./stuck.js";
 import { stopRequestPath, watchQueue, type WatchOptions } from "./watch.js";
 import { createMempalaceBackend, runRecall, type MemoryBackend, type RecallInput, type RecallRecord } from "./memory.js";
 
@@ -152,6 +153,9 @@ function createWorkerDeps({
 /** Usage problem (unknown command/flag, missing value): exit code 2. */
 class UsageError extends Error {}
 
+/** The run stopped because every model refused (design §7): exit code 3, whatever else happened in it. */
+export const EXIT_OUTAGE = 3;
+
 const USAGE = [
   "usage:",
   "  taskctl add \"<意图>\" [--type code|office|research|design] [--simple] [--quick] [--verify human|mechanical|render] [--execution continuous|iterative] [--target <a.html,b.html>] [--id <id>] [--config taskctl.json]",
@@ -243,7 +247,8 @@ async function recordHumanFeedback(
  * Parse argv and run one subcommand. Hand-rolled `--flag value` parsing —
  * no CLI dependency (binding constraint). Values pass through untouched, so
  * newlines, quotes and Chinese land in note files verbatim (Review Focus 5).
- * Returns the process exit code: 0 ok, 1 runtime error, 2 usage error.
+ * Returns the process exit code: 0 ok, 1 runtime error, 2 usage error, 3 a stop
+ * for an outage (`run`, `EXIT_OUTAGE`).
  */
 export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number> {
   const log = deps.log ?? ((line: string) => console.log(line));
@@ -362,7 +367,10 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
 /** `taskctl run` — load config, assemble adapter + store, drain the queue. */
 async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
   const configPath = flags.get("config") ?? "taskctl.json";
-  const cfg = resolveConfig(await readConfig(configPath), configPath);
+  // One run context for the whole command: the attempts and the controller's
+  // decision read the same evidence, so a deferral this process wrote is one
+  // this process decides (a new run, watch or retry process is a new run).
+  const cfg = { ...resolveConfig(await readConfig(configPath), configPath), run: newRunContext() };
   const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
   const store = deps.store ?? new TaskStore(cfg.tasksDir);
   // Controller log: with --log every event line is teed to one operator-chosen
@@ -398,14 +406,18 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
       + `${result.pending.join(", ")}. Run taskctl run again to continue.`,
     );
   }
+  // The report a stop for an outage owes the operator (design §7), printed
+  // beside whatever else this run has to say.
+  const outageTaskId = "outage" in result ? result.outage?.taskId : undefined;
+  if (outageTaskId !== undefined) {
+    for (const line of renderOutageReport(await outageReport(cfg, await store.list(), outageTaskId))) log(line);
+  }
   // Each is said when its own count is above zero, the controller errors
   // first: a run with both must not let the earlier return hide the later line.
-  let failed = false;
   if (controllerErrors > 0) {
     // A task blocked by a controller bug is not an ordinary outcome. The board
     // was still drained, but the run must not read as clean to a script.
     log(`[scheduler] ${controllerErrors} task(s) blocked by a controller error; see the controller-error line(s) above`);
-    failed = true;
   }
   // What was refused is read off the result, never off the events: those are
   // reported once per process per task, and an exit code must not depend on
@@ -421,9 +433,12 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
     // The guard's verdicts are in the `refused` line(s) above. The board was
     // still drained, but a task that did not run must not read as clean to a script.
     log(`[scheduler] ${refused.length} task(s) refused by the budget guard; no model session was started for them`);
-    failed = true;
   }
-  return failed ? 1 : 0;
+  // The code names why the run stopped (design §7): an outage is 3 whatever
+  // else happened — refused tasks and controller errors are printed beside the report.
+  if (outageTaskId !== undefined) return EXIT_OUTAGE;
+  if (controllerErrors > 0) return 1;
+  return refused.length > 0 ? 1 : 0;
 }
 
 /** `taskctl watch` — own and drain one board until its stop request appears. */

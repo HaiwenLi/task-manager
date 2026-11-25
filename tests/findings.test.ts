@@ -82,6 +82,19 @@ describe("findings — 从产物里抽事实", () => {
     expect(draft.markdown).toContain("（待填");
   });
 
+  it("模型不可用停机是一条信号，标签说出停止，并保留原始行", async () => {
+    const { dir, id } = await seed({
+      journal: "2026-11-25T10:04:00.000Z  worker  model-outage  rounds 4/4 over 4m 03s since 2026-11-25T10:00:00.000Z; no task served on the chain\n",
+    });
+    const task = await new TaskStore(dir).get(id);
+    const draft = await buildFinding(dir, task, new Date("2026-11-17T02:00:00Z"));
+
+    expect(draft.signals).toBeGreaterThanOrEqual(1);
+    expect(draft.markdown).toContain("模型不可用，整次运行停止");
+    // 证据是摘录原文：别的机器上没有这个任务目录。
+    expect(draft.markdown).toContain("2026-11-25T10:04:00.000Z  worker  model-outage  rounds 4/4 over 4m 03s since 2026-11-25T10:00:00.000Z; no task served on the chain");
+  });
+
   it("没有信号的安静任务也出一份草稿，并说明没抽到东西", async () => {
     // 一件真的一路顺风的任务：没有返工、没有交接、没有失败产物。
     const dir = await mkdtemp(join(tmpdir(), "taskctl-findings-"));
