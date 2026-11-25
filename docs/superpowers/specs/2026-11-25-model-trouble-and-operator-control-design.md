@@ -198,8 +198,9 @@ Behaviour:
      takes it when no attempt is in flight: with `parallel` above one, another task's turn may be
      running on a chain model at that moment, so the attempts still running are waited for and
      settled before the evidence is read. A run in which another task is being served is never
-     reported as a total outage. Until then the task is shown in the stuck list (§8) as deferred,
-      waiting for the attempts in flight.
+     reported as a total outage. Until then the task is shown in the stuck list (§8) as deferred and
+      waiting for the attempts in flight; when no controller is running, as deferred with its rounds
+      spent and waiting for the owner.
    A task with a deferral is shown in the stuck list (§8) with its round count and next time.
 - *Call.* `modelCooldownMs` defaults to 60 seconds (today 900 000) and `modelRounds` to 4. With
   four models that is four to five minutes before a task is held or a run stops.
@@ -231,6 +232,12 @@ Behaviour:
   A deferral makes `run` wait and pass again, because a provider's refusal passes. A guard refusal
   never makes `run` wait or offer the task again: waiting changes nothing, since a catalogue that was
   read is kept for the life of the process (ADR-0012).
+- *Call.* A manual `taskctl retry` of a deferred task keeps the earliest time already recorded — a retry
+  is not a reason to ask again a model that refused a moment ago — and starts its rounds again: the
+  count and the time of the first refusal are cleared, so the retry buys a fresh `modelRounds`.
+- *Call.* `run --batch` does not wait for a window. A task that is deferred in a batch stops the batch:
+  the command prints when the task may run again and exits 0, since nothing is `blocked`. An outage
+  stops the batch with the report of §7 and exit 3.
 
 ## 7. Stopping for an outage
 
@@ -248,9 +255,10 @@ the run finished, also when tasks ended `blocked` or `awaiting-human`; `1` for a
 task blocked by a controller error, and for tasks the budget guard refused (ADR-0012); `2` for a usage
 error. Nothing is `blocked` by an outage, so after the configuration is changed a plain `taskctl run`,
 or `taskctl watch`, resumes every waiting task without a `retry` per task. A task the budget guard
-refused is not part of this report: it keeps the guard's own line. *Call.* When one `run` both has
-tasks the guard refused and stops for an outage, the exit code is 3: the code names why the run
-stopped, and the guard's lines are printed beside the report.
+refused is not part of this report: it keeps the guard's own line. *Call.* A run that stopped for an
+outage exits 3 whatever else happened in it — tasks the guard refused, a task `blocked` by a
+controller error: the code names why the run stopped, and the guard's lines and the controller errors
+are printed beside the report.
 
 ## 8. The stuck list
 
@@ -383,13 +391,11 @@ Parts 2 to 4 do not depend on part 1 and may be built in any order after it.
 - Where `rework.md` lives under `tasks/<id>/`, outside the definition digest and outside the
   acceptance drift digest. The deferral record is `tasks/<id>/model-wait.json`, likewise outside
   both.
-- How `run --batch` reports an outage. The exit codes themselves are fixed in §7.
+- The wording of the line `run --batch` prints when a deferral stops it; what it says is fixed in §6, and the exit codes in §7.
 - Where the run keeps its record of accepted turns (§6, step 5), across a batch session, where
   several tasks share one session. The rule the record answers is fixed; its storage is not.
 - Wording of the outage report and of the other messages the controller prints.
 - How the stuck list walks a chain of dependencies.
-- Whether the deferral survives a manual `taskctl retry` (it should: a retry is not a reason to
-  hammer a model that has just refused).
 
 ## 16. Added after the builder's check
 
@@ -401,10 +407,15 @@ he has decided it.
 walked, a fully refused round defers the task, and nothing is replayed — the worker's work and the
 acceptance evidence are preserved, as today's park preserves them. When the window reopens, the
 controller resumes the review on the preserved evidence by itself, through today's review-only path
-and its digest gate. After `modelRounds` the same evidence rule decides: if another task got a turn
+and its digest gate; a `retry --review-only` that is asked for while the deferral's time lies in the
+future is not run and says so, with that time, never as a silent `skipped`. The rounds of the review
+stage are counted anew, so a task can be deferred for `modelRounds` rounds as a worker and again as a
+reviewer. After `modelRounds` the same evidence rule decides: if another task got a turn
 accepted, the task is parked as today, `blocked` with `review-pending.json`, for the owner;
 otherwise it is an outage stop, and the task keeps its preserved evidence for the rerun. An accepted
-reviewer turn is evidence that the model works. A reviewer that timed out is not a refusal and keeps
+reviewer turn is evidence that the model works. The provider's reason for refusing a reviewer model
+is kept for the report of §7: the review adapter carries the backend's text of a provider refusal in
+its result, as it carries the session id. A reviewer that timed out is not a refusal and keeps
 today's park: the attempt settles, the journal gets `review-timed-out`, and the task is `blocked`
 with `review-pending.json`, for `retry --review-only`. A reviewer that crashed is not a refusal
 either, and keeps today's handling, which is not the park: its verdict is `unclear`, any earlier
@@ -460,9 +471,12 @@ What the author decided while revising. Each is a *call*:
 2. The evidence counts a turn that was accepted after the task's first refusal, as §4, §6 and §16
    already said, and not one accepted earlier in the run: an acceptance an hour old must not hide an
    outage that began since.
-3. When one `run` has tasks the guard refused and also stops for an outage, the exit code is 3.
+3. A run that stops for an outage exits 3, whatever else happened in it.
 4. A task the guard refused is in the stuck list, read from a record rather than by asking the guard.
 5. The prompt line is Chinese, like every fixed line of the prompt.
 6. A pass in which no model refused the task, because every model was already cooling, is not a
    round.
 7. §11 closes the item the learning-loop design put off, and that design says so.
+8. A manual `retry` of a deferred task keeps its earliest time and starts its rounds again; the review
+   stage counts its rounds anew; `run --batch` does not wait for a window; a `retry --review-only`
+   that a deferral holds says so, with the time.
