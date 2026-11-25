@@ -1489,7 +1489,7 @@ No assertion was loosened, and `tests/protocol.test.ts` is untouched.
 - `18635d4` test(replace), the flaky-test fix named above.
 - After the rebase: `0cd9e91` test, the ten type errors `npm run typecheck` reported in three test files this branch added.
 - Task 11 did more than its steps say: the README also carries the second refusal path, the per-directory reads, what a failed `opencode api` call may quote, and the recall child on Windows and POSIX; GLOSSARY has a fourth entry, `拒绝`; and the design has corrections beside its Status line (§6.3, §6.6, §6.7 and one line of the §6.1 diagram).
-- After the hand-off from the other harness on 2026-11-25, and not from the plan: `fee4f2a` feat(context), fixed sources, the owner's own rules read by file for every attempt; `ce2511c` fix(context), a source named by what follows its last separator of either kind (on POSIX `path.basename` would have handed back a whole Windows path as the name); `7151b7c` feat(metrics), human touches apart; `a1e5f86` docs(adr), ADR-0013. Described under "Added after the hand-off" below.
+- After the hand-off from the other harness on 2026-11-25, and not from the plan: `b209a0d` feat(context), fixed sources, the owner's own rules read by file for every attempt; `70bdfbe` fix(context), a source named by what follows its last separator of either kind (on POSIX `path.basename` would have handed back a whole Windows path as the name); `ec6ff27` feat(metrics), human touches apart; `dedfb5d` docs(adr), ADR-0013. Described under "Added after the hand-off" below.
 
 ### Added after the hand-off (2026-11-25, afternoon)
 
@@ -1507,7 +1507,7 @@ Two additions came with the hand-off from the other harness, not from this plan.
 
 One test helper changed: `writeConfig` in `tests/cli-recall.test.ts` gained an optional third parameter. `tests/protocol.test.ts` is untouched by the four commits.
 
-**Verification.** Observed on 2026-11-25 before the plan's commit, on `4064002` plus this plan's edits short of the three lines that quote this run, with the temp directory set to one the run owned:
+**Verification.** Observed on 2026-11-25 before the plan's commit, on `013ba18` plus this plan's edits short of the three lines that quote this run, with the temp directory set to one the run owned:
 
 - `npm test`: `Test Files  76 passed | 1 skipped (77)`, `Tests  865 passed | 1 skipped (866)`, `Duration  23.20s`. The skipped file is `tests/e2e.smoke.test.ts`, which needs `TASKCTL_E2E=1` and a real backend.
 - `npm run typecheck`: exit code 0, no output after its command line.
