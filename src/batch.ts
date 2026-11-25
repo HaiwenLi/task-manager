@@ -4,6 +4,7 @@ import { modelWaitHolds, type ModelWaitHold } from "./model-wait.js";
 import { definitionDigest, readAttempt } from "./runtime.js";
 import { readExecutionState, type WorkerSessionFact } from "./execution-state.js";
 import { assertAcyclic, passBudget, ready, taskWorkdir } from "./scheduler.js";
+import { pruneGuardRefusals } from "./guard-refusals.js";
 import type { Task } from "./task-file.js";
 import { runTask, settleExhausted, type TaskOutcome, type WorkerConfig, type WorkerDeps } from "./worker.js";
 
@@ -102,6 +103,7 @@ export async function validateBatchSelection(
   board: Task[],
 ): Promise<Task[]> {
   assertAcyclic(board);
+  await pruneGuardRefusals(cfg.tasksDir, board);
   if (ids.length === 0) throw new BatchValidationError(["no tasks selected"]);
 
   const normalized = ids.map((id) => id.trim());

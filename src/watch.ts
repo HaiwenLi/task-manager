@@ -8,6 +8,7 @@ import { modelWaitHolds } from "./model-wait.js";
 import { assertAcyclic, taskWorkdir } from "./scheduler.js";
 import { runTask, settleExhausted, type WorkerConfig, type WorkerDeps } from "./worker.js";
 import { controlDir, acquireWatchLock, heartbeatWatchLock, releaseWatchLock } from "./watch-lock.js";
+import { pruneGuardRefusals } from "./guard-refusals.js";
 
 export const stopRequestPath = (tasksDir: string): string => join(controlDir(tasksDir), "stop.requested");
 
@@ -222,6 +223,7 @@ async function scheduleOnce(
   };
   const board = await deps.store.list();
   assertAcyclic(board);
+  await pruneGuardRefusals(cfg.tasksDir, board);
   // The deferral is a second exclusion beside the guard's: a task waiting for
   // its next model window is not offered, and what the queue picks instead is
   // whatever stands behind it.

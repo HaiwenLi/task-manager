@@ -2,6 +2,7 @@ import { stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { MAX_REVIEW_ROUNDS_DEFAULT, runTask, settleExhausted, type WorkerConfig, type WorkerDeps } from "./worker.js";
 import { formatDuration, modelRoundsOf, modelWaitHolds, processRun, type ModelWaitHold } from "./model-wait.js";
+import { pruneGuardRefusals } from "./guard-refusals.js";
 import type { Task } from "./task-file.js";
 import { draftAncestor } from "./eligibility.js";
 
@@ -160,6 +161,7 @@ export async function runScheduler(
   for (;;) {
     const snapshot = await deps.store.list();
     assertAcyclic(snapshot);
+    await pruneGuardRefusals(cfg.tasksDir, snapshot);
 
     const doneIds = new Set(snapshot.filter((task) => task.status === "done").map((task) => task.id));
     const eligible = ready(snapshot, doneIds).filter((task) => !refused.has(task.id));

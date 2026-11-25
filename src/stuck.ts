@@ -1,4 +1,5 @@
 import { waitReason } from "./eligibility.js";
+import { readGuardRefusals } from "./guard-refusals.js";
 import {
   DEFAULT_MODEL_KEY, formatDuration, modelKey, modelRoundsOf, readModelWait,
   type ModelWaitRecord, type ModelWaitStage,
@@ -43,6 +44,8 @@ export async function outageReport(
   });
   // `waitReason` reads a mutable board snapshot; this one is readonly, so it gets its own copy.
   const boardCopy = [...board];
+  // A task the budget guard refused is not part of the report (design §7): it keeps the guard's own line.
+  const refused = new Set((await readGuardRefusals(cfg.tasksDir)).map((entry) => entry.taskId));
   return {
     taskId,
     stage,
@@ -52,7 +55,7 @@ export async function outageReport(
     stoppedAt: now.toISOString(),
     models,
     // A task waiting on a dependency or an unapproved bundle is not free to run again.
-    waiting: boardCopy.filter((candidate) => candidate.status === "open" && waitReason(candidate, boardCopy) === null)
+    waiting: boardCopy.filter((candidate) => candidate.status === "open" && waitReason(candidate, boardCopy) === null && !refused.has(candidate.id))
       .map((candidate) => candidate.id),
   };
 }

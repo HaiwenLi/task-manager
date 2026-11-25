@@ -12,6 +12,7 @@ import type { AgentAdapter } from "../src/adapters/types.js";
 import type { TaskOutcome, WorkerConfig, WorkerDeps, WorkerEvent } from "../src/worker.js";
 import { MODEL_ROUNDS_DEFAULT, type ModelWaitRecord, type RunContext, newRunContext, processRun, readModelWait, writeModelWait } from "../src/model-wait.js";
 import { outageReport, renderOutageReport } from "../src/stuck.js";
+import { readGuardRefusals, recordGuardRefusal } from "../src/guard-refusals.js";
 import { watchLockPath } from "../src/watch-lock.js";
 import { stopRequestPath, watchQueue, type WatchFs } from "../src/watch.js";
 import { adapterOf, CATALOGUE } from "./helpers/catalogue-fixture.js";
@@ -309,6 +310,17 @@ describe("the outage report", () => {
 
     expect(report.models).toMatchObject([{ model: "r/one", reason: "Error: 429 too many requests" }]);
     expect(renderOutageReport(report)[1]).toBe("[model-outage]   r/one  Error: 429 too many requests");
+  });
+
+  it("a task the budget guard refused is not in the waiting list of the outage report", async () => {
+    await seedTaskFile(tasks, buildContinuousTask("001-spent"), buildContinuousTask("004-refused"), buildContinuousTask("005-waiting"));
+    await writeModelWait(tasks, "001-spent", spent(newRunContext(START)));
+    await recordGuardRefusal(tasks, "004-refused", "- zen/p  provider=zen  enabled=true  variants=-  拒绝：按量计费，约 $15 / 百万 token；未列入 allowedModels", new Date(START));
+
+    const report = await outageReport(config(), await store.list(), "001-spent", new Date("2026-11-25T10:04:03.000Z"));
+
+    // It keeps the guard's own line, which the run printed; it is not "still runnable" work of this report's.
+    expect(report.waiting).toEqual(["001-spent", "005-waiting"]);
   });
 });
 

@@ -30,6 +30,7 @@ import { collectChangeEvidence } from "./changes.js";
 import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck } from "./render.js";
 import { readExecutionState, recordEscalation, recordWorkerSession, type ExecutionState, type WorkerSessionFact } from "./execution-state.js";
 import { clearModelCooldown, modelCooldown, nextModelCooldown, noteModelRefusal } from "./model-cooldown.js";
+import { clearGuardRefusal, recordGuardRefusal } from "./guard-refusals.js";
 import {
   DEFAULT_MODEL_KEY, addRefusal, chainKeys, clearModelWait, coolingRefusals, formatDuration, mergeRefusals, modelCooldownMsOf, modelKey, modelRoundsOf,
   modelWaitHolds, processRun, readModelWait, refusalReason, servedSince, writeModelWait, modelWaitHold,
@@ -374,9 +375,13 @@ async function parkReviewFromRecord(
  * first refused because the catalogue could not be read is reported again when
  * the same models are later refused as paid, while the same verdicts at every
  * wake of a queue are said once.
+ *
+ * The board-level record is written at every judgement, with its time; only
+ * the line is said once.
  */
-function reportRefusal(deps: WorkerDeps, taskId: string, refused: readonly ModelVerdict[]): void {
+async function reportRefusal(tasksDir: string, deps: WorkerDeps, taskId: string, refused: readonly ModelVerdict[]): Promise<void> {
   const detail = renderVerdicts(refused);
+  await recordGuardRefusal(tasksDir, taskId, detail);
   if (noteReported(taskId, [detail])) deps.onEvent?.({ type: "refused", taskId, detail });
 }
 
@@ -396,7 +401,7 @@ export async function runTask(
     ? { reviewer: reviewerModels(cfg, task) }
     : { worker: workerModels(cfg, task), reviewer: reviewerModels(cfg, task) });
   if (refused.length > 0) {
-    reportRefusal(deps, task.id, refused);
+    await reportRefusal(cfg.tasksDir, deps, task.id, refused);
     return "refused";
   }
   if (!await claim(cfg.tasksDir, task.id, owner, cfg.lockTtlMs)) return "skipped";
@@ -497,7 +502,7 @@ export async function runTask(
       ? { reviewer: reviewerModels(r.cfg, r.task) }
       : { worker: workerModels(r.cfg, r.task), reviewer: reviewerModels(r.cfg, r.task) });
     if (refusedHere.length > 0) {
-      reportRefusal(deps, r.task.id, refusedHere);
+      await reportRefusal(cfg.tasksDir, deps, r.task.id, refusedHere);
       // On this path the claim's lock record was written (`claim`, above) and
       // is released again by the `finally`. The workspace reservation is given
       // back here: the `finally` releases only the reservation of a record
@@ -511,6 +516,7 @@ export async function runTask(
     }
     emit(r, task.status === "running" ? "takeover" : "claimed");
     await owned(r, async () => {
+      await clearGuardRefusal(cfg.tasksDir, task.id); // offered again and judged allowed at both judgements: the entry leaves
       await writeRuntime(cfg.tasksDir, task.id, "attempt.json", r.record);
       // The definition this attempt is judged by is written down here, beside the
       // attempt record: a later check — acceptance, review, or a takeover after a
