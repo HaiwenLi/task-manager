@@ -2,8 +2,9 @@
 
 Status: approved by the owner on 2026-11-25. Nothing in it is built yet. Revised the same day, after
 the learning loop was merged (ADR-0011, ADR-0012, ADR-0013), so that it builds on the budget guard
-instead of beside it. The revision is the author's and waits for the owner's confirmation; §17 lists
-what it changed. §10 is not edited by it.
+instead of beside it. The revision is the author's; §17 lists what it changed. The owner chose on
+2026-11-25 not to read the revision himself and asked for a review in his place instead; it found
+nothing to overrule, and its record is in the handoff note. §10 is not edited by it.
 
 Where it changes [the adaptive execution design](2026-11-24-adaptive-execution-design.md), it
 supersedes that document: §14.1 (shared provider cooldown), §16.1 (the lane is chosen by the model
@@ -454,7 +455,9 @@ cancellable execution today.
 The learning loop was merged after this design was approved. Its budget guard (ADR-0012) already
 does, by refusing, what §5 set out to do by a notice, and it added a second kind of refusal, which
 has to be kept apart from a provider's. The design was revised on the same day so that it builds on
-that code. The revision is the author's and waits for the owner's confirmation. §10 is not changed.
+that code. The revision is the author's. The owner chose not to read it himself and asked for a
+review in his place (2026-11-25), which found nothing to overrule; the handoff note has that review.
+§10 is not changed.
 
 What the merged code and its ADRs required:
 
