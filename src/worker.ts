@@ -31,10 +31,11 @@ import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck
 import { readExecutionState, recordEscalation, recordWorkerSession, type ExecutionState, type WorkerSessionFact } from "./execution-state.js";
 import { clearModelCooldown, modelCooldown, nextModelCooldown, noteModelRefusal } from "./model-cooldown.js";
 import {
-  addRefusal, clearModelWait, coolingRefusals, mergeRefusals, modelCooldownMsOf, modelKey, modelRoundsOf,
-  processRun, readModelWait, refusalReason, writeModelWait, modelWaitHold,
+  addRefusal, chainKeys, clearModelWait, coolingRefusals, formatDuration, mergeRefusals, modelCooldownMsOf, modelKey, modelRoundsOf,
+  modelWaitHolds, processRun, readModelWait, refusalReason, servedSince, writeModelWait, modelWaitHold,
   type ModelRefusal, type ModelWaitRecord, type ModelWaitStage, type RunContext,
 } from "./model-wait.js";
+import { withMutex } from "./mutex.js";
 import { recordUsage, type UsageRole } from "./usage.js";
 
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
@@ -166,7 +167,7 @@ export type WorkerDeps = {
  * refused, which is what its detail holds (the guard's verdicts): the same
  * verdicts at a later offer say nothing new, other verdicts are news.
  */
-export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "model-deferred" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error" | "refused";
+export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "model-deferred" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error" | "refused" | "outage";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
 /**
  * `refused`: the budget guard said no, so no model session started and no
@@ -262,6 +263,76 @@ export async function runWorker(cfg: WorkerConfig, deps: WorkerDeps): Promise<{ 
     if (outcome === "blocked") result.blocked.push(task.id);
   }
   return result;
+}
+
+/**
+ * Take the decision an attempt that ran out of rounds leaves open (spec §6,
+ * step 5), for the tasks a controller just got back deferred. With another
+ * task served on the chain since the task's first refusal, the task alone is
+ * held; otherwise it is an outage, and the first one ends the list. Called
+ * only once no attempt is in flight, so every turn that was running has been
+ * counted.
+ */
+export async function settleExhausted(
+  cfg: WorkerConfig, deps: WorkerDeps, board: readonly Task[], deferred: readonly string[], now = new Date(),
+): Promise<{ held: string[]; outage?: { taskId: string } }> {
+  const run = cfg.run ?? processRun();
+  const holds = await modelWaitHolds({ tasksDir: cfg.tasksDir, run, modelRounds: modelRoundsOf(cfg) }, deferred, now);
+  const held: string[] = [];
+  for (const id of deferred) {
+    const hold = holds.get(id);
+    const task = board.find((candidate) => candidate.id === id);
+    if (hold?.kind !== "exhausted" || task === undefined || task.status !== "open") continue;
+    const record = await readModelWait(cfg.tasksDir, id);
+    if (record === null) continue;
+    // The run's evidence decides: did any task get a turn accepted on the
+    // chain that refused, after this task's first refusal?
+    const chain = chainKeys(record.stage === "review" ? configuredReviewerChain(cfg, task) : taskChain(cfg, task));
+    const since = Date.parse(record.firstRefusedAt ?? record.updatedAt);
+    const served = servedSince(run, chain, since);
+    if (served !== null) {
+      await holdForRefusal(cfg, deps, task, record, served);
+      held.push(id);
+      continue;
+    }
+    const said = record.refusals.map((refusal) => `${refusal.model}: ${refusal.reason}`).join(" | ");
+    await withMutex(join(cfg.tasksDir, id, ".mutation.lock"), () => appendJournal(cfg.tasksDir, id, {
+      stage: record.stage, event: "model-outage",
+      detail: `rounds ${hold.rounds}/${modelRoundsOf(cfg)} over ${formatDuration(now.getTime() - since)} since ${record.firstRefusedAt}; no task served on the chain; ${said}`,
+    }));
+    deps.onEvent?.({
+      type: "outage", taskId: id,
+      detail: `every model refused in ${hold.rounds} round(s) and no task was served on the chain; the run stops — nothing is blocked, every waiting task can be run again`,
+    });
+    return { held, outage: { taskId: id } };
+  }
+  return { held };
+}
+
+/** Stop for a human: every model refused this task while another was served. The task itself is the problem. */
+async function holdForRefusal(
+  cfg: WorkerConfig, deps: WorkerDeps, task: Task, record: ModelWaitRecord, served: string,
+): Promise<void> {
+  const rounds = record.rounds;
+  await withMutex(join(cfg.tasksDir, task.id, ".mutation.lock"), async () => {
+    const seq = ((await latestNote(cfg.tasksDir, task.id))?.seq ?? 0) + 1;
+    await writeNote(cfg.tasksDir, {
+      task: task.id, seq, status: "blocked:needs-owner",
+      done: `模型拒绝：本任务在本次执行里连续 ${rounds} 轮被链上所有模型拒绝，期间其他任务在 ${served} 上成功过——模型可用，问题在本任务自身。未消耗 retries。`,
+      found: ["每个模型的拒绝原话：", ...record.refusals.map((refusal) => `- ${refusal.model}: ${refusal.reason}`)].join("\n"),
+      next: "逐条看上面的拒绝原话（常见：输入过长、内容被拒、该模型不支持这份任务）；修改任务定义或为它单独指定 model 后 taskctl retry。依赖它的任务会一直等，其余任务不受影响。",
+      files: [],
+    });
+    await appendJournal(cfg.tasksDir, task.id, {
+      stage: record.stage, event: "blocked",
+      detail: `refused by every model in ${rounds} round(s) while ${served} served another task; retries untouched`,
+    });
+    await deps.store.setStatus(task.id, "blocked");
+  });
+  deps.onEvent?.({
+    type: "blocked", taskId: task.id,
+    detail: `every model refused this task in ${rounds} round(s) while ${served} served another task; retries untouched — the task itself is the problem`,
+  });
 }
 
 /**

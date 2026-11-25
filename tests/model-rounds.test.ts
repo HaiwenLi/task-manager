@@ -7,12 +7,12 @@ import { latestNote } from "../src/handoff.js";
 import { readJournal } from "../src/journal.js";
 import { clearModelCooldown, noteModelRefusal } from "../src/model-cooldown.js";
 import { readAttempt } from "../src/runtime.js";
-import { serializeTaskFile } from "../src/task-file.js";
+import { serializeTaskFile, type Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
-import { runTask, WRAP_UP_INSTRUCTION, type TaskOutcome, type WorkerConfig, type WorkerDeps, type WorkerEvent } from "../src/worker.js";
-import { DEFAULT_MODEL_KEY, MODEL_ROUNDS_DEFAULT, newRunContext, readModelWait, writeModelWait } from "../src/model-wait.js";
+import { runTask, settleExhausted, WRAP_UP_INSTRUCTION, type TaskOutcome, type WorkerConfig, type WorkerDeps, type WorkerEvent } from "../src/worker.js";
+import { DEFAULT_MODEL_KEY, MODEL_ROUNDS_DEFAULT, newRunContext, readModelWait, writeModelWait, type RunContext } from "../src/model-wait.js";
 import { buildTaskFile } from "./helpers/task-fixture.js";
-import { markDoneTask } from "./helpers/watch-fixture.js";
+import { doneTaskId, markDoneTask, seedTaskFile } from "./helpers/watch-fixture.js";
 
 let root: string;
 let tasks: string;
@@ -247,5 +247,133 @@ describe("a fully refused round", () => {
 
     expect(seen).toEqual([DEFAULT_MODEL_KEY]);
     expect(await readModelWait(tasks, "a")).toMatchObject({ rounds: 1, refusals: [{ model: DEFAULT_MODEL_KEY, source: "turn" }] });
+  });
+});
+
+describe("after modelRounds rounds", () => {
+  const round = (adapter: AgentAdapter, context: RunContext, overrides: Partial<WorkerConfig> = {}) => run(adapter, [], { run: context, ...overrides });
+  const seed = (id: string, overrides: Partial<Task> = {}) => seedTaskFile(tasks, buildTaskFile({ id, title: id, acceptance: "check", criteria: ["C1 ok"], ...overrides }));
+  /** What a controller does once nothing is in flight, for the tasks it got back deferred. */
+  const settle = async (cfg: WorkerConfig, deferred: string[]) => {
+    const events: WorkerEvent[] = [];
+    const outcome = await settleExhausted(cfg, {
+      store, adapter: allRefuse().adapter, acceptance: passing, review: passingReview, onEvent: (event) => { events.push(event); },
+    }, await store.list(), deferred);
+    return { outcome, events };
+  };
+
+  it("with no task served, the task is left open, retries untouched, and the run is told to stop", async () => {
+    const context = newRunContext();
+    const outcomes: TaskOutcome[] = [];
+    for (let i = 0; i < MODEL_ROUNDS_DEFAULT; i++) outcomes.push(await round(allRefuse().adapter, context));
+    // Four rounds by default, and not one of them decided anything.
+    expect(outcomes).toEqual(["open", "open", "open", "open"]);
+
+    const { outcome, events } = await settle(config({ run: context }), ["a"]);
+
+    expect(outcome).toEqual({ held: [], outage: { taskId: "a" } });
+    expect(await store.get("a")).toMatchObject({ status: "open", retries: 0 });
+    expect(await readModelWait(tasks, "a")).toMatchObject({ runId: context.id, rounds: 4 });
+    expect(await latestNote(tasks, "a")).toBeNull();
+    expect(events.some((event) => event.type === "blocked")).toBe(false);
+    expect(events.find((event) => event.type === "outage")?.detail).toContain("nothing is blocked, every waiting task can be run again");
+    expect(await journal()).toMatch(/worker model-outage rounds 4\/4 over \S+ since \S+; no task served on the chain; q\/one:/);
+  });
+
+  it("honours a configured round budget", async () => {
+    const context = newRunContext();
+    expect(await round(allRefuse().adapter, context, { modelRounds: 2 })).toBe("open");
+
+    // One round of two is not spent: there is nothing to decide.
+    expect((await settle(config({ run: context, modelRounds: 2 }), ["a"])).outcome).toEqual({ held: [] });
+
+    expect(await round(allRefuse().adapter, context, { modelRounds: 2 })).toBe("open");
+    expect((await settle(config({ run: context, modelRounds: 2 }), ["a"])).outcome).toEqual({ held: [], outage: { taskId: "a" } });
+  });
+
+  it("with another task served on a chain model, only this task is blocked, and the note names every model", async () => {
+    await seed("b");
+    const context = newRunContext();
+    for (let i = 0; i < MODEL_ROUNDS_DEFAULT; i++) expect(await round(allRefuse().adapter, context)).toBe("open");
+    const serving = backend({ "q/one": refusal("Error: 503 on the way"), "q/two": "done" });
+    expect(await run(serving.adapter, [], { run: context }, {}, "b")).toBe("done");
+
+    const { outcome, events } = await settle(config({ run: context }), ["a"]);
+
+    expect(outcome).toEqual({ held: ["a"] });
+    expect(await store.get("a")).toMatchObject({ status: "blocked", retries: 0 });
+    const note = (await latestNote(tasks, "a"))!.markdown;
+    expect(note).toContain("blocked:needs-owner");
+    for (const model of CHAIN) expect(note).toContain(model);
+    expect(note).toContain("未消耗 retries");
+    expect(events.find((event) => event.type === "blocked")?.detail).toContain("the task itself is the problem");
+    expect(await journal()).toContain("refused by every model in 4 round(s) while q/two served another task");
+    expect(await readModelWait(tasks, "a")).toMatchObject({ rounds: 4 });
+    expect(await store.get("b")).toMatchObject({ status: "done" });
+  });
+
+  it("a success that later refusals overwrote in the shared table is still evidence", async () => {
+    await seed("b");
+    await seed("c");
+    const context = newRunContext();
+    for (const id of ["a", "c"]) for (let i = 0; i < MODEL_ROUNDS_DEFAULT - 1; i++) {
+      expect(await run(allRefuse().adapter, [], { run: context }, {}, id)).toBe("open");
+    }
+    // b is served on q/two only; c is refused on every model.
+    const serveBRefuseC: AgentAdapter = {
+      prompt: async (args) => {
+        if (doneTaskId(args.text) === "b" && args.model === "q/two") {
+          await markDoneTask(args.text, tasks);
+          return { sessionId: "ses-b", exitCode: 0, text: "done" };
+        }
+        return refusal("Error: this model will not serve this task");
+      },
+      contextUsage: async () => 0, contextLimit: async () => 100,
+    };
+
+    expect(await run(serveBRefuseC, [], { run: context }, {}, "b")).toBe("done");
+    // a's and c's fourth rounds are refused right after b's success and write q/two's entry again.
+    expect(await run(allRefuse().adapter, [], { run: context })).toBe("open");
+    expect(await run(serveBRefuseC, [], { run: context }, {}, "c")).toBe("open");
+    expect((await table()).models["q/two"]).toBeDefined(); // the shared table alone says "refusing"
+
+    const { outcome } = await settle(config({ run: context }), ["a", "c"]);
+
+    expect(outcome).toEqual({ held: ["a", "c"] });
+    expect(await store.get("a")).toMatchObject({ status: "blocked" });
+    expect(await store.get("b")).toMatchObject({ status: "done" });
+  });
+
+  it("does not count a turn accepted before the task's first refusal", async () => {
+    await seed("b");
+    const context = newRunContext();
+    expect(await run(backend({ "q/one": refusal("Error: 503 on the way"), "q/two": "done" }).adapter, [], { run: context }, {}, "b")).toBe("done");
+    for (let i = 0; i < MODEL_ROUNDS_DEFAULT; i++) expect(await round(allRefuse().adapter, context)).toBe("open");
+
+    expect((await settle(config({ run: context }), ["a"])).outcome).toEqual({ held: [], outage: { taskId: "a" } });
+  });
+
+  it("waits for the attempt in flight: a task served after the round that ran out is still evidence", async () => {
+    await seed("b");
+    const context = newRunContext();
+    for (let i = 0; i < MODEL_ROUNDS_DEFAULT; i++) expect(await round(allRefuse().adapter, context)).toBe("open");
+    // Nothing was decided while b's turn was still to come.
+    expect((await readJournal(tasks, "a")).some((line) => line.event === "model-outage")).toBe(false);
+    expect(await store.get("a")).toMatchObject({ status: "open" });
+
+    const serving = backend({ "q/one": refusal("Error: 503 on the way"), "q/two": "done" });
+    expect(await run(serving.adapter, [], { run: context }, {}, "b")).toBe("done");
+
+    expect((await settle(config({ run: context }), ["a"])).outcome).toEqual({ held: ["a"] });
+    expect(await store.get("a")).toMatchObject({ status: "blocked" });
+  });
+
+  it("decides nothing for a task that is no longer open", async () => {
+    const context = newRunContext();
+    for (let i = 0; i < MODEL_ROUNDS_DEFAULT; i++) expect(await round(allRefuse().adapter, context)).toBe("open");
+    await store.setStatus("a", "blocked"); // by hand, while no controller was running
+
+    expect((await settle(config({ run: context }), ["a"])).outcome).toEqual({ held: [] });
+    expect((await readJournal(tasks, "a")).some((line) => line.event === "model-outage")).toBe(false);
   });
 });
