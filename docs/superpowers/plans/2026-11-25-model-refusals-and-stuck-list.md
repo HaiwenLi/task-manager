@@ -3494,3 +3494,20 @@ This costs one real worker turn and, at step 5, one real review turn. Same rule 
 - [ ] **Step 5: What must be true.** `status --stuck` shows `等模型窗口  第 2/2 轮已用尽，等所有者处理：改好配置后新的 taskctl run 从第 0 轮开始` and the task is `open`; `tasks/<id>/review-pending.json` exists; `tasks/<id>/acceptance.json` is from the first attempt.
 - [ ] **Step 6: Recover.** Set `reviewerModel` to a model of the plan, run the same command again, and record that the journal shows one `review-only` line, no second worker turn and no second acceptance, and that the task ends `done` or `awaiting-human`.
 - [ ] **Step 7: Report to the owner**, verbatim output included. No commit.
+
+---
+
+## Found while carrying out (2026-11-26)
+
+Tasks 1 to 15 were carried out on `feat/model-refusals`, one implementer and one reviewer per task, each on a fresh context, with the controller re-running every gate and every mutation table. What execution found in this plan is recorded here, so that a reader knows where the text above and the code disagree. The tasks above are left as they were written; the code and the tests stand as built.
+
+- **Task 4** — the brief's `backend` helper indexes `tables.turns`, while every call site the task gives passes a flat table. The helper accepts both forms; the call sites are verbatim.
+- **Tasks 5, 6, 7, 8 and 10** — the import lists omit names the briefs' own test code calls (`seedTaskFile`, `doneTaskId`, `readJournal`, `readModelWait`, `WorkerConfig`, `Task`, `TaskOutcome`, `WorkerDeps` and others). They were added.
+- **Task 6** — two edits were made otherwise than written, because the brief's letter fails its own tests. A refused review turn is not written to `review.json` as a degraded verdict: it was read back as the previous verdict and made the next real `fail` look stalled. And a reviewer turn is evidence for the run only when it has its own session, since the `review` seam dispatches no turn.
+- **Task 7** — the test "a pass that only waited does not count against the pass budget" could not tell its own mutation from the real code: with one task and a budget of one pass the budget check never runs. It now seeds a dependent second task under a budget of two passes. The `settle` seam is typed at its own three-argument arity, because `runTask` takes four.
+- **Task 8** — one watch test wrote a deferral whose window had lapsed, which is no hold by design; it now writes a future `nextAt`. The first mutation row is killed by "keeps the guard's own handling of a refused task beside the deferral", not by the test the row names: in that test `selectAutomaticBatch` removes the deferred head, so the ordinary head's guard is never evaluated.
+- **Task 9** — the Files line says `tests/batch.test.ts` gains three cases; its code gives four.
+- **Task 12** — five behaviours the brief leaves unpinned were decided and reviewed: "since when" is taken from the reason's own source; the models clause is left out when the reason already names the model; "any other status with open questions" means a task that would otherwise not be listed; a guard entry is printed before a deferral record for an `open` task that carries both; and one mutation row's spec names only the test that can fail under it.
+- **Task 13** — the record's `updatedAt` is set to the time of the retry; the brief's test does not assert it.
+- **Task 14** — the brief's sentence on unknown-cost models was false against `decide` in `src/budget.ts`: such a model is allowed when it is in `allowedModels` **or** its provider is in `allowedProviders`. The README says so now, and says that a reviewer's verdict is evidence only when the turn has its own session.
+- **Mutation tables** — "red on the case the table names, and on no other" holds exactly for most rows. Where a row's mutation removes a guard that several of the task's tests assert, those tests fail too; each such row is recorded in the task's report. Every row was killed, and every row was also re-run by the controller from a machine-readable spec, restored byte for byte.
