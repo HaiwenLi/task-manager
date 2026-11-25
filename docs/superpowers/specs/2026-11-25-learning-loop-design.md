@@ -2,7 +2,7 @@
 
 Status: 已实现于分支 feat/learning-loop，待所有者签字；真实后端与真实宫殿在 2026-11-25 做过一次只读验证（护栏判定与一次召回，见计划 `2026-11-25-learning-loop.md` 的 As built 一节），带模型会话的真实运行未做。2026-11-25 所有者指示"尽可能自动执行，只有完全需要拍板的才问"，因此第一期实现在分支 `feat/learning-loop` 上进行，不合入 `main`。  
 Date: 2026-11-25  
-Applies to: `main@b587dd9`  
+Applies to: `main@ba500ea`  
 Related evidence: `docs/superpowers/plans/2026-11-24-handoff.md` §3 第 2、7 项；`docs/reviews/2026-11-24-idtrecon-orchestration-retro.md` P01、P02、P10、P21、P25；`docs/reviews/2026-11-16-real-task-retro.md` §2；`docs/findings/README.md` L0；`docs/superpowers/specs/2026-11-16-review-loop-design.md` §8.9、§11；`docs/backlog.md`「方向（2026-11-17 定）」
 
 ## 1. 意图与为什么
@@ -307,7 +307,7 @@ taskctl metrics（新三块） / taskctl models（新） / taskctl recall（新�
 
 **成功标准。**
 
-- S1：没有配置任何新键、任务没有 spec、没有偏好档案时，worker 提示词与 `main@b587dd9` 逐字节相同，`tests/protocol.test.ts` 不改而通过。
+- S1：没有配置任何新键、任务没有 spec、没有偏好档案时，worker 提示词与 `main@ba500ea` 逐字节相同，`tests/protocol.test.ts` 不改而通过。
 - S2：记忆后端未配置时，`recall.json` 不产生，journal 没有召回记录，没有任何子进程被拉起。
 - S3：配置了记忆后端时，worker 提示词含有 §6.2 的各节，`recall.json` 存在，journal 有记录。
 - S4：把后端换成会超时、会报错、会返回垃圾的假实现，任务仍然走完，journal 里有降级记录，子进程已退出，没有任何路径产生 `blocked`。
