@@ -404,6 +404,42 @@ describe("taskctl run", () => {
   });
 });
 
+describe("taskctl run --batch", () => {
+  it("reports an outage and exits 3", async () => {
+    await seedTaskFile(tasks, buildContinuousTask("001-a", { model: "q/one" }), buildContinuousTask("002-b", { model: "q/one" }));
+    const configPath = join(root, "taskctl.json");
+    await writeFile(configPath, JSON.stringify({
+      tasksDir: tasks, workdir: cwd, modelChain: ["q/one"], modelRounds: 1, lockTtlMs: 5_000, heartbeatMs: 20,
+    }), "utf8");
+    const lines: string[] = [];
+
+    const code = await runCli(["run", "--batch", "001-a,002-b", "--config", configPath], {
+      adapter: refusing(), acceptance: passAcceptance, log: (line) => { lines.push(line); }, err: (line) => { lines.push(line); },
+    });
+
+    expect(code).toBe(EXIT_OUTAGE);
+    expect(lines).toContain("[batch] stopped at 001-a (outage); unclaimed: 002-b");
+    expect(lines.filter((line) => line.startsWith("[model-outage]"))).toHaveLength(5);
+    expect(await store.get("002-b")).toMatchObject({ status: "open" });
+  });
+
+  it("says when a deferred task may run again, and exits 0", async () => {
+    await seedTaskFile(tasks, buildContinuousTask("001-a", { model: "q/one" }), buildContinuousTask("002-b", { model: "q/one" }));
+    const configPath = join(root, "taskctl.json");
+    await writeFile(configPath, JSON.stringify({
+      tasksDir: tasks, workdir: cwd, modelChain: ["q/one"], modelRounds: 2, modelCooldownMs: 30_000, lockTtlMs: 5_000, heartbeatMs: 20,
+    }), "utf8");
+    const lines: string[] = [];
+
+    const code = await runCli(["run", "--batch", "001-a,002-b", "--config", configPath], {
+      adapter: refusing(), acceptance: passAcceptance, log: (line) => { lines.push(line); }, err: (line) => { lines.push(line); },
+    });
+
+    expect(code).toBe(0);
+    expect(lines.some((line) => /^\[batch\] stopped at 001-a \(open\); deferred until \S+, run again then; unclaimed: 001-a, 002-b$/.test(line))).toBe(true);
+  });
+});
+
 describe("watch", () => {
   it("a deferred task at the head of the queue does not hold the rest of the board", async () => {
     await seedTaskFile(tasks, buildContinuousTask("001-a"), buildContinuousTask("002-b"));

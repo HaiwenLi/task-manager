@@ -398,7 +398,7 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
     }
   })();
   if (batch !== undefined && "stoppedAt" in result && result.stoppedAt !== undefined) {
-    log(`[batch] stopped at ${result.stoppedAt} (${result.outcome}); unclaimed: ${result.pending.join(", ") || "none"}`);
+    log(`[batch] stopped at ${result.stoppedAt} (${result.outcome})${result.deferredUntil === undefined ? "" : `; deferred until ${result.deferredUntil}, run again then`}; unclaimed: ${result.pending.join(", ") || "none"}`);
   } else if (result.pending.length > 0) {
     // Work left in `open` with no explanation reads as "nothing to do". It is not.
     log(
@@ -408,7 +408,9 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   }
   // The report a stop for an outage owes the operator (design §7), printed
   // beside whatever else this run has to say.
-  const outageTaskId = "outage" in result ? result.outage?.taskId : undefined;
+  const outageTaskId = batch === undefined
+    ? ("outage" in result ? result.outage?.taskId : undefined)
+    : "stoppedAt" in result && result.stoppedAt !== undefined && result.outcome === "outage" ? result.stoppedAt : undefined;
   if (outageTaskId !== undefined) {
     for (const line of renderOutageReport(await outageReport(cfg, await store.list(), outageTaskId))) log(line);
   }

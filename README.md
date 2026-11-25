@@ -344,7 +344,7 @@ npx tsx src/main.ts run --batch C,B,A [--log <file>] [--config taskctl.json]
 
 批次只是调度策略，不是把多项任务合成一个“大任务”。它严格按命令行给出的 `C,B,A` 顺序执行，先整选校验，再从普通 `run` 队列之外**只领取这些任务**。每项都必须：`execution: continuous`（或从 `simple` 推导）、同一解析后的 workdir、`verify: mechanical` / `render`、普通风险、无 `human_check`、依赖已 `done` 或排在所选顺序的前面，并且没有活跃或未结算的旧执行。高风险、人工门禁、跨 workdir、显式 iterative 会被拒绝，不会静默放宽。
 
-每个任务仍然单独领锁、保存定义快照、跑自己的验收和必要的复核，写自己的 `acceptance.json`、session 与 usage 增量；验收**不会**推迟到批次末尾。每次领取前还会重读看板并比较原定义和 workdir，中途改动在被改任务领取前拒绝。复核 `fail` 在当前领取内返工，不会把任务退回 `open`；批次对 `open` 结果的重试是为将来的调度器结果保留的防御分支，目前只有测试接缝能到达。`blocked` / `awaiting-human` / `skipped`（领取被拒、任务已不在 `open`/`running`、依赖未就绪、所有权丢失）会停止批次，后续任务不被领取。
+每个任务仍然单独领锁、保存定义快照、跑自己的验收和必要的复核，写自己的 `acceptance.json`、session 与 usage 增量；验收**不会**推迟到批次末尾。每次领取前还会重读看板并比较原定义和 workdir，中途改动在被改任务领取前拒绝。复核 `fail` 在当前领取内返工，不会把任务退回 `open`；批次对 `open` 结果的重试是为将来的调度器结果保留的防御分支，目前只有测试接缝能到达。`blocked` / `awaiting-human` / `skipped`（领取被拒、任务已不在 `open`/`running`、依赖未就绪、所有权丢失）会停止批次，后续任务不被领取。当前任务被推迟（等模型窗口）时批次停下并打印下次可领取时间，退出码 `0`——到点再跑一次即可，批次自己不等待。`--batch` 显式选中的任务若还在推迟窗口内，整批在领取前就被拒绝并说明时间。批次里出现模型不可用时同样打印报告并以退出码 `3` 退出。
 
 上一任务干净结算后，只有实际 model 与 canonical workdir 都一致、worker session 标记 clean、后端探测返回 `reusable` 时，下一任务才续用该 session。model 不匹配或探测 `unavailable` 会记 journal 后新开；`active` 会阻塞待 reconcile，不会启动竞争 worker。
 

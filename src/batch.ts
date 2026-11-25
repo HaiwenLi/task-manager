@@ -1,11 +1,11 @@
 import { lockLive } from "./claim.js";
 import { draftAncestor } from "./eligibility.js";
-import { modelWaitHolds } from "./model-wait.js";
+import { modelWaitHolds, type ModelWaitHold } from "./model-wait.js";
 import { definitionDigest, readAttempt } from "./runtime.js";
 import { readExecutionState, type WorkerSessionFact } from "./execution-state.js";
 import { assertAcyclic, passBudget, ready, taskWorkdir } from "./scheduler.js";
 import type { Task } from "./task-file.js";
-import { runTask, type TaskOutcome, type WorkerConfig, type WorkerDeps } from "./worker.js";
+import { runTask, settleExhausted, type TaskOutcome, type WorkerConfig, type WorkerDeps } from "./worker.js";
 
 /** Every reason an explicitly requested batch cannot start, in selection order. */
 export class BatchValidationError extends Error {
@@ -47,8 +47,9 @@ export function batchEligibility(
 
 /**
  * One shared runtime probe for explicit and automatic selection. Both callers
- * must see the same eligibility, workdir, live-lock and unsettled-attempt
- * checks; only the terminal handling differs (collect issues vs stop prefix).
+ * must see the same eligibility, workdir, live-lock, model-wait hold and
+ * unsettled-attempt checks; only the terminal handling differs (collect issues
+ * vs stop prefix).
  */
 type BatchTaskProbe = { issue: string | null; workdir: string; expectedWorkdir: string };
 
@@ -58,6 +59,7 @@ async function probeBatchTask(
   board: Task[],
   earlier: Set<string>,
   expectedWorkdir: string | undefined,
+  holds: ReadonlyMap<string, ModelWaitHold>,
 ): Promise<BatchTaskProbe> {
   const workdir = taskWorkdir(cfg.workdir, task);
   const expected = expectedWorkdir ?? workdir;
@@ -67,6 +69,14 @@ async function probeBatchTask(
   }
   if (issue === null && await lockLive(cfg.tasksDir, task.id, cfg.lockTtlMs)) {
     issue = `task ${task.id}: a live lock is held by another execution`;
+  }
+  if (issue === null) {
+    const hold = holds.get(task.id);
+    if (hold !== undefined) {
+      issue = hold.kind === "window"
+        ? `task ${task.id}: deferred until ${hold.nextAt} (round ${hold.rounds})`
+        : `task ${task.id}: its model rounds are spent for the running controller`;
+    }
   }
   if (issue === null) {
     try {
@@ -96,6 +106,7 @@ export async function validateBatchSelection(
 
   const normalized = ids.map((id) => id.trim());
   const byId = new Map(board.map((task) => [task.id, task]));
+  const holds = await modelWaitHolds(cfg, board.filter((task) => task.status === "open").map((task) => task.id));
   const selected: Task[] = [];
   const issues: string[] = [];
   const seen = new Set<string>();
@@ -117,7 +128,7 @@ export async function validateBatchSelection(
       issues.push(`unknown task ${id}`);
       continue;
     }
-    const probe = await probeBatchTask(cfg, task, board, earlier, expectedWorkdir);
+    const probe = await probeBatchTask(cfg, task, board, earlier, expectedWorkdir, holds);
     expectedWorkdir = probe.expectedWorkdir;
     selected.push(task);
     earlier.add(id);
@@ -157,7 +168,7 @@ export async function selectAutomaticBatch(
 
   for (const task of candidates) {
     if (selected.length >= maximum) break;
-    const probe = await probeBatchTask(cfg, task, board, earlier, expectedWorkdir);
+    const probe = await probeBatchTask(cfg, task, board, earlier, expectedWorkdir, held);
     if (probe.issue !== null) break;
     selected.push(task.id);
     earlier.add(task.id);
@@ -171,6 +182,8 @@ export type BatchResult = {
   stoppedAt?: string;
   /** `outage` names a stop for a model outage; the controller that ran the batch reports the decision. */
   outcome?: TaskOutcome | "stop-requested" | "outage";
+  /** Present only when the batch stopped on a task deferred for a window: when it may be claimed again. */
+  deferredUntil?: string;
   /** Selected ids that were never claimed. */
   pending: string[];
 };
@@ -260,6 +273,21 @@ export async function runBatch(
           stoppedAt: selectedTask.id,
           outcome,
           pending: selected.slice(index + 1).map((task) => task.id),
+        };
+      }
+      // A batch is serial, so nothing else is in flight: a task that ran out
+      // of rounds is decided here, and a deferral ends the batch, which does
+      // not wait inside itself.
+      const settled = await settleExhausted(cfg, deps, board, [selectedTask.id]);
+      const rest = selected.slice(index + 1).map((task) => task.id);
+      if (settled.outage !== undefined) return { done, stoppedAt: settled.outage.taskId, outcome: "outage", pending: rest };
+      if (settled.held.includes(selectedTask.id)) return { done, stoppedAt: selectedTask.id, outcome: "blocked", pending: rest };
+      const hold = (await modelWaitHolds(cfg, [selectedTask.id])).get(selectedTask.id);
+      if (hold !== undefined) {
+        return {
+          done, stoppedAt: selectedTask.id, outcome,
+          pending: selected.slice(index).map((task) => task.id),
+          ...(hold.kind === "window" ? { deferredUntil: hold.nextAt } : {}),
         };
       }
       if (attempt >= passBudget(1, cfg)) {

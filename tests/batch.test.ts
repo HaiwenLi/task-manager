@@ -10,6 +10,7 @@ import {
   type BatchRunOptions,
 } from "../src/batch.js";
 import { claim } from "../src/claim.js";
+import { newRunContext, processRun, writeModelWait } from "../src/model-wait.js";
 import { writeRuntime, type AttemptRecord } from "../src/runtime.js";
 import { passBudget } from "../src/scheduler.js";
 import type { Task } from "../src/task-file.js";
@@ -160,6 +161,38 @@ describe("validateBatchSelection", () => {
     };
     await writeRuntime(tasksDir, a.id, "attempt.json", attempt);
     await expect(validateBatchSelection(cfg, ["a"], [a])).resolves.toEqual([a]);
+  });
+
+  it("refuses a selection that names a deferred task before any claim", async () => {
+    const run = newRunContext();
+    cfg.run = run;
+    const nextAt = new Date(Date.now() + 60_000).toISOString();
+    await mkdir(join(tasksDir, "a"), { recursive: true });
+    await writeModelWait(tasksDir, "a", {
+      runId: run.id, stage: "worker", rounds: 1, firstRefusedAt: new Date().toISOString(), refusals: [],
+      nextAt, updatedAt: new Date().toISOString(),
+    });
+    const a = eligible("a");
+    const b = eligible("b");
+
+    const error = await validateBatchSelection(cfg, ["a", "b"], [a, b]).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(BatchValidationError);
+    expect((error as BatchValidationError).issues.join("\n")).toBe(`task a: deferred until ${nextAt} (round 1)`);
+  });
+
+  it("refuses a selection that names a task whose rounds this run has spent", async () => {
+    const run = newRunContext();
+    cfg.run = run;
+    const now = new Date().toISOString();
+    await mkdir(join(tasksDir, "a"), { recursive: true });
+    await writeModelWait(tasksDir, "a", {
+      runId: run.id, stage: "worker", rounds: 4, firstRefusedAt: now, refusals: [], nextAt: now, updatedAt: now,
+    });
+
+    const error = await validateBatchSelection(cfg, ["a"], [eligible("a")]).catch((caught: unknown) => caught);
+
+    expect((error as BatchValidationError).issues.join("\n")).toBe("task a: its model rounds are spent for the running controller");
   });
 });
 
@@ -313,5 +346,55 @@ describe("runBatch", () => {
     });
     expect(calls).toEqual(["a"]);
     expect(result).toEqual({ done: ["a"], stoppedAt: "b", outcome: "stop-requested", pending: ["b", "c"] });
+  });
+
+  it("stops on a deferred current task and says when it may run again", async () => {
+    board = [eligible("a"), eligible("b")];
+    const calls: string[] = [];
+    const nextAt = new Date(Date.now() + 60_000).toISOString();
+
+    const result = await runBatch(cfg, deps, ["a", "b"], {
+      run: async (_cfg, _deps, task) => {
+        calls.push(task.id);
+        if (task.id === "a") {
+          const now = new Date().toISOString();
+          await mkdir(join(tasksDir, "a"), { recursive: true });
+          await writeModelWait(tasksDir, "a", {
+            runId: processRun().id, stage: "worker", rounds: 1, firstRefusedAt: null, refusals: [],
+            nextAt, updatedAt: now,
+          });
+          return "open";
+        }
+        return "done";
+      },
+    });
+
+    expect(calls).toEqual(["a"]);
+    expect(result).toEqual({ done: [], stoppedAt: "a", outcome: "open", pending: ["a", "b"], deferredUntil: nextAt });
+  });
+
+  it("stops on an outage with that outcome and leaves the rest unclaimed", async () => {
+    board = [eligible("a"), eligible("b"), eligible("c")];
+    const calls: string[] = [];
+    const run = newRunContext();
+    cfg.run = run;
+
+    const result = await runBatch(cfg, deps, ["a", "b", "c"], {
+      run: async (_cfg, _deps, task) => {
+        calls.push(task.id);
+        if (task.id === "a") {
+          const now = new Date().toISOString();
+          await mkdir(join(tasksDir, "a"), { recursive: true });
+          await writeModelWait(tasksDir, "a", {
+            runId: run.id, stage: "worker", rounds: 4, firstRefusedAt: now, refusals: [], nextAt: now, updatedAt: now,
+          });
+          return "open"; // the attempt that ran out of rounds decides nothing
+        }
+        return "done";
+      },
+    });
+
+    expect(calls).toEqual(["a"]);
+    expect(result).toEqual({ done: [], stoppedAt: "a", outcome: "outage", pending: ["b", "c"] });
   });
 });
