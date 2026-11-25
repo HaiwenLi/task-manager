@@ -14,6 +14,7 @@ import {
   profileSection,
   readContextSections,
   readFixedSources,
+  sourceName,
   sourcesDetail,
 } from "../src/context.js";
 import { recordFeedback, type FeedbackRecord } from "../src/feedback.js";
@@ -275,5 +276,14 @@ describe("readFixedSources", () => {
       { name: "notes.md", state: "missing", chars: 0 },
       { name: "x.md", state: "unreadable", chars: 0, detail: "EISDIR" },
     ])).toBe("voice.md=1934; contract.md=clipped(8000); blank.md=empty; notes.md=missing; x.md=unreadable(EISDIR)");
+  });
+
+  it("names a source by what follows its last separator, of either kind", () => {
+    // `path.basename` splits on a backslash only where a backslash is a separator, so a name taken with it would
+    // carry a whole Windows path on POSIX. The name is cut by hand, the same way on every platform.
+    expect(sourceName("C:\\rules\\voice.md")).toBe("voice.md");
+    expect(sourceName("/etc/rules/voice.md")).toBe("voice.md");
+    expect(sourceName("C:/rules\\voice.md")).toBe("voice.md");
+    expect(sourceName("voice.md")).toBe("voice.md");
   });
 });

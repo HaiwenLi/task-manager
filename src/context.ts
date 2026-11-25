@@ -1,5 +1,4 @@
 import { readFile } from "node:fs/promises";
-import { basename } from "node:path";
 import type { Task } from "./task-file.js";
 import { pickFeedback, readFeedback, renderEntry, type FeedbackRecord } from "./feedback.js";
 import { readProfile } from "./profile.js";
@@ -139,6 +138,16 @@ export type FixedSourceState = "read" | "clipped" | "empty" | "missing" | "unrea
 export type FixedSourceFile = { name: string; state: FixedSourceState; chars: number; detail?: string };
 
 /**
+ * What a source is called in the prompt, the journal and the output: the text
+ * after its last separator, `/` or `\`. Cut by hand rather than with
+ * `path.basename`, which takes a backslash for a separator on Windows only
+ * and would hand back a whole Windows path as the name anywhere else.
+ */
+export function sourceName(path: string): string {
+  return path.slice(Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
+}
+
+/**
  * The fixed sources of a configuration, read file by file, in the order they
  * are named: the rules the owner keeps across projects — how text is to be
  * written, what must never happen. They are read, never searched for, so no
@@ -159,7 +168,7 @@ export async function readFixedSources(paths: readonly string[]): Promise<{ text
   const files: FixedSourceFile[] = [];
   const blocks: string[] = [];
   for (const path of paths) {
-    const name = basename(path);
+    const name = sourceName(path);
     let raw: string;
     try {
       raw = await readFile(path, "utf8");
@@ -170,8 +179,8 @@ export async function readFixedSources(paths: readonly string[]): Promise<{ text
         : { name, state: "unreadable", chars: 0, detail: error.code ?? error.name });
       continue;
     }
-    // As the file holds it, minus a byte-order mark, `\r\n` and the blank ends.
-    const text = (raw.startsWith("\uFEFF") ? raw.slice(1) : raw).replace(/\r\n/g, "\n").trim();
+    // As the file holds it, minus `\r\n` and the blank ends; a byte-order mark counts as blank and goes with them.
+    const text = raw.replace(/\r\n/g, "\n").trim();
     if (text.length === 0) {
       files.push({ name, state: "empty", chars: 0 });
       continue;
