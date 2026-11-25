@@ -19,7 +19,7 @@ import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
 import { readRelevantFeedback, recordTaskFeedback, type FeedbackEvent } from "./feedback.js";
 import { readFixedSources, sourcesDetail } from "./context.js";
-import { humanTouches, modelFirstPass, readFlowInput, summarizeFlow, type HumanTouch, type ModelFirstPass } from "./metrics.js";
+import { ADJUDICATED, humanTouches, modelFirstPass, readFlowInput, SIGN_OFF, summarizeFlow, type HumanTouch, type ModelFirstPass } from "./metrics.js";
 import { clearQuestions, questionsPath, readQuestions, writeQuestions } from "./questions.js";
 import { waitReason } from "./eligibility.js";
 import {
@@ -1419,20 +1419,39 @@ async function recordedModel(tasksDir: string, id: string, name: string): Promis
 }
 
 /**
- * The section `人工触点`: what the waiting time is — an approximation, said
- * every time — then one line per task a person touched, its touches by kind
- * and how long it waited for them; `（无）` when there is no such task.
+ * The section `人工触点`: the two kinds of touch and which events are which
+ * — read off the sets themselves, so the line cannot drift from what is
+ * counted — then what the waiting time is, an approximation said every time.
+ * After them one line per task a person touched: its touches under each
+ * kind, the ones in neither kind when there are any, the touches by event,
+ * and how long it waited for them. The totals over the tasks close the
+ * section, and only when there is at least one task; `（无）` when there is
+ * none.
  */
 function humanTouchSection(touches: readonly HumanTouch[]): string[] {
   const byKind = (byEvent: Record<string, number>): string =>
     Object.entries(byEvent).map(([event, count]) => `${event}×${count}`).join(", ");
+  /** `共 N 次  审批 S  裁决 A`, then the touches in neither kind when there are any: the shape of a task's line and of the totals. */
+  const counts = ({ total, signOff, adjudicated, other }: Pick<HumanTouch, "total" | "signOff" | "adjudicated" | "other">): string =>
+    `共 ${total} 次  审批 ${signOff}  裁决 ${adjudicated}${other > 0 ? `  未归类 ${other}` : ""}`;
+  const sum = touches.reduce(
+    (all, touch) => ({
+      total: all.total + touch.total, signOff: all.signOff + touch.signOff,
+      adjudicated: all.adjudicated + touch.adjudicated, other: all.other + touch.other,
+    }),
+    { total: 0, signOff: 0, adjudicated: 0, other: 0 },
+  );
   return [
     "人工触点",
+    `审批型是签字放行（${[...SIGN_OFF].join("、")}），该往下压；裁决型是定标准、判对错（${[...ADJUDICATED].join("、")}），是判断的来源，不压`,
     "等人时长为墙钟时间，包含夜间和周末，是近似值",
-    ...(touches.length === 0 ? ["（无）"] : touches.map(({ task, byEvent, total, waitedMs }) => {
-      const minutes = Math.floor(waitedMs / 60_000);
-      return `${task}  共 ${total} 次（${byKind(byEvent)}）  等人 ${Math.floor(minutes / 60)}h${minutes % 60}m`;
-    })),
+    ...(touches.length === 0 ? ["（无）"] : [
+      ...touches.map(({ task, byEvent, total, signOff, adjudicated, other, waitedMs }) => {
+        const minutes = Math.floor(waitedMs / 60_000);
+        return `${task}  ${counts({ total, signOff, adjudicated, other })}  （${byKind(byEvent)}）  等人 ${Math.floor(minutes / 60)}h${minutes % 60}m`;
+      }),
+      `合计  ${counts(sum)}`,
+    ]),
   ];
 }
 

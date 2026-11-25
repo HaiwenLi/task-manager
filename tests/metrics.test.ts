@@ -217,11 +217,47 @@ describe("humanTouches", () => {
       at("2026-01-01T03:00:00Z", "human", "rejected", "worker"),
       at("2026-01-01T04:00:00Z", "split", "applied"),
     ]]]));
-    expect(touches).toEqual([{ task: "a", byEvent: { approved: 1, rejected: 1, applied: 1 }, total: 3, waitedMs: 3_600_000 }]);
+    expect(touches).toEqual([{ task: "a", byEvent: { approved: 1, rejected: 1, applied: 1 }, total: 3, signOff: 2, adjudicated: 1, other: 0, waitedMs: 3_600_000 }]);
   });
 
   it("skips tasks nobody touched", () => {
     expect(humanTouches(new Map([["a", [line("worker", "done")]]]))).toEqual([]);
+  });
+
+  it("counts the seven touches under their kind: four sign-offs, three judgements", () => {
+    const touches = humanTouches(new Map([["a", [
+      at("2026-01-01T00:00:00Z", "clarify", "spec-drafted"),
+      at("2026-01-01T01:00:00Z", "human", "approved", "criteria=2"),    // a draft signed off
+      at("2026-01-01T02:00:00Z", "human", "answered", "q1"),            // a question answered
+      at("2026-01-01T03:00:00Z", "human", "rejected", "stage=worker"),  // sent back, with its reason
+      at("2026-01-01T04:00:00Z", "human", "audited", "pass reviewer"),  // a spot check
+      at("2026-01-01T05:00:00Z", "human", "accepted"),                  // let through
+      at("2026-01-01T06:00:00Z", "human", "retry", "archived to x"),    // run again
+      at("2026-01-01T07:00:00Z", "split", "applied"),                   // a split plan applied
+    ]]]));
+    expect(touches).toEqual([{
+      task: "a",
+      byEvent: { approved: 1, answered: 1, rejected: 1, audited: 1, accepted: 1, retry: 1, applied: 1 },
+      total: 7, signOff: 4, adjudicated: 3, other: 0,
+      // Still waited for as before: an hour before each push (the approval, the answer, the acceptance, the retry), none for a send-back or a spot check.
+      waitedMs: 4 * 3_600_000,
+    }]);
+  });
+
+  it("counts a touch that is neither kind under other, and still in the total", () => {
+    // `nudged` is no event this version knows: it is seen as unclassified, not filed under a kind it may not belong to.
+    const touches = humanTouches(new Map([["a", [
+      at("2026-01-01T00:00:00Z", "clarify", "spec-drafted"),
+      at("2026-01-01T01:00:00Z", "human", "nudged"),
+      at("2026-01-01T02:00:00Z", "human", "accepted"),
+    ]]]));
+    expect(touches).toEqual([{
+      task: "a",
+      byEvent: { nudged: 1, accepted: 1 },
+      total: 2, signOff: 1, adjudicated: 0, other: 1,
+      // An unknown event pushes nothing on, so it is not waited for: only the hour before the acceptance.
+      waitedMs: 3_600_000,
+    }]);
   });
 
   it("counts a spot check as a touch, and waits only for a push that has a time and a line before it", () => {
@@ -232,7 +268,7 @@ describe("humanTouches", () => {
       at("2026-01-01T00:40:00Z", "human", "retry", "archived to x"),      // a retry pushes the task on again: half an hour
       at("2026-01-01T00:40:30Z", "split", "applied"),                     // a touch, never a wait
     ]]]));
-    expect(touches).toEqual([{ task: "a", byEvent: { accepted: 1, audited: 1, retry: 1, applied: 1 }, total: 4, waitedMs: 30 * 60_000 }]);
+    expect(touches).toEqual([{ task: "a", byEvent: { accepted: 1, audited: 1, retry: 1, applied: 1 }, total: 4, signOff: 3, adjudicated: 1, other: 0, waitedMs: 30 * 60_000 }]);
   });
 });
 
@@ -336,9 +372,61 @@ describe("taskctl metrics: human touches and first review pass by model", () => 
     expect(text).toContain("等人时长为墙钟时间，包含夜间和周末，是近似值");
     expect(text).toContain("按模型的首轮复核通过");
     expect(text).toMatch(/plan\/m\s+任务 1\s+首轮通过 1\s+未复核 0\s+首轮通过率 100%/);
-    // The whole of both lines: each kind of touch by name, in the order the journal has them, and the two hours
+    // The whole task line: both counts, each touch by name in the order the journal has them, and the two hours
     // a person was waited for, one before the approval and one before the acceptance.
-    expect(text).toContain("a  共 2 次（approved×1, accepted×1）  等人 2h0m");
+    expect(text).toContain("a  共 2 次  审批 2  裁决 0  （approved×1, accepted×1）  等人 2h0m");
+  });
+
+  it("names the events by kind, counts each task under both kinds, and sums them", async () => {
+    await seedDone("a");
+    await seedDone("b");
+    // a: a draft approved, sent back, a question answered. b: accepted, then a split plan applied.
+    await journalAt("a",
+      ["2026-01-01T00:00:00Z", "clarify", "spec-drafted"],
+      ["2026-01-01T01:00:00Z", "human", "approved", "criteria=2"],
+      ["2026-01-01T02:00:00Z", "human", "rejected", "stage=worker: 按钮没对齐"],
+      ["2026-01-01T03:00:00Z", "human", "answered", "q1"],
+    );
+    await journalAt("b",
+      ["2026-01-01T00:00:00Z", "human", "accepted"],
+      ["2026-01-01T01:00:00Z", "split", "applied", "parts=3"],
+    );
+    const cap = capture();
+    expect(await runCli(["metrics", "--config", await writeConfig()], cap.deps)).toBe(0);
+
+    const touches = cap.lines.indexOf("人工触点");
+    expect(cap.lines.slice(touches, touches + 6)).toEqual([
+      "人工触点",
+      "审批型是签字放行（approved、accepted、retry、applied），该往下压；裁决型是定标准、判对错（answered、rejected、audited），是判断的来源，不压",
+      "等人时长为墙钟时间，包含夜间和周末，是近似值",
+      // One sign-off and two judgements; the hour before the approval and the hour before the answer.
+      "a  共 3 次  审批 1  裁决 2  （approved×1, rejected×1, answered×1）  等人 2h0m",
+      // Two sign-offs and no judgement; the acceptance was the first line, so nothing was waited for.
+      "b  共 2 次  审批 2  裁决 0  （accepted×1, applied×1）  等人 0h0m",
+      "合计  共 5 次  审批 3  裁决 2",
+    ]);
+  });
+
+  it("shows the unclassified count on a task and in the total, and only where there is one", async () => {
+    await seedDone("a");
+    await seedDone("b");
+    // a: accepted, then an event this version does not know. b: a spot check.
+    await journalAt("a",
+      ["2026-01-01T00:00:00Z", "human", "accepted"],
+      ["2026-01-01T00:30:00Z", "human", "nudged"],
+    );
+    await journalAt("b",
+      ["2026-01-01T00:00:00Z", "human", "audited", "pass reviewer"],
+    );
+    const cap = capture();
+    expect(await runCli(["metrics", "--config", await writeConfig()], cap.deps)).toBe(0);
+
+    const touches = cap.lines.indexOf("人工触点");
+    expect(cap.lines.slice(touches + 3, touches + 6)).toEqual([
+      "a  共 2 次  审批 1  裁决 0  未归类 1  （accepted×1, nudged×1）  等人 0h0m",
+      "b  共 1 次  审批 0  裁决 1  （audited×1）  等人 0h0m",
+      "合计  共 3 次  审批 1  裁决 1  未归类 1",
+    ]);
   });
 
   it("names no model for a task whose acceptance record is torn or says none", async () => {
@@ -362,7 +450,14 @@ describe("taskctl metrics: human touches and first review pass by model", () => 
     expect(await runCli(["metrics", "--config", await writeConfig()], cap.deps)).toBe(0);
     const touches = cap.lines.indexOf("人工触点");
     expect(touches).toBeGreaterThanOrEqual(0);
-    expect(cap.lines.slice(touches, touches + 3)).toEqual(["人工触点", "等人时长为墙钟时间，包含夜间和周末，是近似值", "（无）"]);
+    // Still the heading, its two standing lines and `（无）`, then the next section: no task line, and no totals.
+    expect(cap.lines.slice(touches, touches + 5)).toEqual([
+      "人工触点",
+      "审批型是签字放行（approved、accepted、retry、applied），该往下压；裁决型是定标准、判对错（answered、rejected、audited），是判断的来源，不压",
+      "等人时长为墙钟时间，包含夜间和周末，是近似值",
+      "（无）",
+      "按模型的首轮复核通过",
+    ]);
     expect(cap.lines.slice(-2)).toEqual(["按模型的首轮复核通过", "(unknown)  任务 1  首轮通过 0  未复核 1  首轮通过率 -"]);
   });
 

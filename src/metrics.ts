@@ -81,11 +81,21 @@ export function summarizeFlow(input: FlowInput): string[] {
   ];
 }
 
-/** What a person had to do with one task: how often, of which kind, and how long the task waited for them. */
-export type HumanTouch = { task: string; byEvent: Record<string, number>; total: number; waitedMs: number };
+/**
+ * What a person had to do with one task: how often, of which kind, and how
+ * long the task waited for them. The touches are counted by event in
+ * `byEvent` and by kind — a sign-off (`signOff`), a judgement (`adjudicated`)
+ * or neither (`other`) — and `total` is the three together.
+ */
+export type HumanTouch = { task: string; byEvent: Record<string, number>; total: number; signOff: number; adjudicated: number; other: number; waitedMs: number };
 
 /** The first review of the tasks one model finished: how many passed it, and how many never had one. */
 export type ModelFirstPass = { model: string; tasks: number; firstReviewPassed: number; noReview: number };
+
+/** The human touches that are a sign-off: a draft approved, work let through, a task run again, a split plan applied. This is the cost to drive down. */
+export const SIGN_OFF: ReadonlySet<string> = new Set(["approved", "accepted", "retry", "applied"]);
+/** The human touches that supply a judgement: a question answered, work sent back, a spot check. A send-back carries its reason, which is how a correction enters, so it is not a sign-off. This is the supply of judgement, and is not to be squeezed. */
+export const ADJUDICATED: ReadonlySet<string> = new Set(["answered", "rejected", "audited"]);
 
 /** The human events that push a stopped task on again. Every other touch is counted, and is not waited for. */
 const PUSHED_ON: ReadonlySet<string> = new Set(["approved", "answered", "accepted", "retry"]);
@@ -99,6 +109,16 @@ const PUSHED_ON: ReadonlySet<string> = new Set(["approved", "answered", "accepte
  * question answered, work accepted or sent back, a spot check (`audited`), a
  * retry — or a split plan that was `applied`. `total` counts them, and
  * `byEvent` counts them by event, in the order the journal first has each.
+ *
+ * They are also kept apart by kind, because they are not one cost. A
+ * sign-off ({@link SIGN_OFF}) is the person letting work through, and fewer
+ * of them is the point. A touch that supplies a judgement
+ * ({@link ADJUDICATED}) is where the standard comes from — an answer, a
+ * send-back with its reason, a spot check — and squeezing it starves the
+ * loop rather than saving anything. One number for both would reward going
+ * to the person less, whichever kind was cut. A touch in neither set is
+ * counted as `other`, so an event this version does not know is seen, and
+ * not silently filed under a kind it may not belong to.
  *
  * `waitedMs` is how long a person was waited for: for each touch that pushes
  * a stopped task on again (`approved`, `answered`, `accepted`, `retry`) the
@@ -115,17 +135,24 @@ export function humanTouches(journals: ReadonlyMap<string, readonly JournalLine[
   for (const [task, journal] of journals) {
     const byEvent: Record<string, number> = {};
     let total = 0;
+    let signOff = 0;
+    let adjudicated = 0;
+    let other = 0;
     let waitedMs = 0;
     journal.forEach((line, index) => {
       if (line.stage !== "human" && !(line.stage === "split" && line.event === "applied")) return;
       byEvent[line.event] = (byEvent[line.event] ?? 0) + 1;
       total += 1;
+      // An event in neither set is seen as such — counted under `other`, where the output shows it — not filed under a kind it may not belong to.
+      if (SIGN_OFF.has(line.event)) signOff += 1;
+      else if (ADJUDICATED.has(line.event)) adjudicated += 1;
+      else other += 1;
       const previous = journal[index - 1];
       if (line.stage !== "human" || !PUSHED_ON.has(line.event) || previous === undefined) return;
       const waited = Date.parse(line.at) - Date.parse(previous.at);
       if (Number.isFinite(waited)) waitedMs += waited;
     });
-    if (total > 0) touches.push({ task, byEvent, total, waitedMs });
+    if (total > 0) touches.push({ task, byEvent, total, signOff, adjudicated, other, waitedMs });
   }
   return touches;
 }
