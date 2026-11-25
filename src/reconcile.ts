@@ -2,6 +2,7 @@ import { mkdir, rename } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { LOCK_TTL_MS_DEFAULT, lockLive } from "./claim.js";
 import { appendJournal } from "./journal.js";
+import { readModelWait, writeModelWait } from "./model-wait.js";
 import { withMutex } from "./mutex.js";
 import { readAttempt, type AttemptRecord } from "./runtime.js";
 import { TaskStore } from "./task-store.js";
@@ -161,6 +162,13 @@ export async function retryTask(
     const store = new TaskStore(tasksDir);
     await store.updateFields(id, { retries: 0, reviewRounds: 0 });
     await store.setStatus(id, "open");
+    // The deferral stays (design §6): a retry is not a reason to ask again a
+    // model that refused a moment ago. Its earliest time is kept; its rounds
+    // start again, so the retry buys a fresh `modelRounds`.
+    const wait = await readModelWait(tasksDir, id);
+    if (wait !== null) {
+      await writeModelWait(tasksDir, id, { ...wait, rounds: 0, firstRefusedAt: null, updatedAt: now.toISOString() });
+    }
     await appendJournal(tasksDir, id, { stage: "human", event: "retry", detail: `archived to ${archive}` });
     return { ok: true, archive };
   });

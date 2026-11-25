@@ -7,6 +7,7 @@ import type { Task } from "../src/task-file.js";
 import { runScheduler, type SchedulerOptions } from "../src/scheduler.js";
 import { selectAutomaticBatch } from "../src/batch.js";
 import { EXIT_OUTAGE, runCli } from "../src/cli.js";
+import { retryTask } from "../src/reconcile.js";
 import { resetGuardState } from "../src/budget.js";
 import type { AgentAdapter } from "../src/adapters/types.js";
 import type { TaskOutcome, WorkerConfig, WorkerDeps, WorkerEvent } from "../src/worker.js";
@@ -524,6 +525,37 @@ describe("watch", () => {
     await writeModelWait(tasks, "001-a", deferral(processRun(), { nextAt: new Date(Date.now() + 60_000).toISOString() }));
 
     expect(await selectAutomaticBatch(cfg, board)).toEqual(["002-b", "003-c"]);
+  });
+
+  it("offers a task the owner retried by hand again after its recorded time, from round 0, and does not block it again at once", async () => {
+    await seedTaskFile(tasks, buildTaskFile({ id: "001-a", title: "a" }));
+    // As a run leaves a task it held as its own problem: blocked, its rounds spent, its next time still ahead.
+    const nextAt = new Date(Date.now() + 400).toISOString();
+    await writeModelWait(tasks, "001-a", deferral(processRun(), { rounds: MODEL_ROUNDS_DEFAULT, nextAt }));
+    await store.setStatus("001-a", "blocked");
+    const offered: Array<{ at: number; record: ModelWaitRecord | null }> = [];
+    // A bound on a queue that never offers the task: the case then fails on `offered`, not on time.
+    const safety = setTimeout(() => { void stop.request(); }, 5_000);
+
+    const running = watchQueue(cfg, deps, {
+      watchFs, fallbackMs: 50, debounceMs: 5,
+      runOne: async (_cfg, _deps, task) => {
+        offered.push({ at: Date.now(), record: await readModelWait(tasks, task.id) });
+        // Refused again: a first round, not a fifth.
+        await writeModelWait(tasks, task.id, deferral(processRun(), { rounds: 1, nextAt: new Date(Date.now() + 60_000).toISOString() }));
+        await stop.request();
+        return "open";
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100)); // the queue is running, and leaves the blocked task alone
+    expect(await retryTask(tasks, "001-a", { baseWorkdir: cwd, registryDir: join(root, "registry") })).toMatchObject({ ok: true });
+
+    expect(await running).toEqual({ reason: "stop" });
+    clearTimeout(safety);
+    expect(offered).toHaveLength(1);
+    expect(offered[0]!.at).toBeGreaterThanOrEqual(Date.parse(nextAt)); // not before the recorded time
+    expect(offered[0]!.record).toMatchObject({ rounds: 0, firstRefusedAt: null, nextAt });
+    expect(await store.get("001-a")).toMatchObject({ status: "open" }); // not held as its own problem on the first new round
   });
 });
 

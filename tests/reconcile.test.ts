@@ -3,6 +3,8 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { reconcileTask, retryTask } from "../src/reconcile.js";
+import { modelCooldown, noteModelRefusal } from "../src/model-cooldown.js";
+import { readModelWait, writeModelWait } from "../src/model-wait.js";
 import { writeRuntime } from "../src/runtime.js";
 import { serializeTaskFile, type TaskStatus } from "../src/task-file.js";
 import { reserveWorkspace } from "../src/workspace.js";
@@ -150,6 +152,24 @@ describe("retry", () => {
     expect(rendered).toContain("status: open");
     expect(rendered).toContain("retries: 0");
     expect(rendered).toContain("review_rounds: 0");
+  });
+
+  it("keeps the earliest time of a deferral, starts its rounds again, and leaves the shared table alone", async () => {
+    await writeTask("blocked", { retries: 2 });
+    await writeAttempt("settled");
+    const nextAt = new Date(Date.now() + 60_000).toISOString();
+    await writeModelWait(tasksDir, "t1", {
+      runId: "run", stage: "worker", rounds: 4, firstRefusedAt: new Date(Date.now() - 60_000).toISOString(),
+      refusals: [], nextAt, updatedAt: new Date().toISOString(),
+    });
+    await noteModelRefusal(tasksDir, "q/one", { reason: "rate limited", cooldownMs: 600_000 });
+
+    const outcome = await retryTask(tasksDir, "t1", { registryDir, now: new Date("2026-11-25T08:00:00.000Z") });
+
+    expect(outcome.ok).toBe(true);
+    expect(await readdir(join(tasksDir, "t1", "archive", "2026-11-25T08-00-00-000Z"))).not.toContain("model-wait.json");
+    expect(await readModelWait(tasksDir, "t1")).toMatchObject({ rounds: 0, firstRefusedAt: null, nextAt });
+    expect(await modelCooldown(tasksDir, "q/one")).not.toBeNull();
   });
 
   it("reopens a blocked task that has no evidence directory yet", async () => {
