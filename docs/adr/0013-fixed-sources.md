@@ -50,9 +50,11 @@ phase of the learning loop was built.
   later.
 - A file that is missing or cannot be read is a state, not an error: the
   attempt goes on without it, and the journal says so. One `sources` line per
-  attempt names every configured file and what came of reading it — read,
-  clipped, empty, missing, or unreadable with the error's code — every file
-  missing included.
+  attempt that reaches the read names every configured file and what came of
+  it — read, clipped, empty, missing, or unreadable with the error's code —
+  every file missing included. It is skipped only when the attempt never gets
+  there: the board's own context files throwing takes the whole read down
+  with one `context-unavailable` (ADR-0011's rule).
 - `taskctl recall` shows the fixed sources first, as the prompt carries them,
   whether memory is on or not, and exits 1 when one could not be read.
 - **The reviewer's input does not change.**

@@ -323,7 +323,7 @@ taskctl metrics（新三块） / taskctl models（新） / taskctl recall（新�
 
 **只出现文件名。** 提示词、journal 和输出里都只有文件名，没有路径。提示词是 worker 可能引用进它写的东西里的文字，一条路径迟早会进某个仓库。
 
-**读不到不算错。** 文件不在或读不出来，这次 attempt 少这一个文件，任务照常，不 `blocked`。journal 记一条 `sources`，每个 attempt 一条，写明每个配置的文件各是什么结果，全部缺失也记：`voice.md=1934; contract.md=clipped(8000); blank.md=empty; notes.md=missing; x.md=unreadable(EISDIR)`。读到的写字符数，其余四种分别是截过、空的、不在和读不了；读不了只留错误码，因为读失败的报错信息里有路径。
+**读不到不算错。** 文件不在或读不出来，这次 attempt 少这一个文件，任务照常，不 `blocked`。journal 记一条 `sources`，读到固定来源的 attempt 一条，写明每个配置的文件各是什么结果，全部缺失也记（唯一的例外：上下文文件本身抛错时，那次连 `sources` 都没有，只有一条 `context-unavailable`）：`voice.md=1934; contract.md=clipped(8000); blank.md=empty; notes.md=missing; x.md=unreadable(EISDIR)`。读到的写字符数，其余四种分别是截过、空的、不在和读不了；读不了只留错误码，因为读失败的报错信息里有路径。
 
 **可预览。** `taskctl recall` 先打印固定来源：一行写明每个文件读成什么样，再是文件内容，和提示词里带的一样，记忆开着关着都如此；有文件不在或读不了时退出码为 1。文件挪了位置，用它在跑之前查一次。
 
