@@ -267,6 +267,8 @@ without changing task semantics.
 
 ## 9. Reviewer unavailability: preserve work and resume review only
 
+> **2026-11-25 — partly superseded by [the model-trouble design](2026-11-25-model-trouble-and-operator-control-design.md) §16.** Steps 1–3 still hold for a refused reviewer, but step 4 no longer parks a refused review: the task stays `open` with the preserved evidence, and the controller resumes the review by itself when the model window reopens. The park of steps 4–5, recovered by `retry --review-only`, remains for a reviewer that timed out and for a review refused in `modelRounds` rounds while another task was served.
+
 When every reviewer model is unavailable because of provider/quota failures:
 
 1. Do not increment worker retries or review rounds.
@@ -438,6 +440,8 @@ existing fencing rules decide that race. The batch scheduler never interleaves i
 ## 14. Resource reductions and measurement
 
 ### 14.1 Shared provider cooldown
+
+> **2026-11-25 — superseded by [the model-trouble design](2026-11-25-model-trouble-and-operator-control-design.md) §6.** A cooling model is still skipped within its window, but "the task stops with the next probe time" no longer holds: a task whose chain is fully refused or cooling is deferred (`open`, with `tasks/<id>/model-wait.json`) and offered again when the window expires, and after `modelRounds` the controller decides between the task's own problem and an outage stop. `modelCooldownMs` defaults to 60 seconds. Of "The existing per-task chain position and `chainCycles` remain" only `chainCycles` holds: the position is reset at the start of every round.
 
 Add a board-level `.taskctl/model-cooldowns.json` in the existing derived-runtime area, not in a task’s
 attempt archive. Entries contain exact model ID, observed refusal time, `retryAfter`, category and a
