@@ -37,7 +37,7 @@ npx tsx src/main.ts <子命令> [参数]
 | `tasksDir` | string | `tasks` | 任务目录（绝对或相对当前目录） |
 | `workdir` | string | 当前目录 | agent 会话的工作目录，任务的改动都发生在这里 |
 | `agent` | string | `opencode` | v0.1 仅支持 `opencode` |
-| `model` | string | — | 兜底模型（`provider/model`）；任务 frontmatter 的 `model` 优先 |
+| `model` | string | — | 兜底模型（`provider/model`）；任务 frontmatter 的 `model` 优先。未设置时，`taskctl add` 的澄清会话与 `taskctl split` 的规划器改用 `modelChain` 的链首，而不是后端默认模型；两者都由预算护栏先判定 |
 | `effort` | string | — | 兜底努力档（如 `high`）；任务 frontmatter 的 `effort` 优先 |
 | `contextThreshold` | number | `0.8` | 上下文用量比例达到该值即触发收尾交接 |
 | `retryLimit` | number | `3` | 失败尝试（失败回合 / 收尾失败 / 验收失败）上限，达到即 `blocked` |

@@ -33,6 +33,7 @@ import { resolveArtifacts } from "./artifacts.js";
 import { runSelfCheck } from "./self-check.js";
 import { runBatch } from "./batch.js";
 import { judgeRefs, policyOf, renderVerdicts, reviewerModels, workerModels, type ModelVerdict } from "./budget.js";
+import { directModel } from "./models.js";
 import { modelRoundsOf, modelWaitHold, newRunContext, readModelWait } from "./model-wait.js";
 import { outageReport, renderOutageReport } from "./stuck.js";
 import { stopRequestPath, watchQueue, type WatchEnd, type WatchOptions } from "./watch.js";
@@ -686,14 +687,16 @@ async function refreshBoardFile(tasksDir: string): Promise<void> {  const tasks 
 }
 
 /**
- * The budget guard for a session that runs on one model, the configured one
- * or else the backend's default: the clarify session of `add`, the planner
- * session of `split`. The verdicts that were not allowed; empty when the
- * session may start. An adapter that cannot list models is not guarded.
+ * The budget guard for a session that runs on one model — `model`, else the
+ * head of `modelChain`, else the backend's default: the clarify session of
+ * `add`, the planner session of `split`. The verdicts that were not allowed;
+ * empty when the session may start. An adapter that cannot list models is not
+ * guarded.
  */
 async function sessionRefusals(cfg: ResolvedConfig, adapter: AgentAdapter): Promise<ModelVerdict[]> {
   // Asked in `cfg.workdir`: the directory the session starts in, which the backend answers by.
-  const verdicts = await judgeRefs(cfg.model ? [cfg.model] : [], policyOf(cfg), adapter, undefined, cfg.workdir);
+  const judged = directModel(cfg);
+  const verdicts = await judgeRefs(judged === undefined ? [] : [judged], policyOf(cfg), adapter, undefined, cfg.workdir);
   return verdicts.filter((verdict) => !verdict.allowed);
 }
 
@@ -799,7 +802,7 @@ async function addCommand(
   const result = await adapter.prompt({
     text: prompt,
     cwd: cfg.workdir,
-    model: cfg.model,
+    model: directModel(cfg),
     effort: cfg.effort,
     title: task.title,
   });
@@ -837,7 +840,7 @@ async function addCommand(
   await writeRuntime(tasksDir, id, "classification.json", {
     lane, proposedLane: assessment.laneEscalated ? null : assessment.lane, laneEscalated: assessment.laneEscalated,
     sufficiency: assessment.sufficiency,
-    reason: assessment.reason, model: cfg.model ?? "(backend-default)", type, at: new Date().toISOString(),
+    reason: assessment.reason, model: directModel(cfg) ?? "(backend-default)", type, at: new Date().toISOString(),
   });
   if (assessment.sufficiency === "needs-information") {
     // "Insufficient" with nothing to ask is a model that broke the format, not
@@ -1055,7 +1058,7 @@ async function splitCommand(
     const result = await adapter.prompt({
       text: buildSplitPrompt({ parent, spec }),
       cwd: cfg.workdir,
-      model: cfg.model,
+      model: directModel(cfg),
       effort: cfg.effort,
       title: `split: ${parent.title}`,
     });
@@ -1066,7 +1069,7 @@ async function splitCommand(
     }
     try {
       plan = parseSplitPlan(result.text, {
-        parent, spec, board: await store.list(), model: cfg.model ?? "(backend-default)", now: new Date(),
+        parent, spec, board: await store.list(), model: directModel(cfg) ?? "(backend-default)", now: new Date(),
       });
     } catch (err) {
       if (!(err instanceof SplitError)) throw err;

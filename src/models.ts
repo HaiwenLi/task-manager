@@ -120,6 +120,11 @@ export function reviewerChain(
   return own.length > 0 ? own : taskChain(cfg, task);
 }
 
+/** The one model a session that runs on a single model uses: `model`, else the head of `modelChain`; the backend's default when neither is set. */
+export function directModel(cfg: { model?: string; modelChain?: string[] }): string | undefined {
+  return cfg.model ?? cfg.modelChain?.find((model) => model.trim().length > 0)?.trim();
+}
+
 /** Where the chain actually stands: a position recorded for a different model is stale. */
 export function chainPosition(chain: readonly string[], entry: RotationEntry | undefined): number {
   if (entry === undefined) return 0;
