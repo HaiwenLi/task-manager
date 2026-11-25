@@ -35,7 +35,7 @@ import { runBatch } from "./batch.js";
 import { judgeRefs, policyOf, renderVerdicts, reviewerModels, workerModels, type ModelVerdict } from "./budget.js";
 import { modelRoundsOf, modelWaitHold, newRunContext, readModelWait } from "./model-wait.js";
 import { outageReport, renderOutageReport } from "./stuck.js";
-import { stopRequestPath, watchQueue, type WatchOptions } from "./watch.js";
+import { stopRequestPath, watchQueue, type WatchEnd, type WatchOptions } from "./watch.js";
 import { createMempalaceBackend, runRecall, type MemoryBackend, type RecallInput, type RecallRecord } from "./memory.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
@@ -443,13 +443,17 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
 
 /** `taskctl watch` — own and drain one board until its stop request appears. */
 async function watchCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
-  const cfg = await configFor(flags);
+  // One run context for the whole command, as `run` builds one: the attempts
+  // and the controller's decision read the same evidence, so a deferral this
+  // process wrote is one this process decides.
+  const cfg = { ...(await configFor(flags)), run: newRunContext() };
   const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
   const store = deps.store ?? new TaskStore(cfg.tasksDir);
   const telemetry = await createControllerTelemetry(cfg);
   telemetry.refreshBoard();
+  let end: WatchEnd;
   try {
-    await watchQueue(cfg, createWorkerDeps({ deps, adapter, store, telemetry, log }),
+    end = await watchQueue(cfg, createWorkerDeps({ deps, adapter, store, telemetry, log }),
       {
         ...deps.watch,
         resume: flags.has("resume"),
@@ -457,6 +461,13 @@ async function watchCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
       });
   } finally {
     await telemetry.flush();
+  }
+  // The report a stop for an outage owes the operator (design §7), printed as
+  // `run` prints it. The queue wrote no stop file, so the next watch needs no
+  // `--resume`; a guard refusal changes nothing here and still returns 0.
+  if (end.reason === "outage") {
+    for (const line of renderOutageReport(await outageReport(cfg, await store.list(), end.taskId))) log(line);
+    return EXIT_OUTAGE;
   }
   return 0;
 }

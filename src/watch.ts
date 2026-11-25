@@ -4,8 +4,9 @@ import { mkdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { readyTasks, runBatch, selectAutomaticBatch } from "./batch.js";
 import { lockLive } from "./claim.js";
+import { modelWaitHolds } from "./model-wait.js";
 import { assertAcyclic, taskWorkdir } from "./scheduler.js";
-import { runTask, type WorkerConfig, type WorkerDeps } from "./worker.js";
+import { runTask, settleExhausted, type WorkerConfig, type WorkerDeps } from "./worker.js";
 import { controlDir, acquireWatchLock, heartbeatWatchLock, releaseWatchLock } from "./watch-lock.js";
 
 export const stopRequestPath = (tasksDir: string): string => join(controlDir(tasksDir), "stop.requested");
@@ -58,6 +59,9 @@ export function watchDirectory(path: string, listener: () => void): { close(): v
   return watcher;
 }
 
+/** How `watchQueue` ended: a stop request, or an outage the controller declared. */
+export type WatchEnd = { reason: "stop" } | { reason: "outage"; taskId: string };
+
 /**
  * Own and drain one board until `.taskctl/stop.requested` appears. The loop is
  * sequential on purpose: new arrivals are considered only between operations,
@@ -65,13 +69,16 @@ export function watchDirectory(path: string, listener: () => void): { close(): v
  *
  * A task the budget guard refused is left out of the candidates for a while
  * and judged again after that (see {@link scheduleOnce}), so the task behind
- * it is run instead of the refused one being offered at every wake.
+ * it is run instead of the refused one being offered at every wake. A task
+ * waiting for its next model window is left out the same way, and when the
+ * controller declares an outage the queue ends at once — the caller reports
+ * it; no stop request is written, so the next watch needs no `--resume`.
  */
 export async function watchQueue(
   cfg: WorkerConfig,
   deps: WorkerDeps,
   options: WatchOptions = {},
-): Promise<void> {
+): Promise<WatchEnd> {
   await mkdir(cfg.tasksDir, { recursive: true });
   const owner = `watch-${process.pid}:${randomUUID()}`;
   const acquired = await acquireWatchLock(cfg.tasksDir, owner, cfg.lockTtlMs);
@@ -160,7 +167,7 @@ export async function watchQueue(
     beat();
 
     for (;;) {
-      if (await stopRequested(cfg.tasksDir)) return;
+      if (await stopRequested(cfg.tasksDir)) return { reason: "stop" };
       if (ownershipError !== undefined) throw ownershipError;
       let scheduled: Awaited<ReturnType<typeof scheduleOnce>>;
       try {
@@ -177,9 +184,10 @@ export async function watchQueue(
         await waitForWake();
         continue;
       }
+      if (typeof scheduled === "object") return { reason: "outage", taskId: scheduled.outage };
       if (scheduled === "stopped") {
         if (ownershipError !== undefined) throw ownershipError;
-        return;
+        return { reason: "stop" };
       }
       if (scheduled === "worked") continue;
       await waitForWake();
@@ -205,7 +213,7 @@ async function scheduleOnce(
   /** When each task was last refused by the budget guard; the queue's own memory. */
   refusedAt: Map<string, number>,
   retryMs: number,
-): Promise<"worked" | "wait" | "stopped"> {
+): Promise<"worked" | "wait" | "stopped" | { outage: string }> {
   // A task refused lately is *cooling*: to offer it again now would only ask
   // the guard the same question and get the same answer.
   const cooling = (id: string): boolean => {
@@ -214,6 +222,10 @@ async function scheduleOnce(
   };
   const board = await deps.store.list();
   assertAcyclic(board);
+  // The deferral is a second exclusion beside the guard's: a task waiting for
+  // its next model window is not offered, and what the queue picks instead is
+  // whatever stands behind it.
+  const held = await modelWaitHolds(cfg, board.filter((task) => task.status === "open").map((task) => task.id));
   let candidate = undefined as (typeof board)[number] | undefined;
   // Before anything else, and whatever the guard says about the task: a dead
   // lock must still be taken over. But a task the guard refused is left out
@@ -244,6 +256,7 @@ async function scheduleOnce(
         // refused task out just the same, so nothing can spin.
         return result.done.length > 0 ? "worked" : "wait";
       }
+      if (result.stoppedAt !== undefined && result.outcome === "outage") return { outage: result.stoppedAt };
       // A batch that exhausted its open budget did no terminal work: wait for
       // the next event/fallback exactly like the ordinary open outcome.
       return result.done.length > 0 || (result.stoppedAt !== undefined && result.outcome !== "open")
@@ -252,7 +265,7 @@ async function scheduleOnce(
     }
     candidate = selected.length === 1
       ? board.find((task) => task.id === selected[0])
-      : readyTasks(board).find((task) => !cooling(task.id));
+      : readyTasks(board).find((task) => !cooling(task.id) && !held.has(task.id));
   }
   if (candidate === undefined) return "wait";
   // Selection has several await boundaries. Stop and heartbeat loss must be
@@ -265,5 +278,11 @@ async function scheduleOnce(
     `watch-${process.pid}-${candidate.id}`,
   );
   if (outcome === "refused") refusedAt.set(candidate.id, Date.now());
+  if (outcome === "open") {
+    // The controller's decision, taken now that nothing is in flight: watch is
+    // strictly serial, so this attempt was the only one.
+    const settled = await settleExhausted(cfg, deps, board, [candidate.id]);
+    if (settled.outage !== undefined) return { outage: settled.outage.taskId };
+  }
   return outcome === "open" || outcome === "skipped" || outcome === "refused" ? "wait" : "worked";
 }

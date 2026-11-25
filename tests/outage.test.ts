@@ -1,24 +1,32 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskStore } from "../src/task-store.js";
 import type { Task } from "../src/task-file.js";
 import { runScheduler, type SchedulerOptions } from "../src/scheduler.js";
+import { selectAutomaticBatch } from "../src/batch.js";
 import { EXIT_OUTAGE, runCli } from "../src/cli.js";
 import { resetGuardState } from "../src/budget.js";
 import type { AgentAdapter } from "../src/adapters/types.js";
 import type { TaskOutcome, WorkerConfig, WorkerDeps, WorkerEvent } from "../src/worker.js";
-import { MODEL_ROUNDS_DEFAULT, type ModelWaitRecord, type RunContext, newRunContext, writeModelWait } from "../src/model-wait.js";
+import { MODEL_ROUNDS_DEFAULT, type ModelWaitRecord, type RunContext, newRunContext, processRun, readModelWait, writeModelWait } from "../src/model-wait.js";
 import { outageReport, renderOutageReport } from "../src/stuck.js";
+import { watchLockPath } from "../src/watch-lock.js";
+import { stopRequestPath, watchQueue, type WatchFs } from "../src/watch.js";
 import { adapterOf, CATALOGUE } from "./helpers/catalogue-fixture.js";
 import { buildContinuousTask, buildTaskFile } from "./helpers/task-fixture.js";
-import { doneTaskId, markDoneTask, passAcceptance, seedTaskFile } from "./helpers/watch-fixture.js";
+import { createStopRequests, createWatchEventSeam, doneTaskId, markDoneTask, passAcceptance, seedTaskFile, workerConfigFixture } from "./helpers/watch-fixture.js";
 
 let root: string;
 let tasks: string;
 let cwd: string;
 let store: TaskStore;
+let cfg: WorkerConfig;
+let listeners: Map<string, () => void>;
+let watchFs: WatchFs;
+let stop: ReturnType<typeof createStopRequests>;
+let deps: WorkerDeps;
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "taskctl-outage-"));
@@ -31,6 +39,10 @@ beforeEach(async () => {
   await mkdir(join(cwd, "b"), { recursive: true });
   await mkdir(join(cwd, "same"), { recursive: true });
   resetGuardState();
+  cfg = workerConfigFixture({ tasksDir: tasks, workdir: cwd, lockTtlMs: 5_000, heartbeatMs: 20 });
+  ({ listeners, watchFs } = createWatchEventSeam());
+  stop = createStopRequests(tasks, listeners);
+  deps = { store, adapter: idle(), acceptance: passAcceptance };
 });
 
 afterEach(async () => {
@@ -389,5 +401,102 @@ describe("taskctl run", () => {
     expect(lines).toContain("[scheduler] 1 task(s) refused by the budget guard; no model session was started for them");
     expect(lines.filter((line) => line.startsWith("[model-outage]"))).toHaveLength(5);
     expect(await store.get("001-paid")).toMatchObject({ status: "open", retries: 0 });
+  });
+});
+
+describe("watch", () => {
+  it("a deferred task at the head of the queue does not hold the rest of the board", async () => {
+    await seedTaskFile(tasks, buildContinuousTask("001-a"), buildContinuousTask("002-b"));
+    await writeModelWait(tasks, "001-a", deferral(processRun(), { nextAt: new Date(Date.now() + 60_000).toISOString() }));
+    const offered: string[] = [];
+
+    expect(await watchQueue(cfg, deps, {
+      watchFs, fallbackMs: 1_000, debounceMs: 5,
+      runOne: async (_cfg, _deps, task) => {
+        offered.push(task.id);
+        if (task.id === "002-b") await stop.request();
+        return "done";
+      },
+    })).toEqual({ reason: "stop" });
+
+    expect(offered).toEqual(["002-b"]);
+    expect(await store.get("001-a")).toMatchObject({ status: "open" });
+  });
+
+  it("keeps the guard's own handling of a refused task beside the deferral", async () => {
+    // 001-a is refused by the guard, 002-b comes back deferred: neither is offered again at once,
+    // and 003-c behind them runs. A guard refusal leaves no deferral behind.
+    await seedTaskFile(tasks, buildTaskFile({ id: "001-a", title: "a" }), buildTaskFile({ id: "002-b", title: "b" }), buildTaskFile({ id: "003-c", title: "c" }));
+    const offered: string[] = [];
+
+    expect(await watchQueue(cfg, deps, {
+      // Longer than the fallback scan: a shorter interval re-offers the refused task at every wake.
+      watchFs, fallbackMs: 1_000, debounceMs: 5, refusedRetryMs: 10_000,
+      runOne: async (_cfg, _deps, task) => {
+        offered.push(task.id);
+        if (task.id === "002-b") await writeModelWait(tasks, "002-b", deferral(processRun(), { nextAt: new Date(Date.now() + 60_000).toISOString() }));
+        if (task.id === "003-c") await stop.request();
+        return task.id === "001-a" ? "refused" : task.id === "002-b" ? "open" : "done";
+      },
+    })).toEqual({ reason: "stop" });
+
+    expect(offered).toEqual(["001-a", "002-b", "003-c"]);
+    expect(await readModelWait(tasks, "001-a")).toBeNull();
+  });
+
+  it("exits on an outage without offering another task, releases its lock, and writes no stop request", async () => {
+    await seedTaskFile(tasks, buildTaskFile({ id: "001-a", title: "a" }), buildTaskFile({ id: "002-b", title: "b" }));
+    const offered: string[] = [];
+
+    expect(await watchQueue(cfg, deps, {
+      watchFs, fallbackMs: 1_000, debounceMs: 5,
+      runOne: async (_cfg, _deps, task) => {
+        offered.push(task.id);
+        await writeModelWait(tasks, task.id, spent(processRun()));
+        return "open";
+      },
+    })).toEqual({ reason: "outage", taskId: "001-a" });
+
+    expect(offered).toEqual(["001-a"]);
+    await expect(readFile(watchLockPath(tasks), "utf8")).rejects.toThrow("ENOENT");
+    await expect(readFile(stopRequestPath(tasks), "utf8")).rejects.toThrow("ENOENT");
+  });
+
+  it("a batch that met an outage ends the queue too", async () => {
+    await seedTaskFile(tasks, buildContinuousTask("001-a"), buildContinuousTask("002-b"));
+
+    expect(await watchQueue(cfg, deps, {
+      watchFs, fallbackMs: 1_000, debounceMs: 5,
+      runBatch: async () => ({ done: [], stoppedAt: "001-a", outcome: "outage", pending: ["002-b"] }),
+    })).toEqual({ reason: "outage", taskId: "001-a" });
+  });
+
+  it("selectAutomaticBatch leaves a deferred head out and groups what follows", async () => {
+    const board = [buildContinuousTask("001-a"), buildContinuousTask("002-b"), buildContinuousTask("003-c")];
+    await writeModelWait(tasks, "001-a", deferral(processRun(), { nextAt: new Date(Date.now() + 60_000).toISOString() }));
+
+    expect(await selectAutomaticBatch(cfg, board)).toEqual(["002-b", "003-c"]);
+  });
+});
+
+describe("taskctl watch", () => {
+  it("prints the report and exits 3 on an outage", async () => {
+    await seedTaskFile(tasks, buildContinuousTask("001-a", { model: "q/one" }));
+    const configPath = join(root, "taskctl.json");
+    await writeFile(configPath, JSON.stringify({
+      tasksDir: tasks, workdir: cwd, modelChain: ["q/one"], modelRounds: 1, lockTtlMs: 5_000, heartbeatMs: 20,
+    }), "utf8");
+    const lines: string[] = [];
+
+    const code = await runCli(["watch", "--config", configPath], {
+      adapter: refusing(), acceptance: passAcceptance,
+      watch: { watchFs, fallbackMs: 1_000, debounceMs: 5 },
+      log: (line) => { lines.push(line); }, err: (line) => { lines.push(line); },
+    });
+
+    expect(code).toBe(EXIT_OUTAGE);
+    expect(lines.filter((line) => line.startsWith("[model-outage]"))).toHaveLength(5);
+    await expect(readFile(stopRequestPath(tasks), "utf8")).rejects.toThrow("ENOENT"); // the next watch needs no --resume
+    expect(await store.get("001-a")).toMatchObject({ status: "open", retries: 0 });
   });
 });

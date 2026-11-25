@@ -1,5 +1,6 @@
 import { lockLive } from "./claim.js";
 import { draftAncestor } from "./eligibility.js";
+import { modelWaitHolds } from "./model-wait.js";
 import { definitionDigest, readAttempt } from "./runtime.js";
 import { readExecutionState, type WorkerSessionFact } from "./execution-state.js";
 import { assertAcyclic, passBudget, ready, taskWorkdir } from "./scheduler.js";
@@ -136,14 +137,19 @@ export function readyTasks(board: Task[]): Task[] {
 /**
  * Choose the contiguous eligible prefix of the ready queue. An ineligible task
  * is never skipped: watch runs that earlier task ordinarily instead of letting
- * later work jump it merely to form a cheaper batch.
+ * later work jump it merely to form a cheaper batch. A task waiting for its
+ * next model window is not "ineligible" in this sense — its deferral is a
+ * second exclusion beside the guard's cooling one — but it does not hold the
+ * prefix either: it is taken out of the queue before the walk, and what
+ * follows it is selected.
  */
 export async function selectAutomaticBatch(
   cfg: WorkerConfig,
   board: Task[],
 ): Promise<string[]> {
   assertAcyclic(board);
-  const candidates = readyTasks(board);
+  const held = await modelWaitHolds(cfg, board.filter((task) => task.status === "open").map((task) => task.id));
+  const candidates = readyTasks(board).filter((task) => !held.has(task.id));
   const maximum = cfg.batchMaxTasks ?? 5;
   const selected: string[] = [];
   const earlier = new Set<string>();
@@ -163,7 +169,8 @@ export async function selectAutomaticBatch(
 export type BatchResult = {
   done: string[];
   stoppedAt?: string;
-  outcome?: TaskOutcome | "stop-requested";
+  /** `outage` names a stop for a model outage; the controller that ran the batch reports the decision. */
+  outcome?: TaskOutcome | "stop-requested" | "outage";
   /** Selected ids that were never claimed. */
   pending: string[];
 };
