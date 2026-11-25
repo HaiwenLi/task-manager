@@ -131,7 +131,7 @@ describe("worker model fallback", () => {
     const models: string[] = [];
     const agent = adapter({
       turns: { "w/one": rejected("w/one"), "w/two": "done" },
-      reviews: { "(default)": PASS_VERDICT },
+      reviews: { "w/two": PASS_VERDICT },
     }, models);
 
     const outcome = await run(agent, events, { modelFallbacks: ["w/two"] });
@@ -151,7 +151,7 @@ describe("worker model fallback", () => {
     const sessions: (string | undefined)[] = [];
     const agent = adapter({
       turns: { "w/one": rejected("w/one"), "w/two": "done" },
-      reviews: { "(default)": PASS_VERDICT },
+      reviews: { "w/two": PASS_VERDICT },
     }, models, sessions);
 
     expect(await run(agent, [], { modelFallbacks: ["w/two"] })).toBe("done");
@@ -184,7 +184,7 @@ describe("worker model fallback", () => {
     await run(adapter(dead, models), [], { modelFallbacks: ["w/two"], modelCooldownMs: 0 });
     await store.updateFields("a", { retries: 0 });
     await store.setStatus("a", "open");
-    const healthy = { turns: { "w/one": "done", "w/two": "done" }, reviews: { "(default)": PASS_VERDICT } } satisfies Parameters<typeof adapter>[0];
+    const healthy = { turns: { "w/one": "done", "w/two": "done" }, reviews: { "w/one": PASS_VERDICT } } satisfies Parameters<typeof adapter>[0];
     await run(adapter(healthy, models), [], { modelFallbacks: ["w/two"], modelCooldownMs: 0 });
 
     expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one", "w/two", "w/two"]);
@@ -192,6 +192,25 @@ describe("worker model fallback", () => {
 });
 
 describe("reviewer model fallback", () => {
+  it("runs the review on the worker chain when no reviewer model is configured", async () => {
+    await seed();
+    const models: string[] = [];
+    const agent = adapter({ turns: { "w/one": "done" }, reviews: { "w/one": PASS_VERDICT } }, models);
+
+    expect(await run(agent, [])).toBe("done");
+    expect(models).toEqual(["w/one", "review:w/one"]);
+  });
+
+  it("reviews on the model that took over when the worker was refused on the head", async () => {
+    await seed();
+    const models: string[] = [];
+    const agent = adapter({ turns: { "w/one": rejected("w/one"), "w/two": "done" }, reviews: { "w/two": PASS_VERDICT } }, models);
+
+    expect(await run(agent, [], { modelFallbacks: ["w/two"] })).toBe("done");
+    // w/one is cooling on the worker's own refusal, so the inherited chain is walked past it.
+    expect(models.filter((model) => model.startsWith("review:"))).toEqual(["review:w/two"]);
+  });
+
   it("resolves reviewer variants before dispatch instead of appending effort blindly", async () => {
     await seed();
     const agent = adapter({ turns: { "w/one": "done" }, reviews: { "r/one": PASS_VERDICT } });
@@ -250,7 +269,7 @@ describe("rotation is advisory", () => {
     await mkdir(join(tasks, "a"), { recursive: true });
     await writeFile(join(tasks, "a", "models.json"), "{ not json", "utf8");
     const models: string[] = [];
-    const agent = adapter({ turns: { "w/one": "done" }, reviews: { "(default)": PASS_VERDICT } }, models);
+    const agent = adapter({ turns: { "w/one": "done" }, reviews: { "w/one": PASS_VERDICT } }, models);
 
     expect(await run(agent, [], { modelFallbacks: ["w/two"] })).toBe("done");
     expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one"]);
@@ -262,7 +281,7 @@ describe("rotation is advisory", () => {
     // cache file must never turn a working task into an uncertain attempt.
     await mkdir(join(tasks, "a", "models.json"), { recursive: true });
     const models: string[] = [];
-    const agent = adapter({ turns: { "w/one": "done" }, reviews: { "(default)": PASS_VERDICT } }, models);
+    const agent = adapter({ turns: { "w/one": "done" }, reviews: { "w/one": PASS_VERDICT } }, models);
 
     expect(await run(agent, [], { modelFallbacks: ["w/two"] })).toBe("done");
     expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one"]);
@@ -290,7 +309,7 @@ describe("rotation is advisory", () => {
     // the chain no longer has in that slot.
     await writeFile(join(tasks, "a", "models.json"), JSON.stringify({ worker: { index: 1, model: "w/old" } }), "utf8");
     const models: string[] = [];
-    const agent = adapter({ turns: { "w/one": "done", "w/two": "done" }, reviews: { "(default)": PASS_VERDICT } }, models);
+    const agent = adapter({ turns: { "w/one": "done", "w/two": "done" }, reviews: { "w/one": PASS_VERDICT } }, models);
 
     expect(await run(agent, [], { modelFallbacks: ["w/two"] })).toBe("done");
     expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one"]);

@@ -277,8 +277,8 @@ export async function runTask(
   // again below, as the board holds it once the claim has been made, where a
   // refusal comes after the claim was written and releases it.
   const refused = await checkModels(cfg, deps.adapter, options.reviewOnly
-    ? { reviewer: reviewerModels(cfg) }
-    : { worker: workerModels(cfg, task), reviewer: reviewerModels(cfg) });
+    ? { reviewer: reviewerModels(cfg, task) }
+    : { worker: workerModels(cfg, task), reviewer: reviewerModels(cfg, task) });
   if (refused.length > 0) {
     reportRefusal(deps, task.id, refused);
     return "refused";
@@ -369,8 +369,8 @@ export async function runTask(
     // record and the workspace reservation, and nothing more unless the
     // execution state could not be read above.
     const refusedHere = await checkModels(r.cfg, deps.adapter, r.reviewOnly
-      ? { reviewer: reviewerModels(r.cfg) }
-      : { worker: workerModels(r.cfg, r.task), reviewer: reviewerModels(r.cfg) });
+      ? { reviewer: reviewerModels(r.cfg, r.task) }
+      : { worker: workerModels(r.cfg, r.task), reviewer: reviewerModels(r.cfg, r.task) });
     if (refusedHere.length > 0) {
       reportRefusal(deps, r.task.id, refusedHere);
       // On this path the claim's lock record was written (`claim`, above) and
@@ -595,7 +595,7 @@ async function controlled<T>(
 /** The worker's chain, the one definition of it: the task's own model (else the configured chain), then fallbacks. See `taskChain`. */
 const workerChain = (r: Run): string[] => taskChain(r.cfg, r.task);
 /** The reviewer's chain for this attempt: the one definition of it (`reviewerChain` in `./models.ts`), which the budget guard judges too. */
-const reviewerChain = (r: Run): string[] => configuredReviewerChain(r.cfg);
+const reviewerChain = (r: Run): string[] => configuredReviewerChain(r.cfg, r.task);
 
 /**
  * The model a role should use now, per the rotation recorded for this task.

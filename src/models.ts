@@ -103,13 +103,20 @@ export function taskChain(
 }
 
 /**
- * The chain the reviewer dispatches on: its own model, then its fallbacks —
- * never the task's or the worker's. One definition of it, for the worker and
- * for the budget guard. With no reviewer model the chain is empty, and the
- * reviewer runs on the backend's default.
+ * The chain the reviewer dispatches on: its own model, then its fallbacks,
+ * when one is configured — never the task's or the worker's then. With no
+ * reviewer model the chain is the worker's (`taskChain`), so a review that
+ * inherits it starts at the task's own model. Review independence is a fresh
+ * session, not a different model: the backend's default is never chosen on the
+ * reviewer's behalf. One definition of it, for the worker and for the budget
+ * guard.
  */
-export function reviewerChain(cfg: { reviewerModel?: string; reviewerModelFallbacks?: string[] }): string[] {
-  return modelChain(cfg.reviewerModel, cfg.reviewerModelFallbacks);
+export function reviewerChain(
+  cfg: { reviewerModel?: string; reviewerModelFallbacks?: string[]; model?: string; modelChain?: string[]; modelFallbacks?: string[] },
+  task: { model?: string } = {},
+): string[] {
+  const own = modelChain(cfg.reviewerModel, cfg.reviewerModelFallbacks);
+  return own.length > 0 ? own : taskChain(cfg, task);
 }
 
 /** Where the chain actually stands: a position recorded for a different model is stale. */
