@@ -397,7 +397,7 @@ taskctl metrics（新三块） / taskctl models（新） / taskctl recall（新�
 
 ## 10. 分期与触发条件
 
-**第一期（本设计，分支上实现，不合入）。**
+**第一期（本设计，分支上实现；2026-11-25 已合入 main）。**
 
 1. worker 上下文：spec、偏好、纠正。
 2. MemPalace 适配器、`recall.json`、记忆节、`taskctl recall`（`--task` 和 `--query`）。
@@ -410,7 +410,7 @@ taskctl metrics（新三块） / taskctl models（新） / taskctl recall（新�
 - 往宫殿写事实抽屉：`metrics` 显示复盘和提炼是显著的人工类别，或者累计满 10 个任务。
 - 注入 `wake-up` 项目简报：再出现一次 P25 那种"重试丢上下文"，并且 `recall.json` 的抽样支持。
 - 按质量换模型：按模型的首轮复核数据里至少有 3 个模型、10 个任务。
-- 把 handoff §3 第 2 项（升级原因不告知 worker）并进 worker 提示词：下一次改 worker 提示词时一并做，避免第三次 spec 变更。
+- 把 handoff §3 第 2 项（升级原因不告知 worker）并进 worker 提示词：下一次改 worker 提示词时一并做，避免第三次 spec 变更。**已承接（2026-11-25）**：由《模型故障与所有者控制》设计（同目录 `2026-11-25-model-trouble-and-operator-control-design.md`）的 §11 承接——原因写进 `tasks/<id>/rework.md`，提示词只加一行指向；该项不再单独做。
 - 启动时解析整条模型链并缓存（复盘 P02 的建议）：和上一条一起做。
 - triage：按 `docs/findings/README.md:77` 的条件。
 

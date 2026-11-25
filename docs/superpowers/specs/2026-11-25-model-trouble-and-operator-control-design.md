@@ -1,11 +1,15 @@
 # Model trouble and operator control — design
 
-Status: approved by the owner on 2026-11-25. Nothing in it is built yet.
+Status: approved by the owner on 2026-11-25. Nothing in it is built yet. Revised the same day, after
+the learning loop was merged (ADR-0011, ADR-0012, ADR-0013), so that it builds on the budget guard
+instead of beside it. The revision is the author's and waits for the owner's confirmation; §17 lists
+what it changed. §10 is not edited by it.
 
 Where it changes [the adaptive execution design](2026-11-24-adaptive-execution-design.md), it
-supersedes that document: §14.1 (shared provider cooldown) and §16.1 (the lane is chosen by the model
-at intake). Section 10 lists the owner's decisions; everything marked *call* is the author's and can
-be overruled.
+supersedes that document: §14.1 (shared provider cooldown), §16.1 (the lane is chosen by the model
+at intake), the refused-review half of its §9 (§16 below), and the sentence of its §17.3 that says a
+stop is never a process-tree kill (§9 below). Section 10 lists the owner's decisions; everything
+marked *call* is the author's and can be overruled.
 
 ## 1. Intent
 
@@ -102,6 +106,9 @@ Anti-goals — these would make it a failure even if everything above worked:
 - by asking a model with a probe request — refused: it spends quota and proves little;
 - by evidence the run already has — chosen: did any task get a turn accepted on any chain model
   after this task's first refusal? If so the model works and the refusal is this task's problem.
+  The evidence is what the run itself saw, kept for the life of the run (§6, step 5). It is not
+  read from the board's shared cooldown table, which holds one entry per model — the latest
+  refusal — so a refusal by any task replaces the entry that a success had cleared.
 
 **Stop.**
 
@@ -131,26 +138,36 @@ Anti-goals — these would make it a failure even if everything above worked:
 - *Call.* When neither `reviewerModel` nor `reviewerModelFallbacks` is configured, the reviewer chain
   is the worker chain. Today the reviewer then uses the backend's default model, which is not one
   the owner chose. Review independence is a fresh session, not a different model.
-- *Call.* A new optional key `modelPlan`: prefixes (a provider, or `provider/model`) that the owner's
-  subscription covers, for example `zhipuai-coding-plan/`. At the start of `run`, `watch` and `retry`,
-  every model of both chains that no prefix covers is named in one notice: "not covered by the plan;
-  may be billed per use". The notice is also journaled. With no chain configured, the notice says
-  that the backend's default model will be used.
-- The system never adds a model to a chain. A paid fallback is used when, and only when, the owner
-  has put it into the configuration himself, which is his decision; the notice above is how he is
-  told about the billing risk.
+- No plan notice and no `modelPlan` key. That part is the budget guard's (ADR-0012, `src/budget.ts`).
+  Before anything is claimed, `run`, `watch` and `retry --review-only` judge every model the attempt
+  may run on: the worker's chain of that task, the reviewer's chain, and, for a role whose chain is
+  empty, the backend's default model, which is what that role then runs on. A model that costs money
+  per token, or whose cost the backend does not report, is refused unless the owner has allowed it
+  in `taskctl.json` (`allowedModels`, `allowedProviders`, `allowPaidModels`, `maxCostPerMillion`).
+  `taskctl models` prints every verdict before anything runs, and exits 1 when one is refused. A task
+  the guard refuses is not a refusal in the sense of §6: no session started and no model was asked.
+- The system never adds a model to a chain, and never dispatches on one the guard has not allowed. A
+  paid fallback is used when, and only when, the owner has put it into the chain and allowed it in
+  the configuration himself, which is his decision (§10, decision 5). The guard is how that decision
+  is enforced, and its verdict line is how he is told that a model may be billed per use.
 
 ## 6. A refusal
 
 Definitions:
 
 - A **round** is one pass over the chain: each model is tried once, and a refusal moves to the next
-  model at once.
+  model at once. Every round starts again at the head of the chain, and rounds are one window apart
+  (`modelCooldownMs`, 60 seconds by default). Today the model a task was last dispatched on is kept
+  for it, in `tasks/<id>/models.json`, so that a rerun does not try a refused head first
+  (`resetChainCycles` in `src/models.ts`); under rounds that would leave only the tail of the chain
+  to be tried again, so the position is reset at the start of every round. Inside a window the
+  shared table keeps a model that has just refused from being tried again.
 - A refusal is what the adapter reports as a provider failure (today's `failure === "provider"`),
   whether or not the turn had already done work. *Call.* The adapter cannot tell a refusal before
   any work from a provider error after some work, and a provider error is not the task's fault
   either way: such a turn spends no retry. A turn that ran and failed for any other reason keeps
-  today's handling.
+  today's handling. A model the budget guard refused is not a refusal in this sense: no session
+  started and no model was asked (§5).
 
 Behaviour:
 
@@ -158,8 +175,10 @@ Behaviour:
 2. If a model accepts the turn, the task proceeds as today. Success clears that model's cooldown.
 3. If every model of the chain refused in the round, the attempt ends. It spends no retry and the
    task is not `blocked`. The task stays `open` and carries a **deferral** — a per-task runtime
-   record with the round count, the time of the first refusal, each model's refusal, and the
-   earliest time at which the task may be claimed again, `modelCooldownMs` from now.
+   record, `tasks/<id>/model-wait.json`, with the round count, the time of the first refusal, each
+   model's refusal, and the earliest time at which the task may be claimed again, `modelCooldownMs`
+   from now. A pass in which no model refused this task, because every model was already cooling in
+   the shared table, is not a round: the task waits for the earliest expiry and is offered again then.
 4. While a deferral's time lies in the future, the claim path refuses the task exactly as it refuses
    one whose dependency is not done. `run` and `watch` wait for the nearest such time when nothing
    else is runnable, then run another pass.
@@ -169,14 +188,49 @@ Behaviour:
      every model and what each said. Its dependents wait (today's behaviour) and the others continue.
    - **No task did.** This is an outage. The task is left as it is — `open`, retries untouched — and
      the whole `run` or `watch` stops with the report of §7.
+   - **Where the evidence comes from.** From the run, which records every turn a chain model
+     accepted while it ran. "Accepted" is what makes today's code clear a model's cooldown: a worker
+     turn that exits 0, or a reviewer turn that is not a provider refusal (`clearModelCooldown`, in
+     `loop` and in `reviewStage` of `src/worker.ts`). It is not read from the shared cooldown table.
+     That table holds one entry per model, the latest refusal, so with two refused tasks and one
+     served task it shows only refusals, and a run that read it would stop for a false outage.
+   - **When the decision is taken.** Not inside the attempt that ran out of rounds. The controller
+     takes it when no attempt is in flight: with `parallel` above one, another task's turn may be
+     running on a chain model at that moment, so the attempts still running are waited for and
+     settled before the evidence is read. A run in which another task is being served is never
+     reported as a total outage. Until then the task is shown in the stuck list (§8) as deferred,
+      waiting for the attempts in flight.
    A task with a deferral is shown in the stuck list (§8) with its round count and next time.
 - *Call.* `modelCooldownMs` defaults to 60 seconds (today 900 000) and `modelRounds` to 4. With
   four models that is four to five minutes before a task is held or a run stops.
 - The board-wide cooldown table keeps its role within a window: a model that refused is skipped by
-  every task until its entry expires or a success clears it. It no longer causes `blocked`.
+  every task until its entry expires or a success clears it. It no longer causes `blocked`, and it
+  is never read as evidence: it holds one entry per model, the latest refusal, and a later refusal
+  replaces the entry that a success had cleared (`noteModelRefusal`, `src/model-cooldown.ts`).
 - *Call.* `blockForQuota`, the path that blocks a task at once when the chain cannot move on, is
   replaced by the round logic above: a quota refusal is a refusal.
 - `chainCycles` keeps its meaning inside a round.
+- **The budget guard's refusal is kept apart.** The learning loop added a second thing called a
+  refusal: the outcome `refused`, for a task the budget guard judged before any session (ADR-0012).
+  It is not a provider refusal. It starts no round, writes no deferral, and is evidence neither for
+  an outage nor against one. Nothing of it is replaced:
+  - `run` offers such a task once, leaves it out of the rest of the run, prints the guard's line and
+    exits 1 (`runScheduler` in `src/scheduler.ts`; `runCommand` in `src/cli.ts`);
+  - `watch` keeps it out of its candidates for `REFUSED_RETRY_MS`, five minutes, in the queue's own
+    memory, and judges it again at the first wake after that (`scheduleOnce` in `src/watch.ts`);
+  - a batch stops at it (`runBatch` in `src/batch.ts`), and `taskctl models` shows the verdicts
+    before anything runs.
+  *Call.* One thing is added to it. The refusal is recorded once for the board, outside the task's
+  directory — so the guarantee that nothing is written there holds — in `.taskctl/guard-refusals.json`:
+  the task, the time and the guard's line. The stuck list reads that record (§8). The entry is
+  removed when the task is next offered and not refused, or when it leaves `open`.
+  What the deferral replaces is the other path: the functions that `block` a task because its models
+  refused or are cooling (`blockForQuota`, `blockForCooldown`) and the schedulers' treatment of the
+  task they blocked. In each scheduler a deferral is a second exclusion, beside the guard's: neither
+  counts as progress, and each is left out until its time has come. The two waits are not the same.
+  A deferral makes `run` wait and pass again, because a provider's refusal passes. A guard refusal
+  never makes `run` wait or offer the task again: waiting changes nothing, since a catalogue that was
+  read is kept for the life of the process (ADR-0012).
 
 ## 7. Stopping for an outage
 
@@ -185,12 +239,18 @@ The report, printed by `run` and `watch` before they exit:
 - each model of the chain and the provider's reason for refusing it, one line each;
 - how many rounds were tried and over how long;
 - the tasks that are waiting, all of them still runnable;
-- the decision that is the owner's: to use another model, put it into `modelChain` in `taskctl.json`
-  and run again. Models outside the plan may be billed per use.
+- the decision that is the owner's: to use another model, put it into `modelChain` in `taskctl.json`,
+  allow it — `allowedModels` when the backend's catalogue does not report it as free (ADR-0012) —
+  check it with `taskctl models`, and run again. Models outside the plan may be billed per use.
 
-*Call.* The exit code is a documented value distinct from "tasks were blocked" and from success.
-Nothing is `blocked` by an outage, so after the configuration is changed a plain `taskctl run`, or
-`taskctl watch`, resumes every waiting task without a `retry` per task.
+*Call.* `run` and `watch` exit with code 3 for this stop. The other codes stay as they are: `0` when
+the run finished, also when tasks ended `blocked` or `awaiting-human`; `1` for a runtime error, for a
+task blocked by a controller error, and for tasks the budget guard refused (ADR-0012); `2` for a usage
+error. Nothing is `blocked` by an outage, so after the configuration is changed a plain `taskctl run`,
+or `taskctl watch`, resumes every waiting task without a `retry` per task. A task the budget guard
+refused is not part of this report: it keeps the guard's own line. *Call.* When one `run` both has
+tasks the guard refused and stops for an outage, the exit code is 3: the code names why the run
+stopped, and the guard's lines are printed beside the report.
 
 ## 8. The stuck list
 
@@ -201,7 +261,11 @@ Nothing is `blocked` by an outage, so after the configuration is changed a plain
 | `blocked` | the reason (from its note or its last block event), since when, and for a model refusal every model and what it said |
 | waiting on a dependency that will not finish on its own | which task, and why that one is held |
 | deferred for a model window | round `n` of `modelRounds`, next time |
+| refused by the budget guard | the guard's line and when it was judged — as judged then; `taskctl models` shows the verdict now |
 | needs a person | `awaiting-human`, a `draft` awaiting signature, open questions |
+
+*Call.* A task the budget guard refused is read from the board's record of that refusal (§6), not by
+asking the guard, so the command still reads files only and answers at once.
 
 `taskctl status` and `taskctl board` keep their output. When the owner asks which tasks are stuck,
 the answer is this command's output.
@@ -251,10 +315,28 @@ the answer is this command's output.
   rejected and what has to change, from what the controller already holds: the acceptance output
   (bounded), the failed criteria with the reviewer's evidence and defects, a render failure, a turn
   that ended without a completion request, or the worker's own `ESCALATE:` reason.
-- The worker prompt gains one line, not the content: "The previous turn did not pass. Before you
-  start, read `<path>`: it says why, and what has to change."
+- The worker prompt gains one line, not the content. *Call.* In the prompt's own language, Chinese,
+  as the first bullet under `## 工作规则`: "- 上一回合没有通过。开始之前先读 `<path>`：里面写了原因，以及必须改什么。"
+  That is "The previous turn did not pass. Before you start, read `<path>`: it says why, and what has
+  to change." The line is one more optional input of `buildWorkerPrompt` (`src/protocol.ts`), beside
+  the five the learning loop added (ADR-0011, ADR-0013). `<path>` is the absolute path of the file,
+  given for that turn only. On a turn that is not a rework turn the line is absent and nothing is
+  left, not even a blank line, so the prompt is byte-identical to the one without it. It adds no
+  `--tasks-dir` and no brace, which `tests/protocol.test.ts` and `tests/protocol-context.test.ts`
+  pin. It sits in the head of the prompt, with the task, the spec and the work rules, which is the
+  part the 28,000-character clip keeps (ADR-0011). The sections the learning loop added do not move,
+  and no word of their fixed copy changes. The owner signs the wording with the change (below).
 - The file lives in the task directory, so a new session — after a model switch or a context wrap —
-  is pointed at it as well. The review rework note that exists today stays.
+  is pointed at it as well. The review rework note that exists today stays, and so does the
+  corrections section the learning loop added (`## 同类任务上人工给过的纠正`, ADR-0011): that one
+  carries what a person corrected on other tasks; this file carries why this task's last turn was
+  sent back.
+- *Call.* Adding the line is a change to a spec-fixed prompt. As ADR-0011 and ADR-0013 handle
+  theirs, the task that changes `src/protocol.ts` is `risk: high` and needs the owner's signature
+  before it is merged. The wording above is what is put to him for it.
+- This is the change to the worker prompt that the learning-loop design put its deferred item off
+  until (§10 of that design): telling the worker why work was sent back is closed by this section, by
+  a document rather than by prompt text, which is decision 8 in §10 here.
 
 ## 12. The lane is declared
 
@@ -282,7 +364,10 @@ the answer is this command's output.
   smoke scripts in offline mode.
 - Live, each under the owner's authorization: a real cancellation through `stop --now` and through
   Ctrl-C; a real worker reading `rework.md`; a real refusal, which no test has ever produced on the
-  real backend — an invalid model costs no quota.
+  real backend — an invalid model costs no quota. Since the budget guard, an invalid model is of
+  unknown cost: the guard refuses the task before any session starts, and the provider is never
+  asked. For this check the owner names the invalid model in `allowedModels`, or its provider in
+  `allowedProviders`, and `taskctl models` shows it allowed first (ADR-0012).
 
 ## 14. Order of work
 
@@ -295,12 +380,13 @@ Parts 2 to 4 do not depend on part 1 and may be built in any order after it.
 
 ## 15. Left to the builder
 
-- Names and locations of the deferral record and of `rework.md`, under `tasks/<id>/`, outside the
-  definition digest and outside the acceptance drift digest.
-- The exact exit codes, and how `run --batch` reports an outage.
-- How the run-level evidence of accepted turns is kept across a batch session, where several tasks
-  share one session.
-- Wording of the notices and of the outage report.
+- Where `rework.md` lives under `tasks/<id>/`, outside the definition digest and outside the
+  acceptance drift digest. The deferral record is `tasks/<id>/model-wait.json`, likewise outside
+  both.
+- How `run --batch` reports an outage. The exit codes themselves are fixed in §7.
+- Where the run keeps its record of accepted turns (§6, step 5), across a batch session, where
+  several tasks share one session. The rule the record answers is fixed; its storage is not.
+- Wording of the outage report and of the other messages the controller prints.
 - How the stuck list walks a chain of dependencies.
 - Whether the deferral survives a manual `taskctl retry` (it should: a retry is not a reason to
   hammer a model that has just refused).
@@ -318,14 +404,21 @@ controller resumes the review on the preserved evidence by itself, through today
 and its digest gate. After `modelRounds` the same evidence rule decides: if another task got a turn
 accepted, the task is parked as today, `blocked` with `review-pending.json`, for the owner;
 otherwise it is an outage stop, and the task keeps its preserved evidence for the rerun. An accepted
-reviewer turn is evidence that the model works. A reviewer that crashed or timed out is not a
-refusal and keeps today's park. This supersedes the part of §9 of the 11-24 design that leaves a
-refused review to a person's `retry --review-only`.
+reviewer turn is evidence that the model works. A reviewer that timed out is not a refusal and keeps
+today's park: the attempt settles, the journal gets `review-timed-out`, and the task is `blocked`
+with `review-pending.json`, for `retry --review-only`. A reviewer that crashed is not a refusal
+either, and keeps today's handling, which is not the park: its verdict is `unclear`, any earlier
+`review-pending.json` is removed, and the task goes to `awaiting-human` ("review could not decide").
+A timed-out reviewer whose shutdown cannot be confirmed is `uncertain`, as any turn is (§9). This
+supersedes the part of §9 of the 11-24 design that leaves a refused review to a person's
+`retry --review-only`; the park of a review that timed out is not touched.
 
-**Every model the tool can dispatch with.** The notice of §5 covers both chains and also `model`
-where it is used directly: the clarify session of `taskctl add` and the planner of `taskctl split`.
-*Call.* When `model` is unset, those two use the head of `modelChain` instead of the backend's
-default model.
+**Every model the tool can dispatch with.** The budget guard covers both chains and also `model`
+where it is used directly: the clarify session of `taskctl add` and the planner of `taskctl split`
+are judged on the one model their session runs on before it starts — `add` before it writes the task
+file, `split` before it calls the planner. `add --quick` calls no model and is not judged (ADR-0012,
+`sessionRefusals` in `src/cli.ts`). *Call.* When `model` is unset, those two use the head of
+`modelChain` instead of the backend's default model.
 
 **`stop --now` also interrupts the acceptance command** — the owner's decision, on the author's
 recommendation. The owner's acceptance gates run for tens of minutes, so a stop will often land
@@ -334,3 +427,42 @@ to become confirmable first. Today it is confirmed by the closure of its output 
 grandchild process can hold open, so a cut gate would often end `uncertain` and need reconciliation
 by hand — the anti-goal. Making it confirmable is part of this work. The render check is not a
 cancellable execution today.
+
+## 17. Revision notes (2026-11-25)
+
+The learning loop was merged after this design was approved. Its budget guard (ADR-0012) already
+does, by refusing, what §5 set out to do by a notice, and it added a second kind of refusal, which
+has to be kept apart from a provider's. The design was revised on the same day so that it builds on
+that code. The revision is the author's and waits for the owner's confirmation. §10 is not changed.
+
+What the merged code and its ADRs required:
+
+- §5: the `modelPlan` key and its notice are dropped. The budget guard refuses a model that may be
+  billed unless the owner has allowed it, before any session starts, and its verdict line is how he
+  is told.
+- §6: a refusal by the budget guard is not a refusal in the sense of this design. It starts no round
+  and is no evidence. The deferral replaces the paths that `block` a task because its models refused
+  or are cooling; nothing of the guard's is replaced.
+- §4, §6: the evidence for "every model refused" is what the run itself saw. The shared cooldown
+  table holds one entry per model, the latest refusal, so a run that read it would stop for an outage
+  while a model was serving other tasks.
+- §16: only a reviewer that timed out keeps today's park. One that crashed goes to `awaiting-human`,
+  as today.
+- §7, §13, §16: the guard's allow-list is part of what the owner decides after an outage; a live
+  refusal check has to pass the guard first; the clarify and planner sessions are judged by the
+  guard and not by a notice.
+- §11: the prompt line is placed where the prompt is built now, and changing the prompt is
+  `risk: high` and signed by the owner before it is merged, as ADR-0011 and ADR-0013 handle theirs.
+
+What the author decided while revising. Each is a *call*:
+
+1. Every round starts again at the head of the chain, so that each round tries the whole chain.
+2. The evidence counts a turn that was accepted after the task's first refusal, as §4, §6 and §16
+   already said, and not one accepted earlier in the run: an acceptance an hour old must not hide an
+   outage that began since.
+3. When one `run` has tasks the guard refused and also stops for an outage, the exit code is 3.
+4. A task the guard refused is in the stuck list, read from a record rather than by asking the guard.
+5. The prompt line is Chinese, like every fixed line of the prompt.
+6. A pass in which no model refused the task, because every model was already cooling, is not a
+   round.
+7. §11 closes the item the learning-loop design put off, and that design says so.
