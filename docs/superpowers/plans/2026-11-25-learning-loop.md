@@ -1467,7 +1467,7 @@ Observed on `1fb5814` plus the 28 commits, with the temp directory set to one th
 - `npm run typecheck`: ten errors, all on the test side and all in three files this branch added. `main` began type-checking `tests/` in `72829d8`, after this branch had been built. They are corrected in `0cd9e91`, and the gate then exited 0; that also closes the gap "Tests are not type-checked" this section used to list. No assertion changed, nothing in `src/` did, and `tests/protocol.test.ts` is still untouched by this branch.
 - `npx tsc --noEmit`: exit code 0, `TypeScript: No errors found`.
 - `git merge-base --is-ancestor` says of both the old base and the old tip of this branch that neither is an ancestor of it: exit code 1. The old tip of `main` as the other machine knew it was never fetched by this clone, so it is not in its object database (exit code 128); the two commits named first stand in for it.
-- The branch's whole tree holds no `<workspace>` path (the path the rewrite took out), no home-directory path of the machine the branch was built on, and no credential: the three `sk-` and `Bearer` strings in it are the fixtures' own fakes.
+- The branch's whole tree holds no path from either machine: not the checkout paths the rewrite took out of the old file versions, and no home-directory path of the machine the branch was built on. The three `sk-` and `Bearer` strings in it are the fixtures' own fakes.
 
 ### Existing tests whose setup changed
 
