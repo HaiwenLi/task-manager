@@ -81,22 +81,24 @@ describe("model selection beside the shared cooldown", () => {
     expect(await readRuntime(tasks, "a", "acceptance.json")).toMatchObject({ model: "q/three" });
   });
 
+  /** The board changes between two of the round's turns: a refusal on q/two, a success on q/one. */
+  class BetweenTurnsStore extends TaskStore {
+    changed = false;
+    async readDoneMarker(id: string): Promise<boolean> {
+      if (!this.changed) {
+        this.changed = true;
+        await noteModelRefusal(tasks, "q/two", { reason: "rate limited", cooldownMs: 900_000 });
+        await clearModelCooldown(tasks, "q/one");
+      }
+      return super.readDoneMarker(id);
+    }
+  }
+
   it("wraps to a model the round refused earlier only when nothing from its position is available", async () => {
     // The round is refused on q/one and moves to q/two. Between two of its turns
     // another task is refused on q/two, and a third one succeeds on q/one: the
     // walk wraps around to q/one. The controller reads the done marker once
     // after every turn that exited 0, which is where the board changes here.
-    class BetweenTurnsStore extends TaskStore {
-      changed = false;
-      async readDoneMarker(id: string): Promise<boolean> {
-        if (!this.changed) {
-          this.changed = true;
-          await noteModelRefusal(tasks, "q/two", { reason: "rate limited", cooldownMs: 900_000 });
-          await clearModelCooldown(tasks, "q/one");
-        }
-        return super.readDoneMarker(id);
-      }
-    }
     const seen: string[] = [];
     let turns = 0;
     const adapter: AgentAdapter = {
@@ -117,17 +119,6 @@ describe("model selection beside the shared cooldown", () => {
   it("skips forward past a cooling model before it wraps around", async () => {
     // The same board change, in a chain with a model after the position: that
     // one is taken before the walk goes around to q/one.
-    class BetweenTurnsStore extends TaskStore {
-      changed = false;
-      async readDoneMarker(id: string): Promise<boolean> {
-        if (!this.changed) {
-          this.changed = true;
-          await noteModelRefusal(tasks, "q/two", { reason: "rate limited", cooldownMs: 900_000 });
-          await clearModelCooldown(tasks, "q/one");
-        }
-        return super.readDoneMarker(id);
-      }
-    }
     const seen: string[] = [];
     let turns = 0;
     const adapter: AgentAdapter = {
