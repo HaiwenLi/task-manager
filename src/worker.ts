@@ -21,7 +21,7 @@ import {
 import { definitionDigest, readAttempt, readDefinitionSnapshot, readRuntime, writeDefinitionSnapshot, writeRuntime, type AttemptRecord } from "./runtime.js";
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
-import { chainPosition, readModelRotation, resetChainCycles, rotateModel, reviewerChain as configuredReviewerChain, taskChain, type Handover, type ModelRole } from "./models.js";
+import { chainPosition, readModelRotation, resetRotation, rotateModel, reviewerChain as configuredReviewerChain, taskChain, type Handover, type ModelRole } from "./models.js";
 import { checkModels, noteReported, renderVerdicts, reviewerModels, workerModels, type ModelVerdict } from "./budget.js";
 import { classifyDispatchFailure, quotaBackoffMs } from "./dispatch.js";
 import { failureFingerprint } from "./fingerprint.js";
@@ -30,7 +30,11 @@ import { collectChangeEvidence } from "./changes.js";
 import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck } from "./render.js";
 import { readExecutionState, recordEscalation, recordWorkerSession, type ExecutionState, type WorkerSessionFact } from "./execution-state.js";
 import { clearModelCooldown, modelCooldown, nextModelCooldown, noteModelRefusal } from "./model-cooldown.js";
-import { modelCooldownMsOf } from "./model-wait.js";
+import {
+  addRefusal, clearModelWait, coolingRefusals, mergeRefusals, modelCooldownMsOf, modelKey, modelRoundsOf,
+  processRun, readModelWait, refusalReason, writeModelWait, modelWaitHold,
+  type ModelRefusal, type ModelWaitRecord, type ModelWaitStage, type RunContext,
+} from "./model-wait.js";
 import { recordUsage, type UsageRole } from "./usage.js";
 
 export const TURN_TIMEOUT_MS_DEFAULT = 30 * 60_000;
@@ -89,7 +93,7 @@ export type WorkerConfig = {
    * How many times the model chain may wrap back to its head once the tail is
    * reached (default 0 = a linear chain, spent at the tail). A wrap re-probes
    * models that refused earlier — quota windows reset while the chain walks —
-   * so a task parks for a human only when the whole cycle is out of allowance.
+   * so a round ends only when the whole cycle has refused.
    */
   chainCycles?: number;
   /** Shared re-probe window for a provider/model refusal (default 60 seconds). */
@@ -100,6 +104,8 @@ export type WorkerConfig = {
    * `src/model-wait.ts`). A round is one pass over the chain.
    */
   modelRounds?: number;
+  /** The run these attempts belong to: it counts a deferral's rounds and remembers every accepted turn. */
+  run?: RunContext;
   /** How many tasks the scheduler may run at once (default 2). */
   parallel?: number;
   /** Maximum automatic watch batch size (default 5); 1 disables grouping. */
@@ -160,7 +166,7 @@ export type WorkerDeps = {
  * refused, which is what its detail holds (the guard's verdicts): the same
  * verdicts at a later offer say nothing new, other verdicts are news.
  */
-export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error" | "refused";
+export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "model-deferred" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error" | "refused";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
 /**
  * `refused`: the budget guard said no, so no model session started and no
@@ -230,8 +236,8 @@ type Run = {
    * attempt, not once per turn — every turn would only repeat the same line.
    */
   sweepSkipNoted: boolean;
-  /** Why each model on the dispatch chain refused this attempt, in order. */
-  dispatchFailures: Map<string, string>;
+  /** The run these attempts belong to: it counts a deferral's rounds and remembers every accepted turn. */
+  run: RunContext;
   /** What each dependency produced; computed once per attempt (see `dependenciesOf`). */
   dependencies?: string | null;
   /** The context sections this attempt was given; read once per attempt (see `contextOf`). */
@@ -295,7 +301,7 @@ export async function runTask(
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
   const now = new Date().toISOString();
   const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, batch: options.batch, previousSettled: false, sweepSkipNoted: false, budgetUnavailableNoted: false, heartbeatWriteFailureNoted: false,
-    dispatchFailures: new Map(),
+    run: cfg.run ?? processRun(),
     record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing", turnTimeoutMs: cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT } };
   let reservation: WorkspaceReservation | null = null;
   let reviewPending: ReviewPendingRecord | null = null;
@@ -341,6 +347,10 @@ export async function runTask(
     // claim a split child before its bundle is approved, nor a task before its
     // dependencies are done.
     if (!r.reviewOnly && current.status === "open" && waitReason(current, board) !== null) return "skipped";
+    // A deferral holds the task exactly as an unfinished dependency does, and
+    // a task whose rounds this run already spent waits for the controller's decision.
+    const hold = modelWaitHold(await readModelWait(cfg.tasksDir, task.id), r.run.id, modelRoundsOf(cfg), new Date());
+    if (hold !== null) return "skipped";
     r.task = structuredClone(current); r.definition = definitionDigest(current);
     r.executionState = await readExecutionState(cfg.tasksDir, task.id, declaredExecution(current));
     r.escalated = r.executionState.requiresReview;
@@ -658,13 +668,13 @@ async function producedModel(r: Run): Promise<string | undefined> {
  * Returns whether the work moved. A handover does not spend a retry: the
  * attempt never reached the work, and the alternative is spending the whole
  * budget on the one model that is provably unavailable. The chain is finite, so
- * this stays bounded; running out of models spends retries as before.
+ * this stays bounded; running out of models ends the round with a deferral.
  *
  * A handover that cannot be recorded is not a handover: the position is what
  * survives into the retry, and claiming success without it would send the next
  * turn straight back to the model that just refused. It reports `false`
- * instead, so the ordinary retry budget and its `blocked` outcome apply — never
- * an exception out of a task that had already settled its turn.
+ * instead, so the round ends with a deferral — never an exception out of a task
+ * that had already settled its turn.
  */
 async function fallBack(r: Run, role: ModelRole, reason: string): Promise<boolean> {
   const chain = role === "worker" ? workerChain(r) : reviewerChain(r);
@@ -877,41 +887,55 @@ async function blockForCooldown(r: Run, role: ModelRole, retryAfter: string, dis
   return "blocked";
 }
 
-/** One line saying why a model refused the turn, for the blocked note. */
-function refusalLine(model: string, result: PromptResult & { durationMs: number }): string {
-  const first = (result.text ?? "").split(/\r?\n/).map((line) => line.trim()).find((line) => line.length > 0) ?? "no output";
-  return `${model}: exit ${result.exitCode} in ${result.durationMs}ms, ${first.slice(0, 240)}`;
+/** Note one refused turn — the shared table and this round's list — and say whether it was about allowance. */
+async function noteTurnRefusal(
+  r: Run, refusals: readonly ModelRefusal[], model: string | undefined, result: PromptResult & { durationMs: number },
+): Promise<{ refusals: ModelRefusal[]; quota: boolean }> {
+  const kind = classifyDispatchFailure({ failure: result.failure, exitCode: result.exitCode,
+    durationMs: result.durationMs, tokens: result.tokens, output: result.text ?? "" });
+  await noteRefusal(r, model, result, kind === "quota" ? "quota" : "provider");
+  return {
+    refusals: addRefusal(refusals, {
+      model: modelKey(model), at: new Date().toISOString(), reason: refusalReason(result), source: "turn",
+    }),
+    quota: kind === "quota",
+  };
 }
 
 /**
- * Stop for a human when the whole chain is out of allowance.
- *
- * `blocked` rather than a retry: the task never ran, nothing about it failed, and
- * spending its retry budget would only convert a provider's billing window into
- * a task verdict. The note names every model that refused, because the operator's
- * next move (add a funded model, or wait for the window) depends on which.
+ * The round ended without one model accepting: end the attempt here with a
+ * deferral. `refused` says whether this task itself was refused in the round.
+ * `earliest` is the `retryAfter` of the `ModelsCoolingError` when it was not:
+ * the earliest expiry among the chain's windows, and then the next time.
+ * The attempt never decides between the task's own problem and an outage. A
+ * task whose rounds are spent is only recorded; the controller decides once
+ * nothing is in flight (Task 5).
  */
-async function blockForQuota(r: Run, current: string, result: PromptResult & { durationMs: number }): Promise<"blocked"> {
-  r.dispatchFailures.set(current, refusalLine(current, result));
-  const tried = [...r.dispatchFailures.entries()];
+async function refusedRound(
+  r: Run, stage: ModelWaitStage, refusals: readonly ModelRefusal[], refused: boolean, earliest?: string,
+): Promise<"open"> {
+  const now = new Date();
+  const previous = await readModelWait(r.cfg.tasksDir, r.task.id);
+  // Rounds are counted within one run and one stage. A pass in which this task
+  // itself was refused is a round; one where every model was already cooling is not.
+  const earlier = previous !== null && previous.runId === r.run.id && previous.stage === stage ? previous : null;
+  const rounds = (earlier?.rounds ?? 0) + (refused ? 1 : 0);
+  const firstRefusedAt = earlier?.firstRefusedAt ?? (refused ? refusals[0]?.at ?? now.toISOString() : null);
+  const record: ModelWaitRecord = {
+    runId: r.run.id, stage, rounds, firstRefusedAt, refusals: [...refusals],
+    nextAt: refused || earliest === undefined ? new Date(now.getTime() + modelCooldownMsOf(r.cfg)).toISOString() : earliest,
+    updatedAt: now.toISOString(),
+  };
+  const said = refusals.map((refusal) => `${refusal.model}: ${refusal.reason}`).join(" | ");
   await owned(r, async () => {
-    const seq = ((await latestNote(r.cfg.tasksDir, r.task.id))?.seq ?? 0) + 1;
-    await writeNote(r.cfg.tasksDir, {
-      task: r.task.id, seq, status: "blocked:needs-owner",
-      done: `派发失败：配额耗尽，链上 ${tried.length} 个模型都拒绝执行本任务；未消耗 retries（任务本身没跑过）。`,
-      found: tried.map(([model, reason]) => `- ${reason}`).join("\n"),
-      next: "换一个有额度的模型（配置 modelChain）、等窗口重置后 taskctl retry，或由所有者决策升级到付费档/其他供应商（不要把它当作任务失败去改判据）。",
-      files: [],
-    });
-    await r.deps.store.setStatus(r.task.id, "blocked");
+    await writeModelWait(r.cfg.tasksDir, r.task.id, record);
+    await r.deps.store.setStatus(r.task.id, "open");
     await appendJournal(r.cfg.tasksDir, r.task.id, {
-      stage: "worker",
-      event: "blocked",
-      detail: `quota exhausted on every model: ${tried.map(([model]) => model).join(" -> ")}${r.cfg.chainCycles ? ` (chainCycles=${r.cfg.chainCycles} wrap(s) included)` : ""}`,
+      stage, event: "model-deferred", detail: `round ${rounds}/${modelRoundsOf(r.cfg)}; next ${record.nextAt}; ${said}`,
     });
   });
-  emit(r, "blocked", `quota exhausted on every model in the chain (${tried.map(([model]) => model).join(" -> ")}${r.cfg.chainCycles ? `, ${r.cfg.chainCycles} wrap(s)` : ""}); retries untouched — owner decision required (fund a model / wait for the window / escalate tiers by hand)`);
-  return "blocked";
+  emit(r, "model-deferred", `every model refused or cooling; round ${rounds}/${modelRoundsOf(r.cfg)}; next ${record.nextAt}; retries untouched`);
+  return "open";
 }
 
 async function restoreWorkerSession(r: Run, model: string | undefined): Promise<string | undefined> {
@@ -1081,9 +1105,9 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
   const chainCycles = r.cfg.chainCycles ?? 0;
   const maxHandovers = workerChain(r).length * (1 + chainCycles);
   let handovers = 0;
-  // A new attempt gets a fresh wrap budget: the position still points past the
-  // models that refused, but the chain may wrap around to them again.
-  await resetChainCycles(r.cfg.tasksDir, r.task.id, "worker");
+  let refusals: ModelRefusal[] = [];
+  // Every round is one pass over the chain: it starts at the head, with a fresh wrap budget.
+  await resetRotation(r.cfg.tasksDir, r.task.id, "worker");
   let restoreSession = true;
   // Dependencies are done before the claim and cannot change under it, so
   // their summary is read once for the whole attempt, not once per turn.
@@ -1107,8 +1131,11 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
     try {
       model = await modelFor(r, "worker");
     } catch (error) {
-      if (error instanceof ModelsCoolingError) return await blockForCooldown(r, "worker", error.retryAfter, turns);
-      throw error;
+      if (!(error instanceof ModelsCoolingError)) throw error;
+      // Nothing could be tried: every model is cooling on a refusal. The task
+      // waits for the earliest window; only a round in which it was refused itself counts.
+      const cooling = await coolingRefusals(r.cfg.tasksDir, workerChain(r));
+      return await refusedRound(r, "worker", mergeRefusals(refusals, cooling), refusals.length > 0, error.retryAfter);
     }
     if (restoreSession) {
       sessionId = await restoreWorkerSession(r, model);
@@ -1135,7 +1162,12 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
         }, declaredExecution(r.task));
       }
     });
-    if (result.exitCode === 0 && model !== undefined) await clearModelCooldown(r.cfg.tasksDir, model);
+    if (result.exitCode === 0) {
+      // An accepted turn is the run's evidence that this model works, and it ends any deferral.
+      r.run.accepted.set(modelKey(model), Date.now());
+      await clearModelWait(r.cfg.tasksDir, r.task.id);
+      if (model !== undefined) await clearModelCooldown(r.cfg.tasksDir, model);
+    }
     turns++;
     // The worker is allowed to report that the work is bigger than the task it
     // was given. That claim is not taken on trust for anything except the bar it
@@ -1159,34 +1191,24 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
         });
       }
       emit(r, "turn-failed", result.timedOut ? "turn timed out; shutdown confirmed" : `exit ${result.exitCode}`);
-      // Allowance refusals are classified before the retry accounting: the task
-      // never ran, so this must not cost it a retry (see blockForQuota).
-      const kind = classifyDispatchFailure({ failure: result.failure, exitCode: result.exitCode,
-        durationMs: result.durationMs, tokens: result.tokens, output: result.text ?? "" });
-      const modelName = model ?? "(default)";
-      if (result.failure === "provider") await noteRefusal(r, model, result, kind === "quota" ? "quota" : "provider");
-      if (kind === "quota") {
-        r.dispatchFailures.set(modelName, refusalLine(modelName, result));
-        emit(r, "model-fallback", `quota on ${modelName}; not spending a retry`);
+      if (result.failure === "provider") {
+        // A refusal — quota or not, before or after work — is never the task's
+        // fault: it moves to the next model, and a round with no model left to
+        // try ends the attempt without spending a retry.
+        const noted = await noteTurnRefusal(r, refusals, model, result);
+        refusals = noted.refusals;
+        if (noted.quota) emit(r, "model-fallback", `quota on ${modelKey(model)}; not spending a retry`);
         const advanced = handovers < maxHandovers
-          && await fallBack(r, "worker", `quota exhausted on ${modelName}`);
-        if (advanced) {
-          handovers++;
-          // Waiting after choosing a *different* healthy provider cools down
-          // nothing. Pause only for a same-model cyclic re-probe.
-          if (await modelFor(r, "worker") === modelName) await quotaPause(r, handovers - 1);
-          // The next model must not continue a session the refusing backend owns.
-          fresh = true;
-        } else {
-          return await blockForQuota(r, modelName, result);
-        }
+          && await fallBack(r, "worker", `${noted.quota ? "quota exhausted" : "turn rejected"} on ${modelKey(model)}`);
+        if (!advanced) return await refusedRound(r, "worker", refusals, true);
+        handovers++;
+        // Waiting after choosing a *different* healthy provider cools down
+        // nothing. Pause only for a same-model cyclic re-probe.
+        if (noted.quota && await modelFor(r, "worker") === model) await quotaPause(r, handovers - 1);
+        // The next model must not continue a session the refusing backend owns.
+        fresh = true;
       } else {
-        const handedOver = handovers < maxHandovers && result.failure === "provider"
-          && await fallBack(r, "worker", `turn rejected by ${model ?? "(default)"}`);
-        // The next model must not be asked to continue a session created by
-        // another backend. A handover is a session boundary.
-        if (handedOver) { handovers++; fresh = true; }
-        if (!handedOver && await fail(r)) return "blocked";
+        if (await fail(r)) return "blocked";
       }
     } else if (await owned(r, () => r.deps.store.readDoneMarker(r.task.id))) {
       await owned(r, () => r.deps.store.clearDoneMarker(r.task.id));
@@ -1213,11 +1235,13 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       const after = await latestNote(r.cfg.tasksDir, r.task.id);
       if (!after || after.seq <= (note?.seq ?? 0)) {
         if (wrap.failure === "provider") {
-          // The wrap-up turn never ran, so there is no text to build a note from.
+          // The wrap-up turn was refused like any other: same table entry, same round.
+          const noted = await noteTurnRefusal(r, refusals, model, wrap);
+          refusals = noted.refusals;
           const handedOver = handovers < maxHandovers
-            && await fallBack(r, "worker", `wrap-up rejected by ${model ?? "(default)"}`);
+            && await fallBack(r, "worker", `wrap-up rejected by ${modelKey(model)}`);
           if (handedOver) handovers++;
-          if (!handedOver && await fail(r)) return "blocked";
+          else return await refusedRound(r, "worker", refusals, true);
         } else {
           if (!wrap.timedOut) await owned(r, () => writeNote(r.cfg.tasksDir, fallbackNote(r.task, note?.seq ?? 0, wrap.text)));
           emit(r, "handoff", sessionId);
@@ -1612,8 +1636,8 @@ async function reviewStage(
   const chainCycles = r.cfg.chainCycles ?? 0;
   const maxHandovers = reviewerChain(r).length * (1 + chainCycles);
   let handovers = 0;
-  // A fresh review round gets a fresh wrap budget, like a fresh attempt.
-  await resetChainCycles(r.cfg.tasksDir, id, "reviewer");
+  // Every review round starts at the head of its chain, with a fresh wrap budget.
+  await resetRotation(r.cfg.tasksDir, id, "reviewer");
   for (;;) {
     let reviewerModel: string | undefined;
     try {

@@ -13,7 +13,8 @@ import type { PromptResult } from "./adapters/types.js";
  * a single day.)
  *
  * So quota refusals back off and move down the model chain without touching
- * `retries`, and a spent chain blocks with a note naming every model it tried.
+ * `retries`; a round in which the whole chain refused defers the task
+ * (`src/worker.ts`).
  */
 
 /**

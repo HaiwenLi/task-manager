@@ -6,6 +6,7 @@ import type { AgentAdapter, PromptResult } from "../src/adapters/types.js";
 import { classifyDispatchFailure, matchesQuotaHint } from "../src/dispatch.js";
 import { latestNote } from "../src/handoff.js";
 import { journalTail } from "../src/journal.js";
+import { readModelWait } from "../src/model-wait.js";
 import { configChain, readModelRotation } from "../src/models.js";
 import type { ReviewResult } from "../src/review.js";
 import { TaskStore } from "../src/task-store.js";
@@ -166,7 +167,7 @@ describe("dispatch on a quota refusal", () => {
     }
   });
 
-  it("blocks with a note naming every refused model when the chain is spent", async () => {
+  it("defers instead of blocking when the chain is spent, retries untouched", async () => {
     const events: WorkerEvent[] = [];
     const { adapter: agent, seen } = adapter({
       "q/one": quotaRefusal("Error: weekly limit reached"),
@@ -176,32 +177,30 @@ describe("dispatch on a quota refusal", () => {
 
     const outcome = await run(agent, events, { model: "q/one", modelChain: chain });
 
-    expect(outcome).toBe("blocked");
+    expect(outcome).toBe("open");
     expect(seen).toEqual(chain);
     const task = await store.get("a");
-    expect(task.status).toBe("blocked");
+    expect(task.status).toBe("open");
     // The whole point: an allowance this task cannot control costs no retries.
     expect(task.retries).toBe(0);
-    expect(events.find((event) => event.type === "blocked")?.detail).toContain("retries untouched");
-
-    const note = await latestNote(tasks, "a");
-    expect(note?.markdown).toContain("blocked:needs-owner");
-    for (const model of chain) expect(note?.markdown).toContain(model);
-    expect((await journalTail(tasks, "a", 20)).join("\n")).toContain("quota exhausted on every model: q/one -> q/two -> q/three");
+    expect(events.some((event) => event.type === "blocked")).toBe(false);
+    expect(await latestNote(tasks, "a")).toBeNull();
+    const record = await readModelWait(tasks, "a");
+    expect(record).toMatchObject({ stage: "worker", rounds: 1 });
+    expect(record?.refusals.map((refusal) => refusal.model)).toEqual(chain);
+    expect((await journalTail(tasks, "a", 20)).join("\n")).toContain("model-deferred");
   });
 
-  it("still spends a retry on a provider failure that is not about quota", async () => {
-    const events: WorkerEvent[] = [];
+  it("spends no retry on a provider failure that is not about quota", async () => {
     const { adapter: agent, seen } = adapter({
       "q/one": { sessionId: "s", exitCode: 1, text: "model overloaded", failure: "provider", tokens: 5_000 },
     });
 
-    const outcome = await run(agent, events, { model: "q/one", modelChain: ["q/one"] });
+    const outcome = await run(agent, [], { model: "q/one", modelChain: ["q/one"] });
 
-    expect(outcome).toBe("blocked");
+    expect(outcome).toBe("open");
     expect(seen).toEqual(["q/one"]);
-    expect((await store.get("a")).retries).toBe(1);
-    expect(events.find((event) => event.type === "blocked")?.detail).toContain("retry limit");
+    expect((await store.get("a")).retries).toBe(0);
     expect(await latestNote(tasks, "a")).toBeNull();
   });
 });
@@ -263,7 +262,7 @@ describe("cyclic chain (chainCycles)", () => {
     });
   });
 
-  it("parks for the owner only after the whole cycle refused, retries untouched", async () => {
+  it("defers only after the whole cycle refused, retries untouched", async () => {
     const events: WorkerEvent[] = [];
     const allDown = scripted({
       "q/one": [quotaRefusal(), quotaRefusal()],
@@ -273,21 +272,18 @@ describe("cyclic chain (chainCycles)", () => {
 
     const outcome = await run(allDown.adapter, events, { model: "q/one", modelChain: chain, chainCycles: 1 });
 
-    expect(outcome).toBe("blocked");
+    expect(outcome).toBe("open");
     expect(allDown.seen).toEqual([...chain, ...chain]);
     const task = await store.get("a");
-    expect(task.status).toBe("blocked");
+    expect(task.status).toBe("open");
     expect(task.retries).toBe(0);
-    const blocked = events.find((event) => event.type === "blocked")?.detail ?? "";
-    expect(blocked).toContain("1 wrap(s)");
-    expect(blocked).toContain("owner decision required");
-    const note = await latestNote(tasks, "a");
-    expect(note?.markdown).toContain("blocked:needs-owner");
-    expect(note?.markdown).toContain("付费档");
-    expect((await journalTail(tasks, "a", 20)).join("\n")).toContain("chainCycles=1 wrap(s) included");
+    expect(events.some((event) => event.type === "blocked")).toBe(false);
+    const record = await readModelWait(tasks, "a");
+    expect(record?.refusals.map((refusal) => refusal.model)).toEqual(chain);
+    expect(await latestNote(tasks, "a")).toBeNull();
   });
 
-  it("gives a new attempt a fresh wrap budget while keeping the position", async () => {
+  it("starts every round at the head of the chain, with a fresh wrap budget", async () => {
     const allDown = scripted({
       "q/one": [quotaRefusal(), quotaRefusal()],
       "q/two": [quotaRefusal(), quotaRefusal()],
@@ -297,18 +293,17 @@ describe("cyclic chain (chainCycles)", () => {
     await store.updateFields("a", { retries: 0 });
     await store.setStatus("a", "open");
 
-    // The rerun starts at the tail (the rotation survived, so the dead head is
-    // not retried first) and may wrap again (the budget reset with the attempt)
-    // — here the tail is still down and the head has recovered.
+    // The recovered backend answers per step, so the head is refused once and
+    // accepts after the wrap:
     const recovered = scripted({
-      "q/three": [quotaRefusal()],
-      "q/one": ["done"],
+      "q/one": [quotaRefusal(), "done"],
       "q/two": [quotaRefusal()],
+      "q/three": [quotaRefusal()],
     });
     const outcome = await run(recovered.adapter, [], { model: "q/one", modelChain: chain, chainCycles: 1, modelCooldownMs: 0 });
 
     expect(outcome).toBe("done");
-    expect(recovered.seen).toEqual(["q/three", "q/one"]);
+    expect(recovered.seen).toEqual([...chain, "q/one"]);
     expect((await store.get("a")).retries).toBe(0);
   });
 });

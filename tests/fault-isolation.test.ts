@@ -10,6 +10,7 @@ import type { Execution } from "../src/execution.js";
 import { latestNote } from "../src/handoff.js";
 import { readJournal } from "../src/journal.js";
 import { noteModelRefusal } from "../src/model-cooldown.js";
+import { readModelWait } from "../src/model-wait.js";
 import { readAttempt, readRuntime } from "../src/runtime.js";
 import { runScheduler } from "../src/scheduler.js";
 import { TaskStore } from "../src/task-store.js";
@@ -236,7 +237,7 @@ describe("records that a later decision depends on", () => {
     expect(seen[2]).toBeUndefined();
   }, 10_000);
 
-  it("does not claim a task was never dispatched when a refused turn already spent a retry", async () => {
+  it("a refused turn spends no retry and defers the task", async () => {
     await seedTaskFile(tasks, task("a"));
     const refusing: AgentAdapter = {
       ...doneAdapter({ tasksDir: tasks, sessionId: (id) => `s-${id}` }),
@@ -245,14 +246,11 @@ describe("records that a later decision depends on", () => {
 
     const outcome = await runTask({ ...cfg, retryLimit: 2 }, deps(refusing), await store.get("a"), "w1");
 
-    expect(outcome).toBe("blocked");
-    expect((await store.get("a")).retries).toBe(1);
-    const note = await latestNote(tasks, "a");
-    expect(note?.markdown).not.toContain("未派发");
-    // One turn was dispatched. The retry budget was not exhausted (1 of 2), so
-    // the note must not say it was; the retries consumed are in the task file.
-    expect(note?.markdown).toContain("已派发 1 个回合");
-    expect(note?.markdown).not.toMatch(/耗尽了重试预算/);
+    expect(outcome).toBe("open");
+    expect(await store.get("a")).toMatchObject({ status: "open", retries: 0 });
+    expect(await latestNote(tasks, "a")).toBeNull();
+    expect(await readModelWait(tasks, "a")).toMatchObject({ stage: "worker", rounds: 1 });
+    expect((await readJournal(tasks, "a")).some((line) => line.event === "model-deferred")).toBe(true);
   });
 });
 

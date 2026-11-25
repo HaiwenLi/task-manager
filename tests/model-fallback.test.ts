@@ -162,24 +162,24 @@ describe("worker model fallback", () => {
     expect((await store.get("a")).sessions).toEqual(["s-w/two"]);
   });
 
-  it("blocks once the chain is spent, keeping the last model chosen", async () => {
+  it("defers once the chain is spent, keeping the last model chosen", async () => {
     await seed();
     const models: string[] = [];
     const agent = adapter({ turns: { "w/one": rejected("w/one"), "w/two": rejected("w/two") } }, models);
 
     const outcome = await run(agent, [], { modelFallbacks: ["w/two"] });
 
-    expect(outcome).toBe("blocked");
+    expect(outcome).toBe("open");
     expect(models).toEqual(["w/one", "w/two"]);
-    expect((await store.get("a")).retries).toBe(1);
+    expect((await store.get("a")).retries).toBe(0);
     expect((await readModelRotation(tasks, "a")).worker).toEqual({ index: 1, model: "w/two" });
   });
 
-  it("keeps the rotation across attempts, so a rerun does not retry the dead model first", async () => {
+  it("starts every round at the head of the chain", async () => {
     await seed();
     const models: string[] = [];
     const dead = { turns: { "w/one": rejected("w/one"), "w/two": rejected("w/two") } };
-    // The first attempt spends the whole chain and blocks.
+    // The first attempt spends the whole chain and defers.
     // This test targets per-task rotation, not the newer board-level cooldown.
     await run(adapter(dead, models), [], { modelFallbacks: ["w/two"], modelCooldownMs: 0 });
     await store.updateFields("a", { retries: 0 });
@@ -187,7 +187,7 @@ describe("worker model fallback", () => {
     const healthy = { turns: { "w/one": "done", "w/two": "done" }, reviews: { "w/one": PASS_VERDICT } } satisfies Parameters<typeof adapter>[0];
     await run(adapter(healthy, models), [], { modelFallbacks: ["w/two"], modelCooldownMs: 0 });
 
-    expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one", "w/two", "w/two"]);
+    expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one", "w/two", "w/one"]);
   });
 });
 
@@ -287,7 +287,7 @@ describe("rotation is advisory", () => {
     expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one"]);
   });
 
-  it("blocks instead of throwing when a rotation cannot be recorded", async () => {
+  it("ends as a deferral instead of throwing when a rotation cannot be recorded", async () => {
     await seed();
     await mkdir(join(tasks, "a", "models.json"), { recursive: true });
     const models: string[] = [];
@@ -295,24 +295,25 @@ describe("rotation is advisory", () => {
       turns: { "w/one": rejected("w/one"), "w/two": rejected("w/two") },
     }, models);
 
-    // The write fails (the path is a directory). The task must end as an
-    // ordinary retry-limit block with a journal line, not as an exception out
-    // of a turn that had already settled.
-    expect(await run(agent, [], { modelFallbacks: ["w/two"] })).toBe("blocked");
+    // The write fails (the path is a directory). The attempt must end as a
+    // deferral with a journal line, not as an exception out of a turn that had
+    // already settled.
+    expect(await run(agent, [], { modelFallbacks: ["w/two"] })).toBe("open");
     expect((await journalTail(tasks, "a", 20)).join("\n")).toContain("model-fallback-failed");
   });
 
-  it("re-anchors when the recorded position belongs to a different model", async () => {
-    await seed();
-    await mkdir(join(tasks, "a"), { recursive: true });
-    // Someone changed the primary model; the old position pointed at a model
-    // the chain no longer has in that slot.
-    await writeFile(join(tasks, "a", "models.json"), JSON.stringify({ worker: { index: 1, model: "w/old" } }), "utf8");
+  it("walks a chain changed between two rounds from its new head", async () => {
+    await seed(null);
     const models: string[] = [];
-    const agent = adapter({ turns: { "w/one": "done", "w/two": "done" }, reviews: { "w/one": PASS_VERDICT } }, models);
+    // The first round is refused on both models and leaves the position on the second.
+    await run(adapter({ turns: { "w/one": rejected("w/one"), "w/two": rejected("w/two") } }, models), [], { model: "w/one", modelFallbacks: ["w/two"], modelCooldownMs: 0 });
+    expect((await readModelRotation(tasks, "a")).worker).toEqual({ index: 1, model: "w/two" });
+    // Between the rounds the owner puts another model at the head. The recorded position still names
+    // w/two, and w/two is still the second model: only the reset brings the round to the new head.
+    const agent = adapter({ turns: { "w/three": "done" }, reviews: { "w/three": PASS_VERDICT } }, models);
 
-    expect(await run(agent, [], { modelFallbacks: ["w/two"] })).toBe("done");
-    expect(models.filter((model) => !model.startsWith("review:"))).toEqual(["w/one"]);
+    expect(await run(agent, [], { model: "w/three", modelFallbacks: ["w/two"], modelCooldownMs: 0 })).toBe("done");
+    expect(models).toEqual(["w/one", "w/two", "w/three", "review:w/three"]);
   });
 
   it("ignores a fallback list when no primary model is configured", async () => {
