@@ -1000,7 +1000,12 @@ async function refusedRound(
   // itself was refused is a round; one where every model was already cooling is not.
   const earlier = previous !== null && previous.runId === r.run.id && previous.stage === stage ? previous : null;
   const rounds = (earlier?.rounds ?? 0) + (refused ? 1 : 0);
-  const firstRefusedAt = earlier?.firstRefusedAt ?? (refused ? refusals[0]?.at ?? now.toISOString() : null);
+  // The round's earliest refusal, not the first-tried model's latest one: a wrap can
+  // refuse a model twice, and `addRefusal` replaces its entry in place, so the head
+  // of the list can carry a later time than an earlier refusal of the same round.
+  const firstRefusedAt = earlier?.firstRefusedAt ?? (refused
+    ? refusals.map((entry) => entry.at).reduce((a, b) => (a < b ? a : b), refusals[0]?.at ?? now.toISOString())
+    : null);
   const record: ModelWaitRecord = {
     runId: r.run.id, stage, rounds, firstRefusedAt, refusals: [...refusals],
     nextAt: refused || earliest === undefined ? new Date(now.getTime() + modelCooldownMsOf(r.cfg)).toISOString() : earliest,

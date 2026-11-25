@@ -249,6 +249,32 @@ describe("a fully refused round", () => {
     expect(seen).toEqual([DEFAULT_MODEL_KEY]);
     expect(await readModelWait(tasks, "a")).toMatchObject({ rounds: 1, refusals: [{ model: DEFAULT_MODEL_KEY, source: "turn" }] });
   });
+
+  it("keeps the round's earliest refusal as firstRefusedAt when a wrap refuses one model twice", async () => {
+    // q/one is already cooling from another task, so the first model tried is q/two; the wrap
+    // then brings q/one in, and the round ends on q/two's second refusal — whose entry
+    // replaced its first in place (`addRefusal`). The record's first refusal is the round's
+    // earliest, not the first-tried model's latest.
+    await noteModelRefusal(tasks, "q/one", { reason: "429 from another task", cooldownMs: 60_000 });
+    const base = backend({ "q/one": refusal("Error: 503 on q/one"), "q/two": refusal("Error: 503 on q/two") });
+    const inner = base.adapter.start!.bind(base.adapter);
+    const adapter: AgentAdapter = {
+      ...base.adapter,
+      // Spacing the turns keeps the refusal timestamps distinct.
+      start: (args) => {
+        const execution = inner(args);
+        return { ...execution, result: new Promise((resolve) => setTimeout(() => resolve(execution.result), 10)) };
+      },
+    };
+
+    expect(await run(adapter, [], { model: "q/one", modelChain: ["q/one", "q/two"], modelCooldownMs: 60_000, chainCycles: 1 })).toBe("open");
+
+    expect(base.seen).toEqual(["q/two", "q/one", "q/two"]); // q/two refused twice: the wrap brought q/one in, then the round ended on q/two
+    const record = (await readModelWait(tasks, "a"))!;
+    expect(record.rounds).toBe(1);
+    const earliest = record.refusals.map((entry) => entry.at).reduce((a, b) => (a < b ? a : b));
+    expect(record.firstRefusedAt).toBe(earliest);
+  });
 });
 
 describe("after modelRounds rounds", () => {

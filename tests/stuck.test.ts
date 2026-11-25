@@ -64,6 +64,29 @@ describe("taskctl status --stuck", () => {
     expect(lines).toEqual(["001-blocked  已阻塞  retry limit reached；自 " + AT]);
   });
 
+  it("takes since when from the journal for a blocked task whose reason comes from its note", async () => {
+    // What holdForRefusal leaves: a handoff note with the why, and a journal `blocked` line with the when.
+    await seedTaskFile(tasks, buildTaskFile({ id: "001-own", status: "blocked" }));
+    await runCli(["note", "--task", "001-own", "--status", "模型拒绝：连续 4 轮被链上所有模型拒绝", "--done", "d", "--found", "f", "--next", "n", "--tasks-dir", tasks], { log: () => {}, err: () => {} });
+    await mkdir(join(tasks, "001-own"), { recursive: true });
+    await writeFile(join(tasks, "001-own", "journal.md"), `${AT}  worker  blocked  refused by every model in 4 round(s) while q/two served another task; retries untouched\n`, "utf8");
+
+    await stuck();
+
+    expect(lines).toEqual(["001-own  已阻塞  模型拒绝：连续 4 轮被链上所有模型拒绝；自 " + AT]);
+  });
+
+  it("still says 自 - for a note's reason when the journal holds no blocked line", async () => {
+    await seedTaskFile(tasks, buildTaskFile({ id: "001-own", status: "blocked" }));
+    await runCli(["note", "--task", "001-own", "--status", "等老板确认", "--done", "d", "--found", "f", "--next", "n", "--tasks-dir", tasks], { log: () => {}, err: () => {} });
+    await mkdir(join(tasks, "001-own"), { recursive: true });
+    await writeFile(join(tasks, "001-own", "journal.md"), `${AT}  worker  claimed  d:\\work\n`, "utf8");
+
+    await stuck();
+
+    expect(lines).toEqual(["001-own  已阻塞  等老板确认；自 -"]);
+  });
+
   it("for a model refusal, names every model and what it said", async () => {
     await seedTaskFile(tasks, buildTaskFile({ id: "001-own", status: "blocked" }));
     await writeModelWait(tasks, "001-own", {

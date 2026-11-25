@@ -275,6 +275,13 @@ async function noteStatus(tasksDir: string, id: string): Promise<string> {
   return note === null ? "-" : statusLineFromNote(note.markdown);
 }
 
+/** The newest journal `blocked` line that says something, or `undefined`. */
+async function newestBlockedLine(tasksDir: string, id: string) {
+  return (await readJournal(tasksDir, id))
+    .filter((entry) => entry.event === "blocked" && entry.detail.trim().length > 0)
+    .at(-1);
+}
+
 /** Why a task is `blocked`, and since when, from the newest evidence it carries. */
 async function blockedWhy(
   tasksDir: string, id: string,
@@ -285,11 +292,16 @@ async function blockedWhy(
   const note = await noteStatus(tasksDir, id);
   if (note !== "-") {
     reason = note;
-    since = "-";
+    // The note carries the why; the journal's `blocked` line carries the when —
+    // holdForRefusal writes both, so the time is there whenever the note is.
+    const line = await newestBlockedLine(tasksDir, id);
+    if (line !== undefined) {
+      since = line.at;
+    } else {
+      since = "-";
+    }
   } else {
-    const line = (await readJournal(tasksDir, id))
-      .filter((entry) => entry.event === "blocked" && entry.detail.trim().length > 0)
-      .at(-1);
+    const line = await newestBlockedLine(tasksDir, id);
     if (line !== undefined) {
       reason = line.detail;
       since = line.at;
