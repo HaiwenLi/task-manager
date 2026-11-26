@@ -36,6 +36,19 @@
 //                      retryable provider failure, not an uncertain turn
 //   FAKE_PROVIDER_RETRY   — emit a `retry` event carrying a rate-limit error
 //                      and exit non-zero: opencode's own retry loop gave up
+//   FAKE_ERROR_EVENTS — a text event, then one `error` event per record of
+//                      the JSON array, then the exit code (non-zero unless
+//                      FAKE_EXIT_CODE says otherwise): a turn that got work
+//                      out and ended with more than one error (the two hooks
+//                      below are its single-record cases)
+//   FAKE_PROVIDER_UNAVAILABLE — emit the error the real service printed for
+//                      its default model on 2026-11-26 (opencode 2.4.2) and
+//                      exit non-zero: `provider.invalid-request` with
+//                      "Upstream request failed: Model is unavailable.", a
+//                      refusal whose words no refusal list knows
+//   FAKE_ERROR_UNTYPED — emit an `error` event that no provider typed and no
+//                      refusal word marks, and exit non-zero: an ordinary
+//                      failure that still says what it was
 //   FAKE_RUN_HANG         — after the transcript, never exit: the stand-in for
 //                      an agent turn still running when the controller cancels it
 //   FAKE_INTERRUPT_FILE   — `api session.interrupt` appends the sessionID it
@@ -120,6 +133,37 @@ if (subcommand === "run") {
         type: "retry",
         attempt: 4,
         error: { type: "provider.rate-limit", message: "该模型当前访问量过大", status: 429 },
+      })}\n`,
+    );
+    process.exitCode = Number(process.env.FAKE_EXIT_CODE ?? 1);
+  } else if (process.env.FAKE_ERROR_EVENTS) {
+    // A text event first, as a turn that got some work out before it ended
+    // would print.
+    process.stdout.write(`${JSON.stringify({ sessionID: "ses_fake123", type: "text", part: { type: "text", text: "working" } })}\n`);
+    for (const error of JSON.parse(process.env.FAKE_ERROR_EVENTS)) {
+      process.stdout.write(`${JSON.stringify({ sessionID: "ses_fake123", type: "error", error })}\n`);
+    }
+    process.exitCode = Number(process.env.FAKE_EXIT_CODE ?? 1);
+  } else if (process.env.FAKE_PROVIDER_UNAVAILABLE) {
+    process.stdout.write(
+      `${JSON.stringify({
+        sessionID: "ses_fake123",
+        type: "error",
+        error: {
+          type: "provider.invalid-request",
+          message: "Upstream request failed: Model is unavailable.",
+          status: 400,
+          response: { body: '{"error":{"type":"server_error","message":"Upstream request failed: Model is unavailable."}}' },
+        },
+      })}\n`,
+    );
+    process.exitCode = Number(process.env.FAKE_EXIT_CODE ?? 1);
+  } else if (process.env.FAKE_ERROR_UNTYPED) {
+    process.stdout.write(
+      `${JSON.stringify({
+        sessionID: "ses_fake123",
+        type: "error",
+        error: { type: "UnknownError", message: "the tool stack broke" },
       })}\n`,
     );
     process.exitCode = Number(process.env.FAKE_EXIT_CODE ?? 1);
