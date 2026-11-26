@@ -80,9 +80,14 @@ export function descendantsOf(table: ProcessTable, root: number): number[] {
   return descendants;
 }
 
-/** Spawn options that keep a work process out of the controller's console group, so a Ctrl-C meant for the controller reaches the controller alone. */
+/**
+ * Spawn options that keep a work process out of the controller's console, so a Ctrl-C meant for
+ * the controller reaches the controller alone. On Windows that is a hidden console of the
+ * process's own (`windowsHide`): a detached, console-less shell there loses the output of every
+ * program it starts. Elsewhere it is a process group of its own (`detached`).
+ */
 export function insulatedSpawnOptions(platform: NodeJS.Platform = process.platform): Pick<SpawnOptions, "detached" | "windowsHide"> {
-  return { detached: true, windowsHide: platform === "win32" };
+  return platform === "win32" ? { windowsHide: true } : { detached: true };
 }
 
 /**

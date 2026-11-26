@@ -108,7 +108,7 @@ type ModelListing = {
 export class OpenCodeAdapter implements AgentAdapter {
   private readonly bin: string;
   private readonly binArgsPrefix: string[];
-  /** Spawn every child in its own process group (D6); only a controller that handles signals asks for it. */
+  /** Keep every child out of the controller's console (D6): a hidden console of its own on Windows, a process group elsewhere; only a controller that handles signals asks for it. */
   private readonly insulated: boolean;
   /**
    * The model listings behind variant/context lookups and the cost catalogue,

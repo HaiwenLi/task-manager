@@ -25,9 +25,10 @@ export type AcceptanceMode = "generate" | "check";
 
 /**
  * `trees` is the platform double a test injects; production leaves it absent.
- * `insulated` keeps the gate's shell out of the controller's console group
- * ({@link insulatedSpawnOptions}); only a controller that handles signals
- * itself asks for it, and no caller does today.
+ * `insulated` keeps the gate's shell out of the controller's console
+ * ({@link insulatedSpawnOptions}): a hidden console of its own on Windows, a
+ * process group elsewhere. Only a controller that handles signals itself asks
+ * for it.
  */
 export type AcceptanceOptions = { trees?: TreeControl; insulated?: boolean };
 

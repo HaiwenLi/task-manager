@@ -39,6 +39,8 @@ let store: TaskStore;
 let cfg: WorkerConfig;
 const fake = fileURLToPath(new URL("./adapters/fake-opencode.mjs", import.meta.url));
 const gateTree = fileURLToPath(new URL("./fixtures/gate-tree.mjs", import.meta.url));
+/** What insulation is on this platform: a hidden console of its own on Windows, a process group elsewhere. */
+const INSULATED = process.platform === "win32" ? { windowsHide: true } : { detached: true };
 beforeEach(async () => {
   cwd = await mkdtemp(join(tmpdir(), "taskctl-insulation-"));
   tasks = join(cwd, "tasks");
@@ -54,31 +56,48 @@ afterEach(async () => { await rm(cwd, { recursive: true, force: true }); });
 const mechanical = (id: string, overrides: Partial<Task> = {}): Task =>
   buildTaskFile({ id, complexity: "complex", verify: "mechanical", criteria: ["C1 ok"], acceptance: "check", ...overrides });
 
-it("insulation puts a work process in its own group on every platform", () => {
-  expect(insulatedSpawnOptions("win32")).toEqual({ detached: true, windowsHide: true });
-  expect(insulatedSpawnOptions("linux")).toEqual({ detached: true, windowsHide: false });
+it("insulation is a hidden console on Windows and a process group everywhere else", () => {
+  expect(insulatedSpawnOptions("win32")).toEqual({ windowsHide: true });
+  expect(insulatedSpawnOptions("linux")).toEqual({ detached: true });
 });
 
 it("the gate and the agent CLI are insulated only when the controller asks", async () => {
   await acceptance.startAcceptance("echo plain-gate", cwd).result;
   expect(Boolean(spawns.at(-1)?.options.detached)).toBe(process.platform !== "win32"); // today's spawn
+  expect(spawns.at(-1)?.options).not.toMatchObject(INSULATED);
 
   await acceptance.startAcceptance("echo insulated-gate", cwd, "check", { insulated: true }).result;
-  expect(spawns.at(-1)?.options).toMatchObject({ detached: true, windowsHide: process.platform === "win32" });
+  expect(spawns.at(-1)?.options).toMatchObject(INSULATED);
+  if (process.platform === "win32") expect(spawns.at(-1)?.options.detached).not.toBe(true);
 
   await new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: [fake] }).start({ text: "hi", cwd }).result;
   expect(Boolean(spawns.at(-1)?.options.detached)).toBe(process.platform !== "win32");
+  expect(spawns.at(-1)?.options).not.toMatchObject(INSULATED);
 
   await expect(new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: [fake], insulated: true }).start({ text: "hi", cwd }).result)
     .resolves.toEqual({ sessionId: "ses_fake123", exitCode: 0, text: "你好，任务完成。" });
-  expect(spawns.at(-1)?.options).toMatchObject({ detached: true, windowsHide: process.platform === "win32" });
+  expect(spawns.at(-1)?.options).toMatchObject(INSULATED);
+  if (process.platform === "win32") expect(spawns.at(-1)?.options.detached).not.toBe(true);
 
   // The control plane joins the rule (D6, D11): the guard's catalogue read and
   // session.interrupt are `api` children of the same adapter.
   await new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: [fake] }).modelCatalog!();
   expect(Boolean(spawns.at(-1)?.options.detached)).toBe(false); // today's spawn, on every platform
+  expect(spawns.at(-1)?.options).not.toMatchObject(INSULATED);
   await new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: [fake], insulated: true }).modelCatalog!();
-  expect(spawns.at(-1)?.options).toMatchObject({ detached: true, windowsHide: process.platform === "win32" });
+  expect(spawns.at(-1)?.options).toMatchObject(INSULATED);
+  if (process.platform === "win32") expect(spawns.at(-1)?.options.detached).not.toBe(true);
+});
+
+it("an insulated gate's output comes back through the pipes", async () => {
+  const execution = acceptance.startAcceptance(`"${process.execPath}" -e "console.log('insulated-gate-output')"`, cwd, "check", { insulated: true });
+  try {
+    const result = await execution.result;
+    expect(result.skipped).toBe(false);
+    if (!result.skipped) expect(result.output).toContain("insulated-gate-output");
+  } finally {
+    await execution.cancel();
+  }
 });
 
 it("a memory server is in its own group only when the caller asks", async () => {
@@ -87,7 +106,8 @@ it("a memory server is in its own group only when the caller asks", async () => 
   await callTools({ command: [process.execPath, server], timeoutMs: 10_000, env: { FAKE_MCP_MODE: "ok" } }, call);
   expect(spawns.at(-1)?.options.detached).toBeUndefined(); // today's spawn: taskctl recall keeps it
   await callTools({ command: [process.execPath, server], timeoutMs: 10_000, env: { FAKE_MCP_MODE: "ok" }, insulated: true }, call);
-  expect(spawns.at(-1)?.options.detached).toBe(true);
+  expect(spawns.at(-1)?.options).toMatchObject(INSULATED);
+  if (process.platform === "win32") expect(spawns.at(-1)?.options.detached).not.toBe(true);
 });
 
 it("an insulated gate is still cancelled as a tree", async () => {
@@ -104,7 +124,8 @@ it("the worker's gate is insulated: the controller cancels it itself", async () 
   await seedTaskFile(tasks, mechanical("a", { acceptance: "echo worker-gate" }));
   expect(await runTask(cfg, { store, adapter: { prompt: async (args) => { await markDoneTask(args.text, tasks); return { sessionId: "s", exitCode: 0, text: "done" }; }, contextUsage: async () => 0, contextLimit: async () => 100 } }, await store.get("a"), "w1")).toBe("done");
   expect(spawns.at(-1)?.file).toBe(process.platform === "win32" ? "cmd" : "sh");
-  expect(spawns.at(-1)?.options).toMatchObject({ detached: true, windowsHide: process.platform === "win32" });
+  expect(spawns.at(-1)?.options).toMatchObject(INSULATED);
+  if (process.platform === "win32") expect(spawns.at(-1)?.options.detached).not.toBe(true);
 });
 
 it("an attempt's memory server is in its own group exactly when the attempt can be stopped", async () => {
@@ -130,7 +151,8 @@ it("an attempt's memory server is in its own group exactly when the attempt can 
     expect(plain[0]?.options.detached).toBeUndefined(); // no stop source: today's spawn, as taskctl recall
     const insulated = await attempt("b", manualStopNow());
     expect(insulated).toHaveLength(1);
-    expect(insulated[0]?.options.detached).toBe(true);
+    expect(insulated[0]?.options).toMatchObject(INSULATED);
+    if (process.platform === "win32") expect(insulated[0]?.options.detached).not.toBe(true);
   } finally { delete process.env.FAKE_MCP_MODE; }
 }, 10_000);
 
@@ -145,5 +167,8 @@ it("run constructs an insulated agent CLI: every child of the adapter it builds 
   expect(lines.join("\n")).toContain("refused by the budget guard");
   const children = spawns.filter((spawn) => spawn.file === process.execPath);
   expect(children.length).toBeGreaterThan(0);
-  expect(children.every((spawn) => spawn.options.detached === true)).toBe(true);
+  for (const child of children) {
+    expect(child.options).toMatchObject(INSULATED);
+    if (process.platform === "win32") expect(child.options.detached).not.toBe(true);
+  }
 });
