@@ -40,6 +40,7 @@ afterEach(async () => {
   delete process.env.FAKE_PROVIDER_RETRY;
   delete process.env.FAKE_PROVIDER_UNAVAILABLE;
   delete process.env.FAKE_ERROR_UNTYPED;
+  delete process.env.FAKE_ERROR_EVENTS;
   delete process.env.FAKE_MODEL_LIST_FAILS_ONCE;
   delete process.env.FAKE_MODEL_LIST_EMPTY_ONCE;
   delete process.env.FAKE_MODEL_DEFAULT_FAILS_ONCE;
