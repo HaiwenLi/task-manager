@@ -403,11 +403,11 @@ watch 用文件事件（250ms 去抖）和 30 秒兜底扫描发现新任务；�
 
 在 `run` / `watch` 上按 **Ctrl-C**（SIGINT）或收到 SIGTERM 与 `stop --now` 完全相同：同样中断、同样留下两个 stop 文件（所以下一次 `watch` 需要 `--resume`），只复位 `retry --review-only` 的任务会被放回 `blocked` 并保留 `review-pending.json`（自动续跑的推迟复核是从 `open` 领取的，停止后回到 `open`，保留的证据和推迟记录都原样留着）。`stop --now` 落在批次上时中断的是批次当前任务的回合，批次随即停止，后面的任务不被领取，下一批不会续用被切断的会话。被操作员停下的 `run` / `watch` 不会判定为模型不可用：不打印那份报告，也不以 3 退出；正在等模型窗口的 `run` 收到 stop 立即结束等待。比控制器更早发出的 stop 请求对新的 `run` 不起作用；超过取消上限（8 秒）仍无法确认时——例如 opencode 服务不应答 `session.interrupt`、或进程树里有它够不着的进程——这次 attempt 记为 `uncertain`、任务 `blocked`、退出码 1，和超时后的处理一样需要人工对账，绝不会伪装成干净的停止。
 
-退出码：`run`、`watch` 和 `retry --review-only` 一样——`stop --now` 确认成功 → 0；SIGINT → 130；SIGTERM → 143；只要有一次中断未能确认 → 1（优先于前两者），并打印一行点名需要人工对账的 attempt。同一次执行里还有任务被护栏拒绝、或有任务因控制器错误而 `blocked` 时，`run` 仍退出 1（停止报告照常打印）；只有一次干净的 `stop --now`、而且没有别的要报告时才是 0。130/143 是入口进程自己的退出码：直接 `node node_modules/tsx/dist/cli.mjs src/main.ts …` 启动时 shell 显示的就是它；经 `npx` 包装启动时 shell 显示的是包装进程的退出码。第二次 Ctrl-C 不会强杀控制器，只提示 `still stopping`，整个过程有上限。`add` / `split` / `verify` / `check` / `models` / `recall` 不装信号处理，Ctrl-C 的行为和以前一样。
+退出码：`run`、`watch` 和 `retry --review-only` 一样——`stop --now` 确认成功 → 0；SIGINT → 130；SIGTERM → 143；只要有一次中断未能确认 → 1（优先于前两者），并打印一行点名需要人工对账的 attempt。同一次执行里还有任务被护栏拒绝、或有任务因控制器错误而 `blocked` 时，`run` 仍退出 1（停止报告照常打印）；只有一次干净的 `stop --now`、而且没有别的要报告时才是 0。130/143 是入口进程自己的退出码，而且普通退出会被 `npx` 原样转发：另一个终端发出的 `stop --now`、以及让进程自己收尾的 SIGTERM，shell 看到的仍是上面写的 0 / 1 / 130 / 143。唯一的例外是在控制台里按 Ctrl-C：按键也会到达 shell 与入口进程之间的包装进程（`npx`、npm 的 CLI、tsx 的 CLI），它们都不处理这个信号，shell 最终显示哪个状态码还不能断言，也尚未实测。第二次 Ctrl-C 不会强杀控制器，只提示 `still stopping`，整个过程有上限。`add` / `split` / `verify` / `check` / `models` / `recall` 不装信号处理，Ctrl-C 的行为和以前一样。
 
 渲染检查（无头浏览器）今天不是可取消的执行：`--now` 落在它身上时会打印一行 `stop-requested`，等它自己结束（每一步有 30 秒上限），然后同样不判定、任务回到 `open`。记忆召回（`memory.backend` 为 `mempalace` 时，每个 attempt 第一个回合之前的一次查询）也不是可取消的执行：同样先打印一行 `stop-requested`，等它自己结束（上限是 `memory.timeoutMs`，默认 20 秒），然后不派发任何回合、任务回到 `open`。
 
-Windows 上，取消时会用系统自带的 Windows PowerShell 列一次进程表，核对根进程之下是否还有活着的进程，再等输出管道关闭；列不出来（PowerShell 不可用）时退回到按 `taskkill` 的报告确认。父进程在取消开始前就已退出的「孤儿」进程无法归属（见 ADR-0007：不按旧 PID 杀进程），仍按 `uncertain` 处理。非 Windows 平台按进程组终止，不做进程表核对。为了让 Ctrl-C 只到达控制器，`run` / `watch` 把 `opencode run`、验收命令的 shell、`opencode api` 调用（护栏读取模型目录、遥测、取消时的 `session.interrupt`）以及记忆召回的 MCP 服务器都启动在控制器的按键到不了的地方：Windows 上各自开一个隐藏的控制台，其它平台各自一个进程组；Windows 上没有改用不带控制台的独立进程，是因为它们启动的程序会因此拿不回输出。
+Windows 上，取消时会用系统自带的 Windows PowerShell 列一次进程表，核对根进程之下是否还有活着的进程，再等输出管道关闭；列不出来（PowerShell 不可用）时，`taskkill` 的报告只顶替「后代是否都已消失」这一步，输出管道仍要关闭。父进程在取消开始前就已退出的「孤儿」进程无法归属（见 ADR-0007：不按旧 PID 杀进程），仍按 `uncertain` 处理。非 Windows 平台按进程组终止，不做进程表核对。为了让 Ctrl-C 只到达控制器，`run` / `watch` 把 `opencode run`、验收命令的 shell、`opencode api` 调用（护栏读取模型目录、遥测、取消时的 `session.interrupt`）以及记忆召回的 MCP 服务器都启动在控制器的按键到不了的地方：Windows 上各自开一个隐藏的控制台，其它平台各自一个进程组；Windows 上没有改用不带控制台的独立进程，是因为它们启动的程序会因此拿不回输出。
 
 watch 严格串行，不读 `parallel`。调度边界出错——某个已注册任务文件写坏、依赖成环、选中的任务被别的控制器先领走——不会让 watch 退出：它报出原因并等下一次事件，看板修好后自动恢复，期间 `stop` 仍然有效。
 
@@ -555,7 +555,7 @@ taskctl retry --task <id>       # 归档旧证据后重开；仅在 attempt 已 
 
 **worker 崩溃 / 不确定执行** —— 先核实原控制器、子进程树与后端会话均已停止，再检查产物。保留证据后，人工归档旧 `attempt.json` 和对应工作目录预留，再按需重开任务。不能仅按旧 PID 杀进程、删任务锁或改 `status` 后自动重跑。互斥目录 `.mutation.lock` 若因崩溃遗留也必须先确认原操作已停止，不能按时间强抢。
 
-**stop --now 之后任务仍是 blocked** —— 看 `attempt.json`：`phase` 是 `uncertain` 说明取消没能在 8 秒内确认（服务不应答、进程树里有够不着的进程），按上面的「worker 崩溃 / 不确定执行」处理；`phase` 是 `settled` 且 `reason` 是 `stopped by operator` 才是干净的中断，此时任务已是 `open`，不需要 `retry`。
+**stop --now 之后任务仍是 blocked** —— 看 `attempt.json`：`phase` 是 `uncertain` 说明取消没能在 8 秒内确认（服务不应答、进程树里有够不着的进程），按上面的「worker 崩溃 / 不确定执行」处理；`phase` 是 `settled` 且 `reason` 是 `stopped by operator` 才是干净的中断，此时任务已是 `open`，不需要 `retry`（例外：干净中断的若是 `retry --review-only` 的恢复，任务回到 `blocked`，`review-pending.json` 原样保留，仍可再用 `retry --review-only` 恢复）。
 
 人工修改共享预留注册表之前，先停止所有使用该注册表的 taskctl 控制器；仅处理已核对身份的那条预留及其本地标记，不清空其他任务的记录。当前没有自动“强制恢复”命令。缺少验收造成的普通待审则补上验收并重开任务即可，不需要清理已正常释放的预留。
 
