@@ -31,6 +31,7 @@ import { checkRender, describeFailures, RenderUnavailableError, type RenderCheck
 import { readExecutionState, recordEscalation, recordWorkerSession, type ExecutionState, type WorkerSessionFact } from "./execution-state.js";
 import { clearModelCooldown, modelCooldown, nextModelCooldown, noteModelRefusal } from "./model-cooldown.js";
 import { clearGuardRefusal, recordGuardRefusal } from "./guard-refusals.js";
+import type { StopNow } from "./stop.js";
 import {
   DEFAULT_MODEL_KEY, addRefusal, chainKeys, clearModelWait, coolingRefusals, formatDuration, mergeRefusals, modelCooldownMsOf, modelKey, modelRoundsOf,
   modelWaitHolds, processRun, readModelWait, refusalReason, servedSince, writeModelWait, modelWaitHold,
@@ -169,13 +170,15 @@ export type WorkerDeps = {
   /** Test seam: what answers instead of the MemPalace server; production leaves it absent. */
   memory?: MemoryBackend;
   onEvent?: (evt: WorkerEvent) => void;
+  /** The controller's interrupt source. Absent when nothing can stop this worker. */
+  stop?: StopNow;
 };
 /**
  * `refused` is reported once per process for a task and the reason it was
  * refused, which is what its detail holds (the guard's verdicts): the same
  * verdicts at a later offer say nothing new, other verdicts are news.
  */
-export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "model-deferred" | "model-wait" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error" | "refused" | "outage";
+export type WorkerEventType = "claimed" | "takeover" | "running" | "handoff" | "turn-failed" | "model-fallback" | "model-deferred" | "model-wait" | "acceptance" | "acceptance-skipped" | "reviewing" | "reviewed" | "rework" | "awaiting-human" | "done" | "blocked" | "ownership-lost" | "escalated" | "controller-error" | "refused" | "outage" | "stopped" | "stop-unconfirmed" | "stop-requested";
 export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: string };
 /**
  * `refused`: the budget guard said no, so no model session started and no
@@ -190,8 +193,12 @@ export type WorkerEvent = { type: WorkerEventType; taskId: string; detail?: stri
  * the board then holds it: the claim's lock record and the reservation were
  * written and are released again — and the `execution-state-invalid` line
  * stays, on the rare task whose execution state could not be read.
+ *
+ * `stopped`: the attempt was interrupted by the operator, nothing was judged,
+ * the task can run again at once. It never meets `refused`: a refusal comes
+ * before anything there is to interrupt, whatever the stop.
  */
-export type TaskOutcome = "done" | "blocked" | "skipped" | "open" | "awaiting-human" | "refused";
+export type TaskOutcome = "done" | "blocked" | "skipped" | "open" | "awaiting-human" | "refused" | "stopped";
 export type RunTaskOptions = {
   reviewOnly?: boolean;
   /** Batch-only input; ordinary runs keep the task-local restore behavior. */
@@ -225,6 +232,14 @@ class ReviewRequiredError extends Error {}
 class ModelsCoolingError extends Error {
   constructor(readonly retryAfter: string) { super(`every model is cooling until at least ${retryAfter}`); }
 }
+/** The operator's stop was observed. `inFlight` says whether something was running under the attempt when it was. */
+class OperatorStoppedError extends Error {
+  constructor(readonly label: string, readonly inFlight: boolean) { super(`stopped by the operator ${inFlight ? "during" : "after"} ${label}`); }
+}
+/** A stop whose cancellation could not be confirmed: as uncertain as any other unconfirmed shutdown. */
+class UnconfirmedStopError extends UncertainExecutionError {}
+/** Sentinel the stop race resolves with; carries nothing. */
+class StopObserved {}
 
 type Run = {
   cfg: WorkerConfig; deps: WorkerDeps; task: Task; owner: string;
@@ -397,6 +412,9 @@ export async function runTask(
 ): Promise<TaskOutcome> {
   // Even callers reusing a worker label get a distinct fencing generation.
   const owner = `${workerId}:${randomUUID()}`;
+  // Once an interrupt is pending nothing is started for the task, the guard's
+  // read of the catalogue included (D11).
+  if (deps.stop !== undefined && (deps.stop.isRequested() || await deps.stop.check())) return "skipped";
   // The budget guard, before anything is claimed: every model this attempt
   // may run on is judged first, and a refusal here leaves the task `open`,
   // with nothing written into its directory and no session started. A
@@ -411,6 +429,9 @@ export async function runTask(
     await reportRefusal(cfg.tasksDir, deps, task.id, refused);
     return "refused";
   }
+  // An interrupt that arrived while the guard judged is seen here, and nothing
+  // is claimed.
+  if (deps.stop !== undefined && (deps.stop.isRequested() || await deps.stop.check())) return "skipped";
   if (!await claim(cfg.tasksDir, task.id, owner, cfg.lockTtlMs)) return "skipped";
   let notifyLost!: () => void;
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
@@ -419,6 +440,7 @@ export async function runTask(
     run: cfg.run ?? processRun(),
     record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing", turnTimeoutMs: cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT } };
   let reservation: WorkspaceReservation | null = null;
+  let releaseStop: (() => void) | undefined;
   let reviewPending: ReviewPendingRecord | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let renewal: Promise<void> | undefined;
@@ -534,6 +556,8 @@ export async function runTask(
       await deps.store.setStatus(task.id, "running");
       await appendJournal(cfg.tasksDir, task.id, { stage: "worker", event: "claimed", detail: reservation?.cwd ?? cfg.workdir });
     });
+    // While the attempt runs, this controller watches the board for an interrupt.
+    releaseStop = deps.stop?.hold();
     tick(); emit(r, "running");
     const outcome = r.reviewOnly ? await resumeReviewOnly(r, reviewPending!) : await loop(r);
     // The entire run stays active between operations, including telemetry/handoffs.
@@ -543,6 +567,18 @@ export async function runTask(
     if (err instanceof OwnershipLostError || r.lost) {
       emit(r, "ownership-lost", "ownership generation changed; execution reconciles before replay");
       return "skipped";
+    }
+    if (err instanceof UnconfirmedStopError) {
+      await checkpoint(r, "uncertain", r.record.operation, err.message);
+      await owned(r, () => appendJournal(cfg.tasksDir, task.id, {
+        stage: "worker", event: "stop-unconfirmed",
+        detail: `${r.record.operation}; cancellation not confirmed; attempt uncertain; reconcile before retry`,
+      })).catch(() => {});
+      emit(r, "stop-unconfirmed", `${r.record.operation}; cancellation unconfirmed; attempt uncertain; reconcile before retry`);
+      return await block(r, err.message);
+    }
+    if (err instanceof OperatorStoppedError) {
+      return await stopAttempt(r, err.label, err.inFlight);
     }
     if (err instanceof UncertainExecutionError) {
       await checkpoint(r, "uncertain", r.record.operation, err.message);
@@ -568,6 +604,7 @@ export async function runTask(
       throw err;
     }
   } finally {
+    releaseStop?.();
     stopping = true; if (timer) clearTimeout(timer); await renewal;
     if (reservation && r.record.phase === "settled") await reservation.release();
     // An uncertain reservation/record survives even though the task lock is released.
@@ -585,6 +622,50 @@ async function checkpoint(r: Run, phase: AttemptRecord["phase"], operation: stri
 async function block(r: Run, reason: string): Promise<"blocked"> {
   await owned(r, () => r.deps.store.setStatus(r.task.id, "blocked"));
   emit(r, "blocked", reason); return "blocked";
+}
+
+/**
+ * Settle an attempt the operator stopped: nothing was judged, no retry is
+ * spent, and the task can run again at once. The session a cut turn ran on is
+ * marked dirty (D9), a completion request from the cut turn is cleared, and
+ * what the turn had already written stays where it wrote it.
+ */
+async function stopAttempt(r: Run, label: string, inFlight: boolean): Promise<"stopped"> {
+  // Settled first: a crash after this line leaves the ordinary "settled,
+  // status still running" case, which a takeover handles.
+  await checkpoint(r, "settled", label, "stopped by operator");
+  // The status the attempt was claimed from (`r.task` is the copy taken before
+  // the claim set the task `running`): `blocked` only for an explicit
+  // `retry --review-only` recovery, `open` for everything else (D3).
+  const back = r.task.status === "blocked" ? "blocked" : "open";
+  await owned(r, async () => {
+    // The session the attempt recorded is the one that was cut (the stop branch
+    // in `controlled` copies the live execution's session id into `r.record`
+    // first); the model it ran on is kept. `r.record.sessionId` can in one case
+    // name the attempt's previous session: a fresh session whose id the backend
+    // had not announced yet when it was cut. Dirtying that one is the
+    // conservative direction — it had already been left behind by a handoff,
+    // and the session that was cut must not be resumed either.
+    if (label === "agent turn" && inFlight && r.record.sessionId !== undefined) {
+      const model = r.executionState?.latestWorker?.model;
+      r.executionState = await recordWorkerSession(r.cfg.tasksDir, r.task.id, {
+        sessionId: r.record.sessionId, clean: false, ...(model === undefined ? {} : { model }),
+      }, declaredExecution(r.task));
+    }
+    await r.deps.store.clearDoneMarker(r.task.id);
+    await r.deps.store.setStatus(r.task.id, back);
+    await appendJournal(r.cfg.tasksDir, r.task.id, {
+      stage: "worker", event: "stopped",
+      detail: `operator stop ${inFlight ? "during" : "after"} ${label}; ${inFlight ? "cancellation confirmed; " : "nothing was interrupted; "}task returned to ${back}; retries untouched`,
+    });
+  });
+  emit(r, "stopped", `${label}; ${inFlight ? "cancellation confirmed" : "nothing was interrupted"}; task returned to ${back}; retries untouched`);
+  return "stopped";
+}
+
+/** Nothing new is dispatched once a stop was observed: the next step settles the attempt instead. */
+function assertNotStopped(r: Run): void {
+  if (r.deps.stop?.isRequested()) throw new OperatorStoppedError(r.record.operation, false);
 }
 async function fail(r: Run): Promise<boolean> {
   return owned(r, async () => {
@@ -618,7 +699,23 @@ async function escalate(r: Run, reason: string): Promise<void> {
 function legacyExecution<T>(fn: () => Promise<T>): Execution<T> {
   let state: "running" | "exited" = "running";
   const result = Promise.resolve().then(fn).finally(() => { state = "exited"; });
-  return { result, inspect: () => ({ state }), cancel: async () => false };
+  return { result, inspect: () => ({ state }), cancel: async () => false, interruptible: false };
+}
+
+/**
+ * Cancel an execution and wait for its exit, bounded by the cancel deadline.
+ * `true` only when the execution itself reports that it has exited: an end
+ * nobody can confirm is `false`.
+ */
+async function confirmedCancel(execution: Execution<unknown>): Promise<boolean> {
+  let stopTimer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  try {
+    stopped = await Promise.race([execution.cancel(), new Promise<false>(resolve => { stopTimer = setTimeout(() => resolve(false), CANCEL_DEADLINE_MS); })]);
+    stopped = stopped && execution.inspect().state === "exited";
+  } catch { /* failed cancellation is uncertain */ }
+  finally { if (stopTimer) clearTimeout(stopTimer); }
+  return stopped;
 }
 
 /**
@@ -651,6 +748,8 @@ async function controlled<T>(
   start: () => Execution<T>,
   acceptSettled?: (value: T) => boolean,
 ): Promise<T> {
+  // Nothing new is dispatched after a stop: the attempt settles instead.
+  assertNotStopped(r);
   // `false` is the lock no longer being ours. A throw is the write that follows
   // a successful check: it says nothing about ownership, and the guarded
   // dispatch below checks that again for itself.
@@ -676,6 +775,12 @@ async function controlled<T>(
       if (observedSessionId !== undefined) r.record.sessionId = observedSessionId;
       await writeRuntime(r.cfg.tasksDir, r.task.id, "attempt.json", r.record);
     });
+    // A cooperative execution is never raced against the stop: it finishes on
+    // its own, and the next `controlled` throws. Only an interruptible one
+    // watches the source.
+    const stopRace = execution!.interruptible === false || r.deps.stop === undefined
+      ? new Promise<never>(() => {})
+      : r.deps.stop.observed.then(() => new StopObserved());
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new WorkerTimeoutError(`${label} timed out after ${ms}ms`)), ms);
     });
@@ -692,7 +797,17 @@ async function controlled<T>(
       },
       (error) => { throw error; },
     );
-    const value = await Promise.race([tracked, timeout, lost]);
+    const value = await Promise.race([tracked, timeout, lost, stopRace]);
+    if (value instanceof StopObserved) {
+      // It ended by itself in the same tick: nothing is running and nothing has to be cancelled.
+      if (execution!.inspect().state === "exited") throw new OperatorStoppedError(label, false);
+      const sessionId = execution!.inspect().sessionId;
+      if (sessionId !== undefined) r.record.sessionId = sessionId;
+      const stopped = await confirmedCancel(execution!);
+      if (r.lost) throw new OwnershipLostError();
+      if (!stopped) throw new UnconfirmedStopError(`${label}: stopped by the operator, but its end could not be confirmed; automatic retry prohibited`);
+      throw new OperatorStoppedError(label, true);
+    }
     if (settled && acceptSettled?.(value) === true) return value;
     if (execution!.inspect().state !== "exited") throw new UncertainExecutionError(`${label}: execution termination is uncertain`);
     return value;
@@ -700,19 +815,17 @@ async function controlled<T>(
     if (!execution) throw err;
     const observedSessionId = execution.inspect().sessionId;
       if (observedSessionId !== undefined) r.record.sessionId = observedSessionId;
+    // The stop branch already cancelled: rethrow, or this catch would run its
+    // bounded cancel a second time and replace the error with a fresh
+    // UncertainExecutionError, so `runTask`'s stop branch is never reached.
+    if (err instanceof UnconfirmedStopError) throw err;
     if (!(err instanceof WorkerTimeoutError) && !(err instanceof OwnershipLostError) && !r.lost && execution.inspect().state === "exited") throw err;
     // Never wait indefinitely for a broken cancellation implementation. The
     // bound fits a real one: the backend stop (4s cap) runs beside the tree
     // kill (1.5s cap) and the exit confirmation (0.5s cap). It was 2s until
     // 2026-11-23, which left no room for asking the service to stop its
     // session - so every timed-out turn was "unconfirmed" and parked the task.
-    let stopTimer: ReturnType<typeof setTimeout> | undefined;
-    let stopped = false;
-    try {
-      stopped = await Promise.race([execution.cancel(), new Promise<false>(resolve => { stopTimer = setTimeout(() => resolve(false), CANCEL_DEADLINE_MS); })]);
-      stopped = stopped && execution.inspect().state === "exited";
-    } catch { /* failed cancellation is uncertain */ }
-    finally { if (stopTimer) clearTimeout(stopTimer); }
+    const stopped = await confirmedCancel(execution);
     if (err instanceof OwnershipLostError || r.lost) throw new OwnershipLostError();
     if (!stopped) {
       // The turn's own last words (stderr included) are the only evidence of
