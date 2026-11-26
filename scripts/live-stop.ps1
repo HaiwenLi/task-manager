@@ -5,6 +5,11 @@
 #   .\scripts\live-stop.ps1 -Live      # 17 项断言；通过时打印 LIVE STOP PASS（约 4 个 worker 回合）
 #
 # 退出码：0 全部断言通过；1 有断言失败；2 环境不满足（找不到 opencode、node 或 tsx）。
+#
+# 收尾（finally）：仍在跑的 watch 会被先优雅地停掉——那会在故意保留下来供查看的临时项目里
+# 留下 `.taskctl\stop.requested` 与 `.taskctl\stop-now.requested`（用 taskctl status 看即可，
+# 不必手工删）；随后脚本会结束整台机器上命令行带本项目两个工作进程标记
+# （`setTimeout(()=>{},30000)` 与 `gate.go`）的每一个 node.exe，所以在共用机器上跑之前要知道这一点。
 param(
   [switch]$Live,
   [string]$OpencodeExe = "",
@@ -19,7 +24,9 @@ if (-not $OpencodeExe) {
   if (Test-Path $candidate) { $OpencodeExe = $candidate }
 }
 if (-not (Test-Path $OpencodeExe)) {
-  Write-Error "找不到 opencode 可执行文件（.cmd shim 不能被 shell:false 启动）。用 -OpencodeExe 指定真实 exe。"
+  # 用 [Console]::Error 而不是 Write-Error：$ErrorActionPreference = "Stop" 下 Write-Error 是终止错误，
+  # pwsh 会以 1 退出，下一行的 exit 2（"环境不满足"）永远走不到。
+  [Console]::Error.WriteLine("找不到 opencode 可执行文件（.cmd shim 不能被 shell:false 启动）。用 -OpencodeExe 指定真实 exe。")
   exit 2
 }
 $opencodeName = Split-Path -Leaf $OpencodeExe
@@ -33,20 +40,26 @@ New-Item -ItemType Directory -Force -Path $tasks, $workdir, $bin | Out-Null
 # agent 要在自己的回合里调用 taskctl done，所以 PATH 上必须能找到一个 shim
 $tsx = Join-Path $repo "node_modules\tsx\dist\cli.mjs"
 $entry = Join-Path $repo "src\main.ts"
-if (-not (Test-Path $tsx)) { Write-Error "缺少 tsx：先在仓库里 npm ci"; exit 2 }
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Write-Error "找不到 node。"; exit 2 }
+if (-not (Test-Path $tsx)) { [Console]::Error.WriteLine("缺少 tsx：先在仓库里 npm ci"); exit 2 }
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) { [Console]::Error.WriteLine("找不到 node。"); exit 2 }
 Set-Content -Path (Join-Path $bin "taskctl.cmd") -Encoding ascii -Value "@echo off`r`nnode `"$tsx`" `"$entry`" %*`r`n"
 
 # allowedModels 是窄到不能再窄的放行：护栏 (ADR-0012) 会先判每个模型，目录不报"免费"的
 # 模型只有被点名才放行。这里点名 -Model，判定本身仍由目录回答，脚本不猜。
+# 配置里的两个时限；-Live 的等待也从它们算，免得等待和数据源自己的上限一样长。
+$turnBoundMs = 300000
+$acceptanceBoundMs = 180000
+# 行 12、13、16 等的是"回合 + 验收"这样的一整段工作：两个上限相加再加一分钟，等待总比工作活得久。
+$workBoundSeconds = [int](($turnBoundMs + $acceptanceBoundMs) / 1000) + 60
+
 @{
   tasksDir = "tasks"
   workdir = "work"
   opencodeBin = $OpencodeExe
   model = $Model
   parallel = 1
-  turnTimeoutMs = 300000
-  acceptanceTimeoutMs = 180000
+  turnTimeoutMs = $turnBoundMs
+  acceptanceTimeoutMs = $acceptanceBoundMs
   retryLimit = 1
   allowedModels = @($Model)
 } | ConvertTo-Json | Set-Content (Join-Path $root "taskctl.json") -Encoding utf8
@@ -99,13 +112,40 @@ function Read-TextFile([string]$Path) {
   return $text
 }
 
+# 一个进程连同它的整棵进程树都停掉（孙辈在前，根最后）。
+# 这里是最后手段：控制器自己的取消是正常路径。Invoke-Taskctl 的有界等待也用它——
+# 它等的是 tsx 的 node，而那只是包装进程，真正的命令（watch / models …）是它的孩子。
+function Stop-ProcessTree([int]$RootProcessId) {
+  $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId)
+  $byParent = @{}
+  foreach ($row in $all) {
+    $parentKey = [int]$row.ParentProcessId
+    if (-not $byParent.ContainsKey($parentKey)) { $byParent[$parentKey] = New-Object System.Collections.Generic.List[int] }
+    $byParent[$parentKey].Add([int]$row.ProcessId)
+  }
+  $ordered = New-Object System.Collections.Generic.List[int]
+  $queue = New-Object System.Collections.Generic.Queue[int]
+  $queue.Enqueue($RootProcessId)
+  while ($queue.Count -gt 0) {
+    $current = $queue.Dequeue()
+    $children = $byParent[$current]
+    if ($null -eq $children) { continue }
+    foreach ($child in $children) { $ordered.Add($child); $queue.Enqueue($child) }
+  }
+  for ($i = $ordered.Count - 1; $i -ge 0; $i--) { Stop-Process -Id $ordered[$i] -Force -ErrorAction SilentlyContinue }
+  Stop-Process -Id $RootProcessId -Force -ErrorAction SilentlyContinue
+}
+
 function Invoke-Taskctl([string]$Name, [string]$CliArgs, [int]$TimeoutMs = 0) {
   $outFile = Join-Path $root "$Name.out.log"
   $errFile = Join-Path $root "$Name.err.log"
   $process = Start-Process -FilePath "node" -ArgumentList "`"$tsx`" `"$entry`" $CliArgs" -WorkingDirectory $root -NoNewWindow -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
   if ($TimeoutMs -gt 0) {
     if (-not $process.WaitForExit($TimeoutMs)) {
-      Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+      # 超时的是包装进程；只停它自己的话，真正的命令（watch 是最要紧的一个）还在跑，
+      # 而且没有任何东西再握着它。整棵树都结束，并等包装进程退出后再读日志。
+      Stop-ProcessTree $process.Id
+      $null = $process.WaitForExit(10000)
       return [pscustomobject]@{ Code = -1; Out = (Read-TextFile $outFile); Err = ((Read-TextFile $errFile) + "`n[脚本等待 $TimeoutMs 毫秒后放弃]") }
     }
   } else {
@@ -188,33 +228,17 @@ function Find-Processes([string]$Name, [string]$Text) {
   return @(Get-Processes $Name | Where-Object { $null -ne $_.CommandLine -and $_.CommandLine.Contains($Text) })
 }
 
-# 一个 watch 连同它的整棵进程树都停掉（最后手段；正常路径由控制器自己的取消完成）。
-function Stop-ProcessTree([int]$RootProcessId) {
-  $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId)
-  $byParent = @{}
-  foreach ($row in $all) {
-    $parentKey = [int]$row.ParentProcessId
-    if (-not $byParent.ContainsKey($parentKey)) { $byParent[$parentKey] = New-Object System.Collections.Generic.List[int] }
-    $byParent[$parentKey].Add([int]$row.ProcessId)
-  }
-  $ordered = New-Object System.Collections.Generic.List[int]
-  $queue = New-Object System.Collections.Generic.Queue[int]
-  $queue.Enqueue($RootProcessId)
-  while ($queue.Count -gt 0) {
-    $current = $queue.Dequeue()
-    $children = $byParent[$current]
-    if ($null -eq $children) { continue }
-    foreach ($child in $children) { $ordered.Add($child); $queue.Enqueue($child) }
-  }
-  for ($i = $ordered.Count - 1; $i -ge 0; $i--) { Stop-Process -Id $ordered[$i] -Force -ErrorAction SilentlyContinue }
-  Stop-Process -Id $RootProcessId -Force -ErrorAction SilentlyContinue
-}
-
+# 起一个 watch，并把输出收到自己的日志里；句柄拿不到时结束整棵树再抛出，不留没人管的 watch。
 function Start-Watch([string]$Name, [string]$ExtraArgs) {
   $outFile = Join-Path $root "$Name.out.log"
   $errFile = Join-Path $root "$Name.err.log"
   $process = Start-Process -FilePath "node" -ArgumentList "`"$tsx`" `"$entry`" watch --config taskctl.json $ExtraArgs" -WorkingDirectory $root -NoNewWindow -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
-  $null = $process.Handle
+  try { $null = $process.Handle }
+  catch {
+    # 进程已经在跑了；这个触碰失败时 finally 还够不到它，所以先结束整棵树再原样抛出。
+    Stop-ProcessTree $process.Id
+    throw
+  }
   return [pscustomobject]@{ Name = $Name; Process = $process; Out = $outFile; Err = $errFile }
 }
 
@@ -329,28 +353,30 @@ try {
   $currentWatch = Start-Watch "watch-resume" "--resume"
   $watches.Add($currentWatch)
   $resumeState = @{ detail = "" }
-  $doneA = Wait-Until 300 {
+  $doneA = Wait-Until $workBoundSeconds {
     Start-Sleep -Milliseconds 1500
-    $snapshot = Invoke-Taskctl "status-resume" "status --tasks-dir tasks"
-    $resumeState.detail = $snapshot.Out
+    # 循环里也要有界：一个卡住的 status 不能把整个等待拖过期限。
+    $snapshot = Invoke-Taskctl "status-resume" "status --tasks-dir tasks" 30000
+    $resumeState.detail = ((([string]$snapshot.Out).Trim() -split "`r?`n") | Where-Object { $_.Trim().Length -gt 0 }) -join " | "
     return [bool](([string]$snapshot.Out) -match "(?m)^\s*a\s+done\b")
   } 500
   $stateA2 = Read-Json (Join-Path $tasks "a\execution-state.json")
   $sessionA2 = ""
   if ($null -ne $stateA2 -and $null -ne $stateA2.latestWorker) { $sessionA2 = [string]$stateA2.latestWorker.sessionId }
-  Add-Check "row 12: a is done on a fresh session after --resume" ($doneA -and $sessionA2.Length -gt 0 -and $sessionA2 -ne $cutSession) "a done: $doneA；session $sessionA2；cut session $cutSession"
-  if (-not $doneA) { throw "watch --resume 之后 300 秒内 a 没有完成（最后看板见行 12）。" }
+  # 行 12 的 detail 带上最后一次看板：abort 的说法是"最后看板见行 12"。
+  Add-Check "row 12: a is done on a fresh session after --resume" ($doneA -and $sessionA2.Length -gt 0 -and $sessionA2 -ne $cutSession) "a done: $doneA；session $sessionA2；cut session $cutSession；最后看板：$($resumeState.detail)"
+  if (-not $doneA) { throw "watch --resume 之后 $workBoundSeconds 秒内 a 没有完成（最后看板见行 12）。" }
 
   # --- 行 13：b 的验收命令在跑时 stop --now ---
   $gateState = @{ detail = "" }
-  $inGate = Wait-Until 300 {
+  $inGate = Wait-Until $workBoundSeconds {
     $attemptB = Read-Json (Join-Path $tasks "b\attempt.json")
     $gateState.detail = $(if ($null -eq $attemptB) { "b 还没有 attempt.json" } else { "phase=$($attemptB.phase) operation=$($attemptB.operation)" })
     return ($null -ne $attemptB -and [string]$attemptB.operation -eq "acceptance" -and [string]$attemptB.phase -eq "active")
   } 1000
   if (-not $inGate) {
-    Add-Check "row 13: stop --now cuts the acceptance command and watch exits 0" $false "等了 300 秒，b 的验收命令没有在跑（$($gateState.detail)）"
-    throw "等了 300 秒，b 的验收命令仍未进入执行；无法验证切断验收命令。"
+    Add-Check "row 13: stop --now cuts the acceptance command and watch exits 0" $false "等了 $workBoundSeconds 秒，b 的验收命令没有在跑（$($gateState.detail)）"
+    throw "等了 $workBoundSeconds 秒，b 的验收命令仍未进入执行；无法验证切断验收命令。"
   }
   $stopB = Invoke-Taskctl "stop-now-b" "stop --tasks-dir tasks --now" 60000
   $watchExitB = Wait-ForWatch $currentWatch 240000
@@ -379,9 +405,9 @@ try {
   $currentWatch = Start-Watch "watch-gate" "--resume"
   $watches.Add($currentWatch)
   $finalState = @{ detail = "" }
-  $doneB = Wait-Until 300 {
+  $doneB = Wait-Until $workBoundSeconds {
     Start-Sleep -Milliseconds 1500
-    $snapshot = Invoke-Taskctl "status-gate" "status --tasks-dir tasks"
+    $snapshot = Invoke-Taskctl "status-gate" "status --tasks-dir tasks" 30000
     $finalState.detail = $snapshot.Out
     return [bool](([string]$snapshot.Out) -match "(?m)^\s*b\s+done\b")
   } 500
