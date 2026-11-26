@@ -6,9 +6,10 @@
 #
 # 退出码：0 全部断言通过；1 有断言失败；2 环境不满足（找不到 opencode、node 或 tsx）。
 #
-# 收尾（finally）：仍在跑的 watch 会被先优雅地停掉——那会在故意保留下来供查看的临时项目里
-# 留下 `.taskctl\stop.requested` 与 `.taskctl\stop-now.requested`（用 taskctl status 看即可，
-# 不必手工删）；随后脚本会结束整台机器上命令行带本项目两个工作进程标记
+# 收尾（finally）：仍在跑的 watch 会被先优雅地停掉（stop）；60 秒内没退出，再发一次 stop --now。
+# 两次都可能在被保留下来的临时项目里留下请求文件——`.taskctl\stop.requested`（优雅停）
+# 与 `.taskctl\stop-now.requested`（升级到 --now 时）——两者都由 `watch --resume` 清掉。
+# 随后脚本会结束整台机器上命令行带本项目两个工作进程标记
 # （`setTimeout(()=>{},30000)` 与 `gate.go`）的每一个 node.exe，所以在共用机器上跑之前要知道这一点。
 param(
   [switch]$Live,
@@ -116,21 +117,29 @@ function Read-TextFile([string]$Path) {
 # 这里是最后手段：控制器自己的取消是正常路径。Invoke-Taskctl 的有界等待也用它——
 # 它等的是 tsx 的 node，而那只是包装进程，真正的命令（watch / models …）是它的孩子。
 function Stop-ProcessTree([int]$RootProcessId) {
-  $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId)
-  $byParent = @{}
-  foreach ($row in $all) {
-    $parentKey = [int]$row.ParentProcessId
-    if (-not $byParent.ContainsKey($parentKey)) { $byParent[$parentKey] = New-Object System.Collections.Generic.List[int] }
-    $byParent[$parentKey].Add([int]$row.ProcessId)
-  }
+  # 三个调用点（Invoke-Taskctl 超时、Start-Watch、finally）都把它当最后手段：
+  # 列进程表失败时也要继续，函数绝不能抛出。
   $ordered = New-Object System.Collections.Generic.List[int]
-  $queue = New-Object System.Collections.Generic.Queue[int]
-  $queue.Enqueue($RootProcessId)
-  while ($queue.Count -gt 0) {
-    $current = $queue.Dequeue()
-    $children = $byParent[$current]
-    if ($null -eq $children) { continue }
-    foreach ($child in $children) { $ordered.Add($child); $queue.Enqueue($child) }
+  try {
+    $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId)
+    $byParent = @{}
+    foreach ($row in $all) {
+      $parentKey = [int]$row.ParentProcessId
+      if (-not $byParent.ContainsKey($parentKey)) { $byParent[$parentKey] = New-Object System.Collections.Generic.List[int] }
+      $byParent[$parentKey].Add([int]$row.ProcessId)
+    }
+    $queue = New-Object System.Collections.Generic.Queue[int]
+    $queue.Enqueue($RootProcessId)
+    while ($queue.Count -gt 0) {
+      $current = $queue.Dequeue()
+      $children = $byParent[$current]
+      if ($null -eq $children) { continue }
+      foreach ($child in $children) { $ordered.Add($child); $queue.Enqueue($child) }
+    }
+  } catch {
+    # 列不出来就只剩根进程可停；[Console]::Error 在 Stop 偏好下不会终止脚本。
+    $ordered.Clear()
+    [Console]::Error.WriteLine("列出进程树失败，只结束根进程 $RootProcessId：$($_.Exception.Message)")
   }
   for ($i = $ordered.Count - 1; $i -ge 0; $i--) { Stop-Process -Id $ordered[$i] -Force -ErrorAction SilentlyContinue }
   Stop-Process -Id $RootProcessId -Force -ErrorAction SilentlyContinue
@@ -160,7 +169,7 @@ Write-Host "model：$Model"
 Write-Host ""
 
 # 注册守卫不耗模型额度，两种模式都跑（与 smoke.ps1 / live-phase2.ps1 相同的理由）。
-$board = Invoke-Taskctl "status" "status --tasks-dir tasks"
+$board = Invoke-Taskctl "status" "status --tasks-dir tasks" 30000
 Write-Host $board.Out
 if ($board.Out -notmatch "(?m)^\s*a\s+open" -or $board.Out -notmatch "(?m)^\s*b\s+open") {
   Write-Error "任务 a / b 没有注册为 open（看板见上）。"
@@ -284,7 +293,7 @@ try {
   $currentWatch = $null
 
   # --- 行 3 与行 8：a 回到 open 且不花 retry；b 没被领取 ---
-  $statusA = Invoke-Taskctl "status-after-stop" "status --tasks-dir tasks"
+  $statusA = Invoke-Taskctl "status-after-stop" "status --tasks-dir tasks" 30000
   $aOpen = [bool](([string]$statusA.Out) -match "(?m)^\s*a\s+open\s+0(\s|$)")
   Add-Check "row 3: a is open with retries 0" $aOpen ($statusA.Out.Trim())
 
@@ -339,7 +348,8 @@ try {
       try { $envelope = (Read-TextFile $apiOut) | ConvertFrom-Json } catch { $envelope = $null }
       if ($null -ne $envelope -and $null -ne $envelope.data -and $null -ne $envelope.data.time) { $idleValue = $envelope.data.time.idle }
     } else {
-      Stop-Process -Id $api.Id -Force -ErrorAction SilentlyContinue
+      # 等待到点：opencode 可能已起了自己的孩子，整棵树一起结束，别只结束客户端。
+      Stop-ProcessTree $api.Id
     }
   }
   $idleNumeric = ($null -ne $idleValue) -and ($idleValue -is [int] -or $idleValue -is [long] -or $idleValue -is [double] -or $idleValue -is [decimal])
@@ -385,7 +395,7 @@ try {
   $currentWatch = $null
 
   # --- 行 14：b 原样回到 open，验收证据一个也没写 ---
-  $statusB = Invoke-Taskctl "status-after-gate" "status --tasks-dir tasks"
+  $statusB = Invoke-Taskctl "status-after-gate" "status --tasks-dir tasks" 30000
   $bOpen = [bool](([string]$statusB.Out) -match "(?m)^\s*b\s+open\s+0(\s|$)")
   $acceptanceFile = Join-Path $tasks "b\acceptance.json"
   $failuresFile = Join-Path $tasks "b\acceptance-failures.json"
