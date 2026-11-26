@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { processExecution, type Execution, type TreeControl } from "./execution.js";
+import { insulatedSpawnOptions, processExecution, type Execution, type TreeControl } from "./execution.js";
 
 /**
  * Outcome of the acceptance gate. `exitCode` is null when the command could
@@ -23,8 +23,13 @@ export type AcceptanceResult =
  */
 export type AcceptanceMode = "generate" | "check";
 
-/** `trees` is the platform double a test injects; production leaves it absent. */
-export type AcceptanceOptions = { trees?: TreeControl };
+/**
+ * `trees` is the platform double a test injects; production leaves it absent.
+ * `insulated` keeps the gate's shell out of the controller's console group
+ * ({@link insulatedSpawnOptions}); only a controller that handles signals
+ * itself asks for it, and no caller does today.
+ */
+export type AcceptanceOptions = { trees?: TreeControl; insulated?: boolean };
 
 export type AcceptanceExecution = Execution<AcceptanceResult> & {
   /** Output captured so far, including output available after cancellation. */
@@ -64,6 +69,7 @@ export function startAcceptance(command: string, cwd: string, mode: AcceptanceMo
     cwd,
     shell: false,
     detached: !isWindows,
+    ...(options.insulated === true ? insulatedSpawnOptions() : {}),
     env: { ...process.env, [ACCEPTANCE_MODE_ENV]: mode },
     windowsVerbatimArguments: isWindows,
   });

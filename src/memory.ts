@@ -131,14 +131,17 @@ export function renderMemory(hits: readonly MemoryHit[], cfg: Pick<MemoryConfig,
  * similarity floor; a `wing` narrows a search to that wing.
  *
  * `call` is the stdio client, and a test can put its own in its place.
+ * `insulated` starts the server in its own process group, out of the
+ * controller's console (D6); it defaults to false — `taskctl recall` keeps
+ * today's spawn, and only an attempt that has a stop source asks for it.
  */
-export function createMempalaceBackend(cfg: MemoryConfig, call: typeof callTools = callTools): MemoryBackend {
+export function createMempalaceBackend(cfg: MemoryConfig, call: typeof callTools = callTools, insulated = false): MemoryBackend {
   const maxDistance = Number((1 - cfg.minSimilarity).toFixed(6));
   return {
     name: "mempalace",
     async searchAll(requests, opts) {
       const replies = await call(
-        { command: cfg.command, timeoutMs: cfg.timeoutMs },
+        { command: cfg.command, timeoutMs: cfg.timeoutMs, ...(insulated ? { insulated: true } : {}) },
         requests.map((request) => ({
           name: SEARCH_TOOL,
           arguments: { query: request.query, limit: opts.limit, max_distance: maxDistance, ...(request.wing === undefined ? {} : { wing: request.wing }) },

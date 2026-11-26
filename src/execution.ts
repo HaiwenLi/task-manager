@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -78,6 +78,11 @@ export function descendantsOf(table: ProcessTable, root: number): number[] {
     frontier = next;
   }
   return descendants;
+}
+
+/** Spawn options that keep a work process out of the controller's console group, so a Ctrl-C meant for the controller reaches the controller alone. */
+export function insulatedSpawnOptions(platform: NodeJS.Platform = process.platform): Pick<SpawnOptions, "detached" | "windowsHide"> {
+  return { detached: true, windowsHide: platform === "win32" };
 }
 
 /**
