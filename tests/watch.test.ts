@@ -696,7 +696,9 @@ describe("watch and stop CLI parsing", () => {
       root, tasksDir: tasks, workdir: work, agent: adapter(), acceptance: passAcceptance,
       err: (line) => errors.push(line), watch: { watchFs, fallbackMs: 1_000, debounceMs: 5 },
     });
-    // Today the watch starts and serves; the stop is only so this test cannot hang on that.
+    // The refusal comes before any listener: the race below is a floor for
+    // this test alone — the day the refusal is lost it keeps the test from
+    // hanging — and the graceful stop is not the behaviour under test.
     const first = await Promise.race([running.then(() => "exited"), waitFor(() => listeners.has(tasks)).then(() => "serving", () => "no listener")]);
     if (first === "serving") await requestStop();
     expect(await running).toBe(1);

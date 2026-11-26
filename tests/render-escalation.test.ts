@@ -50,6 +50,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  stopWhenRenderRecorded = undefined;
   await rm(root, { recursive: true, force: true });
 });
 

@@ -114,14 +114,28 @@ it("a memory server is in its own group only when the caller asks", async () => 
   if (process.platform === "win32") expect(spawns.at(-1)?.options.detached).not.toBe(true);
 });
 
+/** The gate tree's three pids, or a plain failure after 100 × 30 ms instead of a silent undefined. */
+async function gateTreePids(): Promise<{ root: number; child: number; leaf: number }> {
+  for (let i = 0; i < 100; i++) {
+    try { return JSON.parse(await readFile(join(cwd, "tree-pids.json"), "utf8")); } catch { await delay(30); }
+  }
+  throw new Error("the gate tree did not start: tree-pids.json never came");
+}
+
 it("an insulated gate is still cancelled as a tree", async () => {
   const execution = acceptance.startAcceptance(`"${process.execPath}" "${gateTree}"`, cwd, "check", { insulated: true });
-  let tree: { root: number; child: number; leaf: number };
-  for (let i = 0; i < 300; i++) {
-    try { tree = JSON.parse(await readFile(join(cwd, "tree-pids.json"), "utf8")); break; } catch { await delay(30); }
+  let tree: { root: number; child: number; leaf: number } | undefined;
+  try {
+    tree = await gateTreePids();
+    // `cancel()` is memoized: the `finally` answers with this same promise if
+    // the tree never started, so the trio is always cancelled.
+    await expect(execution.cancel()).resolves.toBe(true);
+  } finally {
+    await execution.cancel();
   }
-  await expect(execution.cancel()).resolves.toBe(true);
-  for (const pid of Object.values(tree!)) expect(() => process.kill(pid, 0)).toThrow();
+  // Asserted only when the tree was read: a start that failed plainly above
+  // has already ended the test.
+  if (tree !== undefined) for (const pid of Object.values(tree)) expect(() => process.kill(pid, 0)).toThrow();
 }, 15_000);
 
 it("retry --review-only constructs an insulated adapter: every child of it is in its own group", async () => {

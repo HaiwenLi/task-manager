@@ -227,9 +227,15 @@ it("a descendant the tree kill leaves alive keeps the cancellation unconfirmed",
     const execution = acceptance.startAcceptance(`"${process.execPath}" "${gateTree}"`, cwd, "check", {
       trees: { ...platformTreeControl, descendants: async () => [bystander.pid!] },
     });
-    await treePids();
-    await expect(execution.cancel()).resolves.toBe(false);
-    expect(execution.inspect().state).toBe("uncertain");
+    try {
+      await treePids();
+      // `cancel()` is memoized: the `finally` below answers with this same
+      // promise if the tree never started, so the gate is always cancelled.
+      await expect(execution.cancel()).resolves.toBe(false);
+      expect(execution.inspect().state).toBe("uncertain");
+    } finally {
+      await execution.cancel();
+    }
   } finally {
     bystander.kill();
     // it is going down either way; wait so the directory can be removed
@@ -253,14 +259,19 @@ it("the kill utility's report is not needed once the tree is known to be gone", 
       },
     },
   });
-  const tree = await treePids();
-  // the listing is of the whole live tree — a node it does not hold would
-  // still inherit the output pipes and keep the close from ever arriving
-  known = [tree.root, tree.child, tree.leaf];
-  await expect(execution.cancel()).resolves.toBe(true);
-  expect(calls).toEqual(["list", "kill"]);
-  expect(execution.inspect().state).toBe("exited");
-  for (const pid of known) expect(() => process.kill(pid, 0)).toThrow();
+  try {
+    const tree = await treePids();
+    // the listing is of the whole live tree — a node it does not hold would
+    // still inherit the output pipes and keep the close from ever arriving
+    known = [tree.root, tree.child, tree.leaf];
+    // Memoized: the `finally`'s call is this same one when the tree started.
+    await expect(execution.cancel()).resolves.toBe(true);
+    expect(calls).toEqual(["list", "kill"]);
+    expect(execution.inspect().state).toBe("exited");
+    for (const pid of known) expect(() => process.kill(pid, 0)).toThrow();
+  } finally {
+    await execution.cancel();
+  }
 }, 15_000);
 
 it("a root whose exit was never observed is not confirmed", async () => {

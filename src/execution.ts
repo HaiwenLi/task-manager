@@ -292,7 +292,14 @@ export const platformTreeControl: TreeControl = {
   killTree: (pid) => stopTree(pid),
 };
 
-/** A pid the platform still schedules answers a presence probe; anything else does not. */
+/**
+ * A pid the platform still schedules answers a presence probe; anything else does not.
+ *
+ * `process.kill(pid, 0)` throws `EPERM` for a pid that exists but belongs to
+ * another user, and this reads that as not alive. Unreachable for a tree this
+ * process spawned, and backstopped by the output pipes: a process that
+ * inherited them keeps them from closing.
+ */
 function alive(pid: number): boolean {
   try {
     process.kill(pid, 0);
