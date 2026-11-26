@@ -175,6 +175,20 @@ describe("a fully refused round", () => {
     expect(await readModelWait(tasks, "a")).toBeNull();
   });
 
+  it("ends the deferral at the worker turn that was accepted, not only at a later review turn", async () => {
+    // `verify: mechanical`: acceptance ends the task with no review turn. A review turn that is
+    // not a provider refusal clears a deferral of its own (`reviewStage`), so the case above
+    // still passes with the worker turn's clear removed; this one does not.
+    await writeFile(join(tasks, "a.md"), serializeTaskFile(buildTaskFile({
+      id: "a", title: "a", acceptance: "check", verify: "mechanical",
+    })), "utf8");
+    expect(await run(allRefuse().adapter)).toBe("open");
+
+    expect(await run(backend({ "q/one": "done" }).adapter)).toBe("done");
+
+    expect(await readModelWait(tasks, "a")).toBeNull();
+  });
+
   it("waits for the window when every model is already cooling, and such a pass is not a round", async () => {
     for (const model of CHAIN) await noteModelRefusal(tasks, model, { reason: `429 on ${model}`, cooldownMs: 60_000 });
     const { adapter, seen } = allRefuse();
