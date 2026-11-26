@@ -599,6 +599,13 @@ Phase 2 的有界真实验证（两任务批次共用一个 session、逐任务 
 .\scripts\live-phase2.ps1 -Live     # 15 项断言，通过时打印 LIVE PHASE 2 PASS
 ```
 
+```powershell
+.\scripts\live-stop.ps1           # 只准备环境、校验注册，并在真实进程上走一遍 stop --now 与 watch 的拒绝；不调模型
+.\scripts\live-stop.ps1 -Live     # 17 项断言：护栏放行、stop --now 打断回合、打断验收命令、重跑与 --resume；通过时打印 LIVE STOP PASS
+```
+
+它会消耗约 4 个 worker 回合。Ctrl-C 的验证需要真人按键，步骤见 `docs/superpowers/plans/2026-11-25-stop-now.md` 的 Task 12。
+
 ## 凭据与隐私
 
 - 通过 agent CLI 在本地配置模型凭据；不要把 API key、访问令牌或认证头写进任务、示例或仓库配置。
