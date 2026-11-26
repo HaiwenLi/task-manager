@@ -171,6 +171,10 @@ Write-Host ""
 # 注册守卫不耗模型额度，两种模式都跑（与 smoke.ps1 / live-phase2.ps1 相同的理由）。
 $board = Invoke-Taskctl "status" "status --tasks-dir tasks" 30000
 Write-Host $board.Out
+if ($board.Code -ne 0) {
+  Write-Error "status 没有正常结束（exit $($board.Code)），看板内容不可信：$($board.Err.Trim())"
+  exit 1
+}
 if ($board.Out -notmatch "(?m)^\s*a\s+open" -or $board.Out -notmatch "(?m)^\s*b\s+open") {
   Write-Error "任务 a / b 没有注册为 open（看板见上）。"
   exit 1

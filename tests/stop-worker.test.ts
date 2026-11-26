@@ -358,6 +358,8 @@ it("a stop during the acceptance command kills the gate and judges nothing", asy
   // No acceptance seam: the real gate runs, as it does in production.
   const running = runTask(cfg, deps(agent, stop, { acceptance: undefined }), await store.get("a"), "w1");
   let gatePid = 0;
+  const timedOut = Symbol("the attempt did not settle");
+  let settled: unknown;
   try {
     for (let i = 0; i < 100 && gatePid === 0; i++) {
       try { gatePid = Number(await readFile(join(work, "gate.pid"), "utf8")); } catch { await new Promise((resolve) => setTimeout(resolve, 30)); }
@@ -368,10 +370,12 @@ it("a stop during the acceptance command kills the gate and judges nothing", asy
     // the fixture never started: the attempt settles here, and the confirmed
     // cancel takes the gate's process tree with it. A real cancel may run to
     // the 8 s cancel deadline, so the wait is the 8.5 s wrapper the real-adapter
-    // tests use, not `settles`' 4 s.
+    // tests use, not `settles`' 4 s. `running` is awaited without a catch: its
+    // rejection is this test's failure, and the sentinel only bounds the wait.
     stop.trigger("file");
-    await Promise.race([running.catch(() => {}), new Promise((resolve) => setTimeout(resolve, 8_500))]);
+    settled = await Promise.race([running, new Promise((resolve) => setTimeout(() => resolve(timedOut), 8_500))]);
   }
+  expect(settled).toBe("stopped");
   expect(() => process.kill(gatePid, 0)).toThrow();
   expect(await store.get("a")).toMatchObject({ status: "open", retries: 0 });
   expect(await readAttempt(tasks, "a")).toMatchObject({ phase: "settled", operation: "acceptance", reason: "stopped by operator" });

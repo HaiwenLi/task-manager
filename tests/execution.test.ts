@@ -36,7 +36,7 @@ async function descendant(): Promise<number> {
 const gateTree = fileURLToPath(new URL("./fixtures/gate-tree.mjs", import.meta.url));
 
 async function treePids(): Promise<{ root: number; child: number; leaf: number }> {
-  for (let i = 0; i < 300; i++) {
+  for (let i = 0; i < 100; i++) {
     try { return JSON.parse(await readFile(join(cwd, "tree-pids.json"), "utf8")); } catch { /* not yet */ }
     await delay(30);
   }
@@ -270,6 +270,10 @@ it("the kill utility's report is not needed once the tree is known to be gone", 
     expect(execution.inspect().state).toBe("exited");
     for (const pid of known) expect(() => process.kill(pid, 0)).toThrow();
   } finally {
+    // When the fixture never recorded the tree, `known` stays empty and the
+    // `killTree` above ends only the root: the real tree is ended first, then
+    // the cancel settles the execution.
+    if (known.length === 0) await platformTreeControl.killTree(execution.inspect().pid!);
     await execution.cancel();
   }
 }, 15_000);

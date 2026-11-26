@@ -145,7 +145,7 @@ export async function createStopNow(
     }
     let released = false;
     return () => {
-      // A release acts once: a second call would take another hold's count
+      // A release acts once: a second call would take the holder count
       // below zero, and that hold would then start no poll at all.
       if (released) return;
       released = true;
