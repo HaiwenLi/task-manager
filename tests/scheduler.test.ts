@@ -8,6 +8,7 @@ import { MODEL_ROUNDS_DEFAULT, newRunContext, writeModelWait, type ModelWaitReco
 import type { runTask, WorkerConfig } from "../src/worker.js";
 import type { AgentAdapter } from "../src/adapters/types.js";
 import { manualStopNow } from "./helpers/stop-fixture.js";
+import type { StopNow, StopSource } from "../src/stop.js";
 
 let root: string;
 let tasks: string;
@@ -367,5 +368,77 @@ describe("runScheduler", () => {
     stop.trigger("file");
     expect(await running).toEqual({ done: [], blocked: [], pending: [] });
     expect(offered).toEqual([]);
+  });
+
+  it("a request the last look missed is still seen before the decision", async () => {
+    await seed("001-a", ["workdir: a"]);
+    const run = newRunContext(START);
+    // A request on the board that no attempt's poll has seen: `isRequested()`
+    // stays false, and the look that follows the drain is the first to see it.
+    let arrived = false;
+    let seen = false;
+    let settle!: (source: StopSource) => void;
+    const stop: StopNow = {
+      observed: new Promise<StopSource>((resolve) => { settle = resolve; }),
+      isRequested: () => seen,
+      source: () => (seen ? "file" : undefined),
+      check: async () => {
+        if (arrived) { seen = true; settle("file"); }
+        return seen;
+      },
+      hold: () => () => {},
+    };
+    const result = await runScheduler(config({ run }), { store, adapter: adapter(), acceptance: failGate, stop }, {
+      run: async () => {
+        // a ran out of rounds and only recorded it; the request lands after its last look.
+        await writeModelWait(tasks, "001-a", deferral(run, MODEL_ROUNDS_DEFAULT));
+        arrived = true;
+        return "open";
+      },
+    });
+    // The decision is not taken under a stop the drain's look saw: no outage,
+    // the spent task left `open` for the owner.
+    expect(result).toEqual({ done: [], blocked: [], pending: [] });
+    expect(await store.get("001-a")).toMatchObject({ status: "open", retries: 0 });
+  });
+
+  it("a run waiting for a model window holds the stop, so a request on the board ends the wait at once", async () => {
+    await seed("001-a");
+    const run = newRunContext(START);
+    await writeModelWait(tasks, "001-a", deferral(run));
+    // A request that only a look sees, and looks happen only while a holder
+    // holds: `hold()` asks `check()` on the microtask after the wait has begun,
+    // as the real hold's poll does. Without a hold the look never happens and
+    // the wait never ends.
+    let holding = false;
+    let seen = false;
+    let released = 0;
+    let settle!: (source: StopSource) => void;
+    const observed = new Promise<StopSource>((resolve) => { settle = resolve; });
+    const stop: StopNow = {
+      observed,
+      isRequested: () => seen,
+      source: () => (seen ? "file" : undefined),
+      check: async () => {
+        if (holding) { seen = true; settle("file"); }
+        return seen;
+      },
+      hold: () => {
+        holding = true;
+        void Promise.resolve().then(() => { void stop.check(); });
+        return () => { holding = false; released += 1; };
+      },
+    };
+    const offered: string[] = [];
+    const running = runScheduler(config({ run }), {
+      store, adapter: adapter(), acceptance: failGate, stop,
+    }, {
+      run: async (_cfg, _deps, task) => { offered.push(task.id); return "done"; },
+      now: () => START,
+      sleep: () => new Promise<void>(() => {}), // a sleep that never ends: only a look can end the wait
+    });
+    expect(await running).toEqual({ done: [], blocked: [], pending: [] });
+    expect(offered).toEqual([]);
+    expect(released).toBe(1); // the wait's hold is released exactly once, whichever way the wait ends
   });
 });

@@ -223,8 +223,10 @@ export async function runScheduler(
       await Promise.race([...inflight.values()]);
     }
     // The attempts in flight have settled and nothing more is offered; the
-    // controller's outage decision is not taken under a stop (D13b).
-    if (deps.stop?.isRequested()) break;
+    // controller's outage decision is not taken under a stop (D13b). One look
+    // here per pass: a request that landed after the last look of the final
+    // attempt is still seen before the decision.
+    if (deps.stop !== undefined && (deps.stop.isRequested() || await deps.stop.check())) break;
 
     // The decision an attempt could not take (spec §6, step 5): nothing is in flight now.
     if (deferred.length > 0) {
@@ -251,13 +253,21 @@ export async function runScheduler(
         const before = now().getTime();
         // The wait ends at once on a stop, and a default sleep's timer is kept
         // so it can be cleared: a stopped run must not sit out the window
-        // after it has returned (D13c).
+        // after it has returned (D13c). The run holds the stop source while it
+        // waits — `hold()` is otherwise attempt-scoped — so its poll sees a
+        // request written from another terminal and ends the wait at once, not
+        // at the window's edge.
         let waitTimer: ReturnType<typeof setTimeout> | undefined;
-        await Promise.race([
-          options.sleep === undefined ? new Promise<void>((resolve) => { waitTimer = setTimeout(resolve, ms); }) : sleep(ms),
-          ...(deps.stop === undefined ? [] : [deps.stop.observed]),
-        ]);
-        if (waitTimer !== undefined) clearTimeout(waitTimer);
+        const release = deps.stop?.hold();
+        try {
+          await Promise.race([
+            options.sleep === undefined ? new Promise<void>((resolve) => { waitTimer = setTimeout(resolve, ms); }) : sleep(ms),
+            ...(deps.stop === undefined ? [] : [deps.stop.observed]),
+          ]);
+        } finally {
+          if (waitTimer !== undefined) clearTimeout(waitTimer);
+          release?.();
+        }
         if (deps.stop?.isRequested()) break; // instead of the `continue` a pass that only waited takes
         // A sleep that did not move the clock would wait for ever.
         if (now().getTime() <= before) break;
