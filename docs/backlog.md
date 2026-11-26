@@ -18,7 +18,7 @@
 | --- | --- | --- |
 | 第 1 节 `tsc --noEmit` | 「从未执行过」（TSD 透明加密，`tsc` 读到密文） | 2026-11-24 在本机可以运行：`npx tsc --noEmit` 退出码 0，remediation plan 的每一轮门槛都有记录。原因没有查（白名单或加密状态变了），这里只记事实 |
 | 第 1 节 `tsc --noEmit`（检查范围） | 未提；此前只包含 `src/`，`tests/` 从未被类型检查 | 2026-11-25 起 `npm run typecheck`（`tsconfig.test.json`）同时检查 `tests/`、`scripts/` 和 `vitest.config.ts`。纳入时报出 46 个错误，全部在测试一侧（测试替身缺接口要求的方法、夹具缺必填字段、联合类型未收窄就读字段），已清零 |
-| 第 1 节「真实环境端到端」 | 「大部分未跑过」 | 2026-11-24 做过有界 Live 验证（`scripts/smoke.ps1 -Live`、`scripts/live-phase2.ps1 -Live` 15/15），见 README「测试」。取消与中断恢复已于 2026-11-27 在 opencode v2.4.2 上验证（`scripts/live-stop.ps1 -Live` 17 项 PASS：打断回合与验收命令、任务回到 `open` 不耗 `retries`、重跑用新会话、没有进程残留）；仍未验证：进程信号、复核超时 |
+| 第 1 节「真实环境端到端」 | 「大部分未跑过」 | 2026-11-24 做过有界 Live 验证（`scripts/smoke.ps1 -Live`、`scripts/live-phase2.ps1 -Live` 15/15），见 README「测试」。取消与中断恢复已于 2026-11-27 在 opencode v2.4.2 上验证（`scripts/live-stop.ps1 -Live` 17 项 PASS：打断回合与验收命令、任务回到 `open` 不耗 `retries`、重跑用新会话、没有进程残留）；控制台里按 Ctrl-C 于同日实测（控制器立即收到、约 2 秒内确认停止、退出码 130，连按两次只提示 `still stopping`），对真实进程发送 SIGTERM 仍未实测；复核超时仍未验证 |
 | 第 1 节末句的用例数 | `307 passed / 1 skipped` | 已过时；当前门槛见 [phase2-review-remediation](superpowers/plans/2026-11-24-phase2-review-remediation.md) |
 | 第 0 节「Simple/Complex 自动分流的分类 agent」 | 「分类器要等 `escalated` 事件积累出比例才有依据」 | 设计 §16 已经落地了模型分类（`taskctl add` 按模型给的车道决定是否等签字）。它与 ADR-0008/0009 的冲突尚未写 supersession，待所有者裁决 |
 | 第 5 节「已知偶发」 | `tests/worker-review.test.ts` 1 次失败，「撞上慢 IO」，未修 | 2026-11-24 在 `tests/model-chain.test.ts` 上复现并定位了**一个**同类根因：Windows 上改名覆盖被短暂拒绝（EPERM）时，锁心跳把它当成所有权丢失。改名统一带重试、心跳写失败不再等于丢锁之后，同一循环 45 次不再失败。当时 `worker-review` 那次是否同因，无法回溯确认 |
