@@ -21,14 +21,37 @@ vi.mock("node:child_process", async (importOriginal) => {
 import * as acceptance from "../src/acceptance.js";
 import { insulatedSpawnOptions } from "../src/execution.js";
 import { OpenCodeAdapter } from "../src/adapters/opencode.js";
+import type { MemorySettings } from "../src/memory.js";
 import { callTools } from "../src/mcp-client.js";
+import type { StopNow } from "../src/stop.js";
+import type { Task } from "../src/task-file.js";
+import { TaskStore } from "../src/task-store.js";
+import { runTask, type WorkerConfig } from "../src/worker.js";
+import { buildTaskFile } from "./helpers/task-fixture.js";
+import { manualStopNow } from "./helpers/stop-fixture.js";
+import { markDoneTask, passAcceptance, seedTaskFile, workerConfigFixture } from "./helpers/watch-fixture.js";
 
 let cwd: string;        // the gate's working directory
 let tasks: string;      // a small board beside it; Task 6 and Task 8 add tests that need one
+let work: string;       // the attempts' workspace
+let store: TaskStore;
+let cfg: WorkerConfig;
 const fake = fileURLToPath(new URL("./adapters/fake-opencode.mjs", import.meta.url));
 const gateTree = fileURLToPath(new URL("./fixtures/gate-tree.mjs", import.meta.url));
-beforeEach(async () => { cwd = await mkdtemp(join(tmpdir(), "taskctl-insulation-")); tasks = join(cwd, "tasks"); await mkdir(tasks); spawns.length = 0; });
+beforeEach(async () => {
+  cwd = await mkdtemp(join(tmpdir(), "taskctl-insulation-"));
+  tasks = join(cwd, "tasks");
+  work = join(cwd, "work");
+  await mkdir(tasks);
+  await mkdir(work);
+  store = new TaskStore(tasks);
+  cfg = workerConfigFixture({ tasksDir: tasks, workdir: work, lockTtlMs: 5_000, heartbeatMs: 1_000 });
+  spawns.length = 0;
+});
 afterEach(async () => { await rm(cwd, { recursive: true, force: true }); });
+
+const mechanical = (id: string, overrides: Partial<Task> = {}): Task =>
+  buildTaskFile({ id, complexity: "complex", verify: "mechanical", criteria: ["C1 ok"], acceptance: "check", ...overrides });
 
 it("insulation puts a work process in its own group on every platform", () => {
   expect(insulatedSpawnOptions("win32")).toEqual({ detached: true, windowsHide: true });
@@ -75,3 +98,37 @@ it("an insulated gate is still cancelled as a tree", async () => {
   await expect(execution.cancel()).resolves.toBe(true);
   for (const pid of Object.values(tree!)) expect(() => process.kill(pid, 0)).toThrow();
 }, 15_000);
+
+it("the worker's gate is insulated: the controller cancels it itself", async () => {
+  await seedTaskFile(tasks, mechanical("a", { acceptance: "echo worker-gate" }));
+  expect(await runTask(cfg, { store, adapter: { prompt: async (args) => { await markDoneTask(args.text, tasks); return { sessionId: "s", exitCode: 0, text: "done" }; }, contextUsage: async () => 0, contextLimit: async () => 100 } }, await store.get("a"), "w1")).toBe("done");
+  expect(spawns.at(-1)?.file).toBe(process.platform === "win32" ? "cmd" : "sh");
+  expect(spawns.at(-1)?.options).toMatchObject({ detached: true, windowsHide: process.platform === "win32" });
+});
+
+it("an attempt's memory server is in its own group exactly when the attempt can be stopped", async () => {
+  // No `memory` seam: the attempt builds its own backend, so the real spawn is the one observed.
+  process.env.FAKE_MCP_MODE = "ok";
+  const server = fileURLToPath(new URL("./adapters/fake-mcp.mjs", import.meta.url));
+  const memory: MemorySettings = {
+    backend: "mempalace", command: [process.execPath, server], excludeWings: [], rooms: ["pitfall"],
+    minSimilarity: 0.55, maxItems: 5, maxChars: 2_000, itemChars: 400, timeoutMs: 10_000,
+  };
+  const attempt = async (id: string, stop?: StopNow) => {
+    await seedTaskFile(tasks, mechanical(id, { acceptance: "echo gate" }));
+    spawns.length = 0;
+    await runTask({ ...cfg, memory }, {
+      store, ...(stop === undefined ? {} : { stop }),
+      adapter: { prompt: async (args) => { await markDoneTask(args.text, tasks); return { sessionId: "s", exitCode: 0, text: "done" }; }, contextUsage: async () => 0, contextLimit: async () => 100 },
+    }, await store.get(id), "w1");
+    return spawns.filter((spawn) => spawn.file === process.execPath); // the server: the gate is the shell, the turn is a seam
+  };
+  try {
+    const plain = await attempt("a");
+    expect(plain).toHaveLength(1);
+    expect(plain[0]?.options.detached).toBeUndefined(); // no stop source: today's spawn, as taskctl recall
+    const insulated = await attempt("b", manualStopNow());
+    expect(insulated).toHaveLength(1);
+    expect(insulated[0]?.options.detached).toBe(true);
+  } finally { delete process.env.FAKE_MCP_MODE; }
+}, 10_000);

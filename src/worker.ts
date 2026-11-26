@@ -8,6 +8,7 @@ import { latestNote, writeNote, type HandoffNote } from "./handoff.js";
 import { startAcceptance, type AcceptanceResult } from "./acceptance.js";
 import { readContextSections, readFixedSources, sourcesDetail, type ContextSections } from "./context.js";
 import { createMempalaceBackend, runRecall, type MemoryBackend, type MemorySettings } from "./memory.js";
+import { callTools } from "./mcp-client.js";
 import { buildWorkerPrompt } from "./protocol.js";
 import type { TaskStore } from "./task-store.js";
 import type { Task, TaskExecution } from "./task-file.js";
@@ -240,6 +241,15 @@ class OperatorStoppedError extends Error {
 class UnconfirmedStopError extends UncertainExecutionError {}
 /** Sentinel the stop race resolves with; carries nothing. */
 class StopObserved {}
+
+/**
+ * Sentinel the render check's stop race resolves with (D4): the check is not a
+ * cancellable execution, so the stop does not cancel it — it only ends the
+ * wait, lets the check run to its own bounded end, and sees to it that nothing
+ * it saw is judged.
+ */
+class StopObservedDuringRenderCheck {}
+const STOP = new StopObservedDuringRenderCheck();
 
 type Run = {
   cfg: WorkerConfig; deps: WorkerDeps; task: Task; owner: string;
@@ -964,6 +974,8 @@ async function captureUsage(
     });
   } catch (error) {
     if (error instanceof OwnershipLostError) throw error;
+    // A stop must not be journaled as an unavailable telemetry call.
+    if (error instanceof OperatorStoppedError) throw error;
     await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
       stage: role === "worker" ? "worker" : "review", event: "usage-unavailable",
       detail: error instanceof Error ? error.message : String(error),
@@ -1265,9 +1277,18 @@ async function readSections(r: Run): Promise<WorkerContext> {
     // section, and what was read before it is already in hand: the step sits
     // inside this guard like the reads above it.
     if (r.cfg.memory?.backend === "mempalace") {
+      // The recall is not interrupted (D12), only announced while it lasts:
+      // it bounds itself, ends its own server, and the loop's first check
+      // settles the attempt once it has ended.
+      let recalling = true;
+      void r.deps.stop?.observed.then(() => {
+        if (recalling) emit(r, "stop-requested", "memory recall in progress; it ends before anything else is asked of the worker (bounded by memory.timeoutMs)");
+      });
       const memory = await runRecall(
         r.cfg.memory,
-        r.deps.memory ?? createMempalaceBackend(r.cfg.memory),
+        // The server is kept out of the console's Ctrl-C only for an attempt
+        // that can be stopped (D6); `taskctl recall` keeps today's spawn.
+        r.deps.memory ?? createMempalaceBackend(r.cfg.memory, callTools, r.deps.stop !== undefined),
         {
           title: r.task.title, description: r.task.description,
           // Read again, and whole: the query wants the spec's goal, which the
@@ -1281,6 +1302,8 @@ async function readSections(r: Run): Promise<WorkerContext> {
           journal: (event, detail) => owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, { stage: "worker", event, detail })),
         },
       );
+      // The wait is over: a stop observed from here on is the loop's own news.
+      recalling = false;
       // `null` is every other outcome: nothing kept, or the backend could not answer.
       if (memory !== null) sections.memory = memory;
     }
@@ -1324,6 +1347,8 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
   // The same holds for the context sections: read once, not once per turn.
   const context = await contextOf(r);
   for (;;) {
+    // Nothing new is dispatched once a stop was observed: the attempt settles instead.
+    assertNotStopped(r);
     const note = await latestNote(r.cfg.tasksDir, r.task.id);
     const protocol = buildWorkerPrompt(r.task, {
       handoff: note?.markdown, workdir: r.cfg.workdir, tasksDir: r.cfg.tasksDir,
@@ -1356,6 +1381,10 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
     }
     const result = await workedTurn(r, prompt, model, sessionId);
     await captureUsage(r, "worker", result.sessionId, model, result.durationMs);
+    // A stop observed during the telemetry call costs no retry, no escalation
+    // and no `turn-failed` line: the session is not recorded, the turn is not
+    // accounted, and the attempt settles instead.
+    assertNotStopped(r);
     await owned(r, async () => {
       // A rejected turn did no work, and its session belongs to the backend that
       // refused it: recording it would both spend a session and hand the next
@@ -1554,6 +1583,10 @@ function digestExclusions(cfg: Pick<WorkerConfig, "tasksDir" | "configPath">): s
 }
 
 async function resumeReviewOnly(r: Run, pending: ReviewPendingRecord): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
+  // Nothing is dispatched once a stop was observed: the parked task keeps its
+  // evidence and the attempt settles instead (the status it returns to is the
+  // one it was claimed from, `stopAttempt`).
+  assertNotStopped(r);
   if (pending.definitionDigest !== await attemptDefinition(r)) {
     throw new ReviewRequiredError("review-only recovery refused: the task definition changed; old evidence is stale");
   }
@@ -1627,8 +1660,11 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
     // (re)generate, because the digest comparison below spans the run. The
     // worker-side invocations default to `generate` and land inside the
     // attempt window instead (see TASKCTL_ACCEPTANCE_MODE in the README).
+    // The gate's shell is spawned in its own process group (D4): a Ctrl-C that
+    // lands on the attempt reaches this controller alone, and the confirmed
+    // cancel of the cut gate is the controller's own.
     result = await controlled(r, "acceptance", r.cfg.acceptanceTimeoutMs ?? ACCEPTANCE_TIMEOUT_MS_DEFAULT,
-      () => r.deps.acceptance ? legacyExecution(() => r.deps.acceptance!(command, r.cfg.workdir)) : startAcceptance(command, r.cfg.workdir, "check"));
+      () => r.deps.acceptance ? legacyExecution(() => r.deps.acceptance!(command, r.cfg.workdir)) : startAcceptance(command, r.cfg.workdir, "check", { insulated: true }));
   } catch (err) {
     if (!(err instanceof WorkerTimeoutError)) throw err;
     result = {
@@ -1637,6 +1673,9 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
     };
   }
   const artifactAfter = await artifactDigest(r.cfg.workdir, digestExclusions(r.cfg), r.cfg.artifactIgnore ?? []);
+  // A gate that ended as the stop was observed is not judged: nothing below
+  // writes evidence or spends a retry, and the attempt settles instead.
+  assertNotStopped(r);
   // All controller writers use the same mutex as takeover for final validation/write.
   // The review runs outside this guard: it takes the same mutex for its own
   // writes, and nesting would deadlock the task against itself.
@@ -1753,12 +1792,24 @@ async function acceptRender(
   await mkdir(evidenceDir, { recursive: true });
   let check: RenderCheck;
   try {
-    check = await checkRender({
+    const running = checkRender({
       targets: r.task.renderTargets.map((target) => join(r.cfg.workdir, target)),
       ...(r.cfg.renderViewports === undefined ? {} : { viewports: r.cfg.renderViewports }),
       evidenceDir,
       ...(r.cfg.chromeBin === undefined ? {} : { chromeBin: r.cfg.chromeBin }),
     });
+    // The stop ends the wait, never the check (D4): the check still runs to
+    // its own end — each of its steps is bounded at 30 s — and its `finally`
+    // closes the browser.
+    const first = r.deps.stop === undefined
+      ? await running
+      : await Promise.race([running, r.deps.stop.observed.then(() => STOP)]);
+    if (first instanceof StopObservedDuringRenderCheck) {
+      emit(r, "stop-requested", "render check in progress; it ends before anything is judged (each step is bounded at 30 s)");
+      await running.catch(() => {});
+      throw new OperatorStoppedError("render check", false);
+    }
+    check = first;
   } catch (err) {
     if (err instanceof RenderUnavailableError) {
       await owned(r, () => appendJournal(r.cfg.tasksDir, id, {
@@ -1772,6 +1823,8 @@ async function acceptRender(
     }
     throw err;
   }
+  // A stop observed while the check ran: the verdict it returned is not judged.
+  if (r.deps.stop?.isRequested()) throw new OperatorStoppedError("render check", false);
   const evidenceDigest = await attemptDefinition(r);
   await owned(r, () => writeRuntime(r.cfg.tasksDir, id, "render.json", {
     ...check, model, definitionDigest: evidenceDigest, escalated: r.escalated,
@@ -1794,6 +1847,9 @@ async function acceptRender(
     event: "acceptance",
     detail: `render failed: ${failures.join(" | ")}`,
   }));
+  // Checked once more at the judgement itself: a stop that landed between the
+  // record above and this retry spends nothing.
+  if (r.deps.stop?.isRequested()) throw new OperatorStoppedError("render check", false);
   if (await fail(r)) return "blocked";
   return "retry";
 }
@@ -1903,6 +1959,9 @@ async function reviewStage(
     if (result.reviewerSessionId) {
       await captureUsage(r, "reviewer", result.reviewerSessionId, reviewerModel, Date.now() - reviewStarted);
     }
+    // A stop observed during the reviewer's telemetry: the verdict is not
+    // judged — `review.json` keeps what it had, and the attempt settles.
+    assertNotStopped(r);
     if (result.failure !== "provider") {
       // A provider rejection is not a verdict, so nothing is recorded as one:
       // review.json keeps the last real verdict, and a later real verdict is
@@ -2173,6 +2232,8 @@ async function overBudget(r: Run, sessionId: string | undefined, model: string |
     return usage;
   } catch (err) {
     if (err instanceof OwnershipLostError || err instanceof UncertainExecutionError) throw err;
+    // A stop must not be journaled as an unavailable telemetry call.
+    if (err instanceof OperatorStoppedError) throw err;
     // A silent "not over budget" reads as a measured answer. Say once that the
     // check could not run, so a control plane that stopped answering is visible.
     if (!r.budgetUnavailableNoted) {

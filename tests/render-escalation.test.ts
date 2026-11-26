@@ -8,11 +8,14 @@ vi.mock("../src/render.js", async (importOriginal) => {
   return { ...actual, checkRender: vi.fn() };
 });
 
-import { checkRender } from "../src/render.js";
-import { runTask, type WorkerConfig } from "../src/worker.js";
+import { checkRender, type RenderCheck } from "../src/render.js";
+import { readAttempt, readRuntime } from "../src/runtime.js";
+import { runTask, type WorkerConfig, type WorkerEvent } from "../src/worker.js";
 import { TaskStore } from "../src/task-store.js";
 import { serializeTaskFile } from "../src/task-file.js";
 import { buildTaskFile } from "./helpers/task-fixture.js";
+import { manualStopNow } from "./helpers/stop-fixture.js";
+import { markDoneTask } from "./helpers/watch-fixture.js";
 
 let root: string;
 let tasks: string;
@@ -73,3 +76,41 @@ describe("escalated render verification", () => {
     expect((await store.get("a")).status).toBe("done");
   });
 });
+
+it("a stop during the render check waits for the check, judges nothing, and returns the task to open", async () => {
+  const task = buildTaskFile({ id: "a", status: "open", verify: "render", renderTargets: ["index.html"], criteria: ["C1 page works"], execution: "continuous", complexity: "simple" });
+  await writeFile(join(tasks, "a.md"), serializeTaskFile(task), "utf8");
+  let finish!: (check: RenderCheck) => void;
+  let checkEnded = false;
+  vi.mocked(checkRender).mockReturnValue(new Promise<RenderCheck>((resolve) => {
+    finish = (check) => { checkEnded = true; resolve(check); };
+  }));
+  const store = new TaskStore(tasks);
+  const cfg: WorkerConfig = { tasksDir: tasks, workdir: work, agent: "fixture", contextThreshold: 0.8, retryLimit: 1, lockTtlMs: 5_000, heartbeatMs: 50 };
+  const stop = manualStopNow();
+  const events: WorkerEvent[] = [];
+  const outcome = runTask(cfg, {
+    store, stop, onEvent: (event) => events.push(event),
+    adapter: { prompt: async (args) => { await markDoneTask(args.text, tasks); return { sessionId: "s", exitCode: 0, text: "done" }; }, contextUsage: async () => 0, contextLimit: async () => 100 },
+  }, await store.get("a"), "w1");
+  try {
+    await vi.waitFor(() => expect(checkRender).toHaveBeenCalledOnce());
+    stop.trigger("file");
+    // The wait is visible at once …
+    await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({ type: "stop-requested", taskId: "a" })));
+    // … and the check is not abandoned: the attempt is still open until the check ends.
+    expect(await Promise.race([outcome.then(() => "settled"), new Promise((resolve) => setTimeout(() => resolve("still running"), 150))])).toBe("still running");
+  } finally {
+    // The attempt only settles once the check ends, so end it here too: a
+    // failure above would otherwise leave the attempt (and its heartbeat)
+    // running over a directory the afterEach is about to remove.
+    finish?.({ ok: false, browser: "fake", at: new Date().toISOString(),
+      views: [{ target: join(work, "index.html"), viewport: "1440x900", ok: false, problems: ["blank"], screenshot: "shot.png", measurements: { scrollWidth: 100, clientWidth: 100, textLength: 0, images: 0, brokenImages: 0 } }] });
+    expect(checkEnded).toBe(true);
+    await Promise.race([outcome.catch(() => {}), new Promise((resolve) => setTimeout(resolve, 5_000))]);
+  }
+  expect(await outcome).toBe("stopped");
+  expect(await store.get("a")).toMatchObject({ status: "open", retries: 0 });
+  expect(await readRuntime(tasks, "a", "render.json")).toBeNull();
+  expect(await readAttempt(tasks, "a")).toMatchObject({ phase: "settled", operation: "render check", reason: "stopped by operator" });
+}, 10_000);

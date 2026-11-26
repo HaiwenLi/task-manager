@@ -285,7 +285,9 @@ export function startReview(deps: ReviewDeps, evidence: ReviewEvidence): Executi
   }
   let state: "running" | "exited" = "running";
   const result = deps.adapter.prompt(args).then(finish).finally(() => { state = "exited"; });
-  return { result, inspect: () => ({ state }), cancel: async () => false };
+  // A prompt-only adapter cannot prove cancellation: the review finishes on
+  // its own, and the stop surfaces at the next `controlled`.
+  return { result, inspect: () => ({ state }), cancel: async () => false, interruptible: false };
 }
 
 function degraded(ids: string[], reason: string): ReviewResult {
