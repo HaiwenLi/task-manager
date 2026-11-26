@@ -8,8 +8,27 @@ vi.mock("../src/render.js", async (importOriginal) => {
   return { ...actual, checkRender: vi.fn() };
 });
 
+vi.mock("../src/runtime.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/runtime.js")>();
+  return {
+    ...actual,
+    writeRuntime: async (tasksDir: string, id: string, name: string, record: unknown) => {
+      const written = await actual.writeRuntime(tasksDir, id, name, record);
+      // The one pass-through seam this suite needs: a stop that lands after the
+      // render check returned and before its judgement has no adapter seam to
+      // fire from, so the record's own write asks for it.
+      if (name === "render.json") stopWhenRenderRecorded?.();
+      return written;
+    },
+  };
+});
+
+let stopWhenRenderRecorded: (() => void) | undefined;
+
 import { checkRender, type RenderCheck } from "../src/render.js";
 import { readAttempt, readRuntime } from "../src/runtime.js";
+import { readJournal } from "../src/journal.js";
+import { latestNote } from "../src/handoff.js";
 import { runTask, type WorkerConfig, type WorkerEvent } from "../src/worker.js";
 import { TaskStore } from "../src/task-store.js";
 import { serializeTaskFile } from "../src/task-file.js";
@@ -113,4 +132,29 @@ it("a stop during the render check waits for the check, judges nothing, and retu
   expect(await store.get("a")).toMatchObject({ status: "open", retries: 0 });
   expect(await readRuntime(tasks, "a", "render.json")).toBeNull();
   expect(await readAttempt(tasks, "a")).toMatchObject({ phase: "settled", operation: "render check", reason: "stopped by operator" });
+}, 10_000);
+
+it("a stop after the render check returned judges nothing: no retry is spent on the verdict", async () => {
+  const task = buildTaskFile({ id: "a", status: "open", verify: "render", renderTargets: ["index.html"], criteria: ["C1 page works"], execution: "continuous", complexity: "simple" });
+  await writeFile(join(tasks, "a.md"), serializeTaskFile(task), "utf8");
+  vi.mocked(checkRender).mockResolvedValue({ ok: false, browser: "fake", at: new Date().toISOString(),
+    views: [{ target: join(work, "index.html"), viewport: "1440x900", ok: false, problems: ["blank"], screenshot: "shot.png", measurements: { scrollWidth: 100, clientWidth: 100, textLength: 0, images: 0, brokenImages: 0 } }] });
+  const store = new TaskStore(tasks);
+  const cfg: WorkerConfig = { tasksDir: tasks, workdir: work, agent: "fixture", contextThreshold: 0.8, retryLimit: 1, lockTtlMs: 5_000, heartbeatMs: 50 };
+  const stop = manualStopNow();
+  // The guard under test sits between the record's write and the judgement,
+  // where no adapter seam fires: the record's own write asks for the stop.
+  stopWhenRenderRecorded = () => stop.trigger("file");
+  const outcome = runTask(cfg, {
+    store, stop,
+    adapter: { prompt: async (args) => { await markDoneTask(args.text, tasks); return { sessionId: "s", exitCode: 0, text: "done" }; }, contextUsage: async () => 0, contextLimit: async () => 100 },
+  }, await store.get("a"), "w1");
+  expect(await outcome).toBe("stopped");
+  expect(await store.get("a")).toMatchObject({ status: "open", retries: 0, reviewRounds: 0 });
+  // The check's own record stands; nothing was judged on it: no retry spent on
+  // the failed verdict, no rework note, no review round.
+  expect(await readRuntime(tasks, "a", "render.json")).toMatchObject({ ok: false });
+  expect(await readAttempt(tasks, "a")).toMatchObject({ phase: "settled", operation: "render check", reason: "stopped by operator" });
+  expect((await readJournal(tasks, "a")).map((line) => line.event)).not.toContain("rework");
+  expect(await latestNote(tasks, "a")).toBeNull();
 }, 10_000);

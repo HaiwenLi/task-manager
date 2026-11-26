@@ -15,7 +15,7 @@ import { readAttempt, readRuntime, writeRuntime } from "../src/runtime.js";
 import type { StopNow } from "../src/stop.js";
 import type { Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
-import { runTask, type WorkerConfig, type WorkerDeps, type WorkerEvent } from "../src/worker.js";
+import { runTask, type WorkerConfig, type WorkerDeps, type WorkerEvent, type WorkerStore } from "../src/worker.js";
 import { reserveWorkspace } from "../src/workspace.js";
 import { CATALOGUE } from "./helpers/catalogue-fixture.js";
 import { buildTaskFile } from "./helpers/task-fixture.js";
@@ -44,37 +44,65 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
-type Turn = "work" | "done" | { hang: "confirm" | "unconfirmed" };
-type Scripted = AgentAdapter & { sessionIds: Array<string | undefined>; hanging: Promise<void> };
+type Turn = "work" | "done" | { hang: "confirm" | "unconfirmed" } | { stopWhenSettled: true };
+type Scripted = AgentAdapter & { sessionIds: Array<string | undefined>; hanging: Promise<void>; announced: Promise<void> };
 
-/** Turns scripted one by one: "work" answers without a completion request, "done" writes it, a hanging turn never ends until the controller cancels it. */
-function scriptedTurns(script: Turn[], hooks: { beforeHang?: () => Promise<void> } = {}): Scripted {
+/** Turns scripted one by one: "work" answers without a completion request, "done" writes it, a hanging turn never ends until the controller cancels it, and a `stopWhenSettled` turn asks for the operator's stop the first time `controlled` looks at it after it settled. */
+function scriptedTurns(script: Turn[], hooks: { beforeHang?: () => Promise<void>; hangAnnouncesSession?: boolean; stopWhenSettled?: () => void } = {}): Scripted {
   const worker = doneAdapter({ tasksDir: tasks, sessionId: () => "ses-a", canResumeSession: async () => "reusable" });
   const sessionIds: Array<string | undefined> = [];
   let notify!: () => void;
   const hanging = new Promise<void>((resolve) => { notify = resolve; });
+  let announce!: () => void;
+  const announced = new Promise<void>((resolve) => { announce = resolve; });
   return {
     ...worker,
     sessionIds,
     hanging,
+    announced: hooks.hangAnnouncesSession === true ? announced : Promise.resolve(),
     prompt: async () => { throw new Error("every turn goes through start"); },
     start: (args): Execution<PromptResult> => {
       sessionIds.push(args.sessionId);
       const turn = script.shift() ?? { hang: "confirm" as const };
-      if (typeof turn === "string") {
+      if (typeof turn === "string" || (typeof turn === "object" && "stopWhenSettled" in turn)) {
         // A settled answer is an exited execution: without the flip `controlled`
         // reads the turn as an unconfirmed shutdown, exactly as it would for a
         // real client that finished (`legacyExecution`) — see the RED run note.
         let state: "running" | "exited" = "running";
-        const result = (turn === "done" ? worker.prompt(args) : Promise.resolve({ sessionId: "ses-a", exitCode: 0, text: "working" }))
+        const result = (typeof turn === "string" && turn === "done" ? worker.prompt(args) : Promise.resolve({ sessionId: "ses-a", exitCode: 0, text: "working" }))
           .finally(() => { state = "exited"; });
-        return { result, inspect: () => ({ state }), cancel: async () => false, interruptible: false };
+        const asksStopWhenSettled = typeof turn === "object" && "stopWhenSettled" in turn;
+        let asked = false;
+        return {
+          result,
+          inspect: () => {
+            // The first look after the turn settled is `controlled`'s own check
+            // before it returns the value: a stop asked there is pending before
+            // the caller goes on — the window the telemetry catches guard.
+            if (asksStopWhenSettled && state === "exited" && !asked) { asked = true; hooks.stopWhenSettled?.(); }
+            return { state };
+          },
+          cancel: async () => false, interruptible: false,
+        };
       }
       let state: "running" | "exited" = "running";
+      let announcedSession = false;
       void Promise.resolve().then(() => hooks.beforeHang?.()).then(notify, notify);
+      // With `hangAnnouncesSession` the hang models a backend whose session id
+      // only becomes known mid-flight: the fake announces it once the turn is
+      // running, and the announced id is a live client's knowledge — `inspect`
+      // reports it while the turn runs, and a cancelled client reports nothing
+      // about its session any more.
+      const announcesSession = hooks.hangAnnouncesSession === true;
+      if (announcesSession) void Promise.resolve().then(() => { announcedSession = true; announce(); });
       return {
         result: new Promise<PromptResult>(() => {}),
-        inspect: () => ({ state, sessionId: args.sessionId ?? "ses-cut" }),
+        inspect: () => ({
+          state,
+          ...(announcesSession
+            ? (state === "running" && announcedSession ? { sessionId: args.sessionId ?? "ses-cut" } : {})
+            : { sessionId: args.sessionId ?? "ses-cut" }),
+        }),
         cancel: async () => {
           // Only a confirmed cancellation ends the execution: an end that could
           // not be confirmed leaves it running — that is what "unconfirmed" means.
@@ -134,6 +162,28 @@ it("the session a cut turn ran on is marked dirty, so the rerun starts a fresh o
   const second = scriptedTurns(["done"]);
   expect(await runTask(cfg, deps(second, manualStopNow()), await store.get("a"), "w2")).toBe("done");
   expect(second.sessionIds).toEqual([undefined]);
+}, 8_000);
+
+it("a stop records the session id the cut turn announced, before any heartbeat could carry it", async () => {
+  await seedTaskFile(tasks, mechanical("a"));
+  const stop = manualStopNow();
+  // The tick interval is `min(heartbeatMs, lockTtlMs / 3)`: with the fixture's
+  // 5 s lock the 60 s heartbeat would still tick about every 1.7 s. A tick is
+  // the other writer of the session id, so the lock is raised with it and the
+  // first tick is a minute away.
+  const agent = scriptedTurns([{ hang: "confirm" }], { hangAnnouncesSession: true });
+  const running = runTask({ ...cfg, lockTtlMs: 180_000 }, deps(agent, stop), await store.get("a"), "w1");
+  await agent.hanging;
+  await agent.announced;
+  // The id is live on the execution, but no record carries it yet: the dispatch
+  // checkpoint saw none, and no heartbeat tick has fired.
+  expect((await readAttempt(tasks, "a"))?.sessionId).toBeUndefined();
+  stop.trigger("file");
+  expect(await settles(running)).toBe("stopped");
+  // The stop branch copies the live execution's session id before it settles,
+  // and the session the attempt recorded is the one that was cut.
+  expect(await readAttempt(tasks, "a")).toMatchObject({ phase: "settled", operation: "agent turn", sessionId: "ses-cut", reason: "stopped by operator" });
+  expect(await readExecutionState(tasks, "a")).toMatchObject({ latestWorker: { sessionId: "ses-cut", clean: false } });
 }, 8_000);
 
 it("an unconfirmed cancellation is recorded uncertain and blocks, never as a clean stop", async () => {
@@ -371,6 +421,46 @@ it("a stop during an automatic review resumption returns the task to open, where
   expect(await readRuntime(tasks, "a", "review.json")).toBeNull();
 }, 8_000);
 
+it("a stop during a review turn that cannot prove cancellation finishes it and judges nothing", async () => {
+  await seedTaskFile(tasks, mechanical("a", { verify: "human" }));
+  const stop = manualStopNow();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let asked = false;
+  const worker = doneAdapter({ tasksDir: tasks, sessionId: () => "s-a" });
+  // A prompt-only adapter (no `start`): `startReview` cannot prove cancellation,
+  // so the review finishes on its own and the stop surfaces at the next
+  // `controlled` — never as a race against an execution that cannot be cancelled.
+  const agent: AgentAdapter = {
+    ...worker,
+    prompt: async (args) => {
+      if (args.text.includes("独立复核者")) {
+        asked = true;
+        stop.trigger("file"); // the stop lands while the review turn is in flight
+        await held;
+        return { sessionId: "s-review", exitCode: 0, text: "done" };
+      }
+      return worker.prompt(args);
+    },
+  };
+  const running = runTask(cfg, deps(agent, stop), await store.get("a"), "w1");
+  await waitForCondition(() => asked);
+  // The stop is observed while the review turn is in flight: under a racing
+  // review execution the attempt is already recorded uncertain before the
+  // reviewer answers. Under the fix nothing consumes the stop until the
+  // release below, so the bounded wait runs out first.
+  await Promise.race([
+    waitForConditionAsync(async () => (await readAttempt(tasks, "a"))?.phase === "uncertain", 3_000),
+    new Promise((resolve) => setTimeout(resolve, 750)),
+  ]);
+  release(); // the review finishes on its own
+  expect(await settles(running)).toBe("stopped");
+  expect(await store.get("a")).toMatchObject({ status: "open", retries: 0, reviewRounds: 0 });
+  expect(await readRuntime(tasks, "a", "review.json")).toBeNull();
+  expect(await readAttempt(tasks, "a")).toMatchObject({ phase: "settled", operation: "review", reason: "stopped by operator" });
+  expect((await readJournal(tasks, "a")).map((line) => line.event)).not.toContain("stop-unconfirmed");
+}, 8_000);
+
 it("a stop observed during telemetry is not an uncertain stop and is not recorded as unavailable", async () => {
   await seedTaskFile(tasks, mechanical("a"));
   const stop = manualStopNow();
@@ -448,6 +538,47 @@ it("a stop observed during the reviewer's telemetry writes no verdict", async ()
   expect(await settles(running)).toBe("stopped");
   expect(await readRuntime(tasks, "a", "review.json")).toBeNull();
   expect(await store.get("a")).toMatchObject({ status: "open", retries: 0 });
+}, 8_000);
+
+it("a stop already pending when the telemetry dispatches is not journaled as unavailable", async () => {
+  await seedTaskFile(tasks, mechanical("a"));
+  const stop = manualStopNow();
+  const scripted = scriptedTurns([{ stopWhenSettled: true }], { stopWhenSettled: () => stop.trigger("file") });
+  const agent: AgentAdapter = { ...scripted, sessionUsage: async () => ({ input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0 }) };
+  // The turn wins the race, then asks for the stop as `controlled` looks at the
+  // execution once more: the stop is already pending when `captureUsage`
+  // dispatches — `loop` goes straight from the turn to the telemetry call, with
+  // no stop check between them, so the catch's rethrow is what keeps the stop
+  // out of the journal.
+  const running = runTask(cfg, deps(agent, stop), await store.get("a"), "w1");
+  expect(await settles(running)).toBe("stopped");
+  expect(await store.get("a")).toMatchObject({ status: "open", retries: 0 });
+  expect(await readAttempt(tasks, "a")).toMatchObject({ phase: "settled", operation: "agent turn", reason: "stopped by operator" });
+  const journaled = (await readJournal(tasks, "a")).map((line) => line.event);
+  expect(journaled).not.toContain("usage-unavailable");
+  expect(journaled).not.toContain("turn-failed");
+}, 8_000);
+
+it("a stop pending when the context telemetry dispatches is not journaled as unavailable either", async () => {
+  await seedTaskFile(tasks, mechanical("a"));
+  const stop = manualStopNow();
+  const agent = scriptedTurns(["work"]);
+  // The stop lands in the ownership-guarded session recording, after the loop's
+  // post-telemetry check has passed: `overBudget` is reached with the stop
+  // already pending, and its telemetry dispatch must not journal it either.
+  const stoppingStore: WorkerStore = {
+    list: () => store.list(),
+    setStatus: (id, status) => store.setStatus(id, status),
+    appendSession: async (id, sessionId) => { await store.appendSession(id, sessionId); stop.trigger("file"); },
+    incRetries: (id) => store.incRetries(id),
+    readDoneMarker: (id) => store.readDoneMarker(id),
+    clearDoneMarker: (id) => store.clearDoneMarker(id),
+    incReviewRounds: (id) => store.incReviewRounds(id),
+  };
+  const running = runTask(cfg, deps(agent, stop, { store: stoppingStore }), await store.get("a"), "w1");
+  expect(await settles(running)).toBe("stopped");
+  expect(await store.get("a")).toMatchObject({ status: "open", retries: 0 });
+  expect((await readJournal(tasks, "a")).map((line) => line.event)).not.toContain("context-budget-unavailable");
 }, 8_000);
 
 const fake = fileURLToPath(new URL("./adapters/fake-opencode.mjs", import.meta.url));
