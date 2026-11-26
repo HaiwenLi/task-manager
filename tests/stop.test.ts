@@ -115,6 +115,38 @@ it("nothing is polled while no attempt is held; a scheduling boundary still sees
   } finally { await stop.close(); }
 });
 
+it("a release called twice does not silence the next hold", async () => {
+  const stop = await createStopNow(tasks, { pollMs: 10 });
+  try {
+    const first = stop.hold();
+    first();
+    first();
+    const second = stop.hold();
+    await requestStop(tasks, "now");
+    // A bound the test states: a run that never sees the request fails here
+    // instead of waiting on the suite's timeout.
+    const observed = await Promise.race([
+      stop.observed,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("the interrupt was not observed within 2 s")), 2_000)),
+    ]);
+    expect(observed).toBe("file");
+    second();
+  } finally { await stop.close(); }
+});
+
+it("hold after close starts no poll", async () => {
+  const stop = await createStopNow(tasks, { pollMs: 10 });
+  const first = stop.hold();
+  first();
+  await stop.close();
+  const second = stop.hold();
+  await requestStop(tasks, "now");
+  // Several poll intervals: a poll started here would have seen the request.
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  expect(stop.isRequested()).toBe(false);
+  second();
+});
+
 it("close unsubscribes from signals and awaits what a signal started", async () => {
   const signals = manualSignals();
   let calls = 0;

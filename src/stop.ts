@@ -132,14 +132,23 @@ export async function createStopNow(
   };
   let timer: NodeJS.Timeout | undefined;
   let holders = 0;
+  let closed = false;
   const tick = (): void => { void look(); };
   const hold = (): (() => void) => {
+    // A closed controller is over: a poll started after `close()` would never
+    // be cleared again, and nothing would stop it looking at the board.
+    if (closed) return () => {};
     holders += 1;
     if (holders === 1 && timer === undefined) {
       timer = setInterval(tick, options.pollMs ?? STOP_POLL_MS);
       timer.unref();
     }
+    let released = false;
     return () => {
+      // A release acts once: a second call would take another hold's count
+      // below zero, and that hold would then start no poll at all.
+      if (released) return;
+      released = true;
       holders -= 1;
       if (holders === 0) {
         clearInterval(timer);
@@ -152,6 +161,8 @@ export async function createStopNow(
     signal(sig);
   });
   const close = async (): Promise<void> => {
+    // Every later `hold()` must be inert: `close()` is the last clear there is.
+    closed = true;
     if (timer !== undefined) {
       clearInterval(timer);
       timer = undefined;
