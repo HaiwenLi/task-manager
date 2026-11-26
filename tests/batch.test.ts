@@ -16,6 +16,7 @@ import { passBudget } from "../src/scheduler.js";
 import type { Task } from "../src/task-file.js";
 import type { WorkerConfig, WorkerDeps } from "../src/worker.js";
 import { buildTaskFile } from "./helpers/task-fixture.js";
+import { manualStopNow } from "./helpers/stop-fixture.js";
 
 function eligible(id: string, overrides: Partial<Task> = {}): Task {
   return buildTaskFile({
@@ -346,6 +347,22 @@ describe("runBatch", () => {
     });
     expect(calls).toEqual(["a"]);
     expect(result).toEqual({ done: ["a"], stoppedAt: "b", outcome: "stop-requested", pending: ["b", "c"] });
+  });
+
+  it.each(["done", "stopped"] as const)("claims nothing after the current task was %s with a stop pending", async (outcome) => {
+    board = [eligible("a"), eligible("b"), eligible("c")];
+    const stop = manualStopNow();
+    const calls: string[] = [];
+    const run: BatchRunOptions["run"] = async (_cfg, _deps, task) => {
+      calls.push(task.id);
+      if (task.id === "a") { stop.trigger("file"); return outcome; }
+      return "done";
+    };
+    const result = await runBatch(cfg, { ...deps, stop }, ["a", "b", "c"], { run });
+    expect(calls).toEqual(["a"]);
+    expect(result).toEqual(outcome === "done"
+      ? { done: ["a"], stoppedAt: "b", outcome: "stop-requested", pending: ["b", "c"] }
+      : { done: [], stoppedAt: "a", outcome: "stopped", pending: ["b", "c"] });
   });
 
   it("stops on a deferred current task and says when it may run again", async () => {

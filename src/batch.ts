@@ -222,7 +222,7 @@ export async function runBatch(
     const original = originals.get(selectedTask.id)!;
     const preamble = `## 连续批次\n- 当前任务：${selectedTask.id}\n- 前面已完成：${done.join(", ") || "无"}\n- 不要重做前面已完成的任务，也不要修改它们的定义或任务文件；只完成当前任务并独立验收。\n\n`;
     for (let attempt = 1; ; attempt++) {
-      if (await shouldStop()) {
+      if (await shouldStop() || (deps.stop !== undefined && (deps.stop.isRequested() || await deps.stop.check()))) {
         return {
           done,
           stoppedAt: selectedTask.id,
@@ -279,11 +279,14 @@ export async function runBatch(
       }
       // A batch is serial, so nothing else is in flight: a task that ran out
       // of rounds is decided here, and a deferral ends the batch, which does
-      // not wait inside itself.
-      const settled = await settleExhausted(cfg, deps, board, [selectedTask.id]);
-      const rest = selected.slice(index + 1).map((task) => task.id);
-      if (settled.outage !== undefined) return { done, stoppedAt: settled.outage.taskId, outcome: "outage", pending: rest };
-      if (settled.held.includes(selectedTask.id)) return { done, stoppedAt: selectedTask.id, outcome: "blocked", pending: rest };
+      // not wait inside itself. Not under a stop (D13b): what the operator
+      // stopped is not evidence of an outage the run collected.
+      if (!(await shouldStop())) {
+        const settled = await settleExhausted(cfg, deps, board, [selectedTask.id]);
+        const rest = selected.slice(index + 1).map((task) => task.id);
+        if (settled.outage !== undefined) return { done, stoppedAt: settled.outage.taskId, outcome: "outage", pending: rest };
+        if (settled.held.includes(selectedTask.id)) return { done, stoppedAt: selectedTask.id, outcome: "blocked", pending: rest };
+      }
       const hold = (await modelWaitHolds(cfg, [selectedTask.id])).get(selectedTask.id);
       if (hold !== undefined) {
         return {

@@ -1,11 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskStore } from "../src/task-store.js";
 import { runScheduler, type SchedulerOptions } from "../src/scheduler.js";
-import type { WorkerConfig } from "../src/worker.js";
+import { MODEL_ROUNDS_DEFAULT, newRunContext, writeModelWait, type ModelWaitRecord } from "../src/model-wait.js";
+import type { runTask, WorkerConfig } from "../src/worker.js";
 import type { AgentAdapter } from "../src/adapters/types.js";
+import { manualStopNow } from "./helpers/stop-fixture.js";
 
 let root: string;
 let tasks: string;
@@ -269,5 +271,101 @@ describe("runScheduler", () => {
     expect(result).toEqual({ done: [], blocked: [], pending: [] });
     expect(await readFile(snapshot, "utf8")).toBe(contents);
     expect((await store.scan()).ignored).toEqual(["013-snapshot-at-relaunch.md"]);
+  });
+
+  const START = new Date("2026-11-25T10:00:00.000Z");
+  /** A deferral of `run`'s, as part 1's attempt leaves it. */
+  const deferral = (run: ReturnType<typeof newRunContext>, rounds = 1): ModelWaitRecord => ({
+    runId: run.id, stage: "worker", rounds, firstRefusedAt: START.toISOString(), refusals: [],
+    nextAt: new Date(START.getTime() + 60_000).toISOString(), updatedAt: START.toISOString(),
+  });
+
+  it("a stop interrupts every task in flight and offers nothing afterwards", async () => {
+    await seed("001-a", ["workdir: a"]);
+    await seed("002-b", ["workdir: b"]);
+    await seed("003-c", ["workdir: same"]); // still pending when the stop lands: the next `startAvailable` must not take it
+    const stop = manualStopNow();
+    const calls: string[] = [];
+    let listings = 0;
+    const counting = Object.create(store) as TaskStore;
+    counting.list = async () => { listings += 1; return store.list(); };
+    let began = 0;
+    let both!: () => void;
+    const inFlight = new Promise<void>((resolve) => { both = resolve; });
+    const interrupted: typeof runTask = async (_cfg, runDeps, task) => {
+      calls.push(task.id);
+      if (++began === 2) both();
+      await runDeps.stop!.observed;
+      return "stopped";
+    };
+    const running = runScheduler(config({ parallel: 2 }), { store: counting, adapter: adapter(), acceptance: failGate, stop }, { run: interrupted });
+    await inFlight;
+    stop.trigger("file");
+    const result = await running;
+    expect([...calls].sort()).toEqual(["001-a", "002-b"]);
+    expect([...result.stopped!].sort()).toEqual(["001-a", "002-b"]);
+    expect(result).toMatchObject({ done: [], blocked: [], pending: [] });
+    // One pass, one scan: the interrupted tasks are `open` again and must not be re-offered.
+    expect(listings).toBe(1);
+  });
+
+  it("nothing is claimed once a stop was already requested", async () => {
+    await seed("001-a");
+    const stop = manualStopNow();
+    stop.trigger("SIGINT");
+    const run = vi.fn(settling);
+    const result = await runScheduler(config(), { store, adapter: adapter(), acceptance: failGate, stop }, { run });
+    expect(run).not.toHaveBeenCalled();
+    expect(result).toEqual({ done: [], blocked: [], pending: [] });
+  });
+
+  it("a run the operator stopped declares no outage", async () => {
+    await seed("001-a", ["workdir: a"]);
+    await seed("002-b", ["workdir: b"]);
+    const run = newRunContext(START);
+    const stop = manualStopNow();
+    let ranOut!: () => void;
+    const ranOutAt = new Promise<void>((resolve) => { ranOut = resolve; });
+    // Not awaited: the run holds b until the stop below; `result` is the run's promise.
+    const result = runScheduler(config({ parallel: 2, run }), { store, adapter: adapter(), acceptance: failGate, stop }, {
+      run: async (_cfg, runDeps, task) => {
+        if (task.id === "001-a") {
+          // a ran out of rounds and only recorded it: the controller decides once nothing is in flight (part 1).
+          await writeModelWait(tasks, "001-a", deferral(run, MODEL_ROUNDS_DEFAULT));
+          ranOut();
+          return "open";
+        }
+        await ranOutAt;
+        await runDeps.stop!.observed;
+        return "stopped";
+      },
+    });
+    await ranOutAt;
+    stop.trigger("file");
+    await expect(result).resolves.toEqual({ done: [], blocked: [], pending: [], stopped: ["002-b"] });
+    // Left as no controller leaves it: `open`, its rounds spent, waiting for the owner.
+    expect(await store.get("001-a")).toMatchObject({ status: "open", retries: 0 });
+  });
+
+  it("a stop ends a wait for a model window at once, and nothing is offered after it", async () => {
+    await seed("001-a");
+    const run = newRunContext(START);
+    await writeModelWait(tasks, "001-a", deferral(run));
+    const stop = manualStopNow();
+    const offered: string[] = [];
+    let waiting!: () => void;
+    const waited = new Promise<void>((resolve) => { waiting = resolve; });
+    const running = runScheduler(config({ run }), {
+      store, adapter: adapter(), acceptance: failGate, stop,
+      onEvent: (event) => { if (event.type === "model-wait") waiting(); },
+    }, {
+      run: async (cfg, deps, task, workerId) => { offered.push(task.id); return settling(cfg, deps, task, workerId); },
+      now: () => START,
+      sleep: () => new Promise<void>(() => {}), // a sleep that never ends: only the stop can end the wait
+    });
+    await waited;
+    stop.trigger("file");
+    expect(await running).toEqual({ done: [], blocked: [], pending: [] });
+    expect(offered).toEqual([]);
   });
 });

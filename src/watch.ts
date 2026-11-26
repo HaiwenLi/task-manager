@@ -78,7 +78,7 @@ export type WatchEnd = { reason: "stop" } | { reason: "outage"; taskId: string }
 /**
  * Own and drain one board until `.taskctl/stop.requested` appears. The loop is
  * sequential on purpose: new arrivals are considered only between operations,
- * and a stop never becomes a process-tree kill or an uncertain replay.
+ * and a graceful stop never becomes a process-tree kill or an uncertain replay.
  *
  * A task the budget guard refused is left out of the candidates for a while
  * and judged again after that (see {@link scheduleOnce}), so the task behind
@@ -86,6 +86,9 @@ export type WatchEnd = { reason: "stop" } | { reason: "outage"; taskId: string }
  * waiting for its next model window is left out the same way, and when the
  * controller declares an outage the queue ends at once — the caller reports
  * it; no stop request is written, so the next watch needs no `--resume`.
+ *
+ * A graceful stop never interrupts; an interrupt (`stop --now`, a signal)
+ * cancels the attempt in flight and is confirmed before anything is recorded.
  */
 export async function watchQueue(
   cfg: WorkerConfig,
@@ -124,6 +127,11 @@ export async function watchQueue(
     wakeResolver = undefined;
     resolve?.();
   };
+  // An idle watch must not sit out its fallback after an interrupt: the wake
+  // ends the wait and the loop top reads the stop. A request from the board
+  // needs no wake of its own — the control directory is watched, and `stop
+  // --now` writes into it.
+  void deps.stop?.observed.then(() => wake());
   const onFilesystem = (): void => {
     if (debounce !== undefined) clearTimeout(debounce);
     debounce = setTimeout(() => {
@@ -142,7 +150,11 @@ export async function watchQueue(
     fallback = undefined;
     wakeRequested = false;
   };
-  const stopOrLost = async (): Promise<boolean> => ownershipError !== undefined || await stopRequested(cfg.tasksDir);
+  const stopOrLost = async (): Promise<boolean> =>
+    ownershipError !== undefined
+    || deps.stop?.isRequested() === true
+    || await deps.stop?.check() === true
+    || await stopRequested(cfg.tasksDir);
   const beat = (): void => {
     heartbeatTimer = setTimeout(() => {
       renewal = (async () => {
@@ -182,8 +194,11 @@ export async function watchQueue(
     beat();
 
     for (;;) {
-      if (await stopRequested(cfg.tasksDir)) return { reason: "stop" };
+      // Ownership first: a lost lock ends the watch as a thrown error, never
+      // as a graceful stop. Then the stop — a request on the board, or this
+      // process's own interrupt source.
       if (ownershipError !== undefined) throw ownershipError;
+      if (await stopOrLost()) return { reason: "stop" };
       let scheduled: Awaited<ReturnType<typeof scheduleOnce>>;
       try {
         scheduled = await scheduleOnce(cfg, deps, runOne, runSelected, stopOrLost, refusedAt, refusedRetryMs);
@@ -294,9 +309,11 @@ async function scheduleOnce(
     `watch-${process.pid}-${candidate.id}`,
   );
   if (outcome === "refused") refusedAt.set(candidate.id, Date.now());
-  if (outcome === "open") {
+  if (outcome === "open" && !(await shouldStop())) {
     // The controller's decision, taken now that nothing is in flight: watch is
-    // strictly serial, so this attempt was the only one.
+    // strictly serial, so this attempt was the only one. Not under a stop
+    // (D13b): the stop is what ended the offering, so the evidence says
+    // nothing about the models.
     const settled = await settleExhausted(cfg, deps, board, [candidate.id]);
     if (settled.outage !== undefined) return { outage: settled.outage.taskId };
   }

@@ -14,10 +14,13 @@ import {
   releaseWatchLock,
   watchLockPath,
 } from "../src/watch-lock.js";
-import { stopNowRequestPath } from "../src/stop.js";
+import { MODEL_ROUNDS_DEFAULT, processRun, writeModelWait } from "../src/model-wait.js";
+import { stopNowRequestPath, type StopNow } from "../src/stop.js";
+import { readAttempt } from "../src/runtime.js";
 import { stopRequestPath, watchDirectory, watchQueue } from "../src/watch.js";
 import type { WorkerConfig, WorkerDeps } from "../src/worker.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
+import { manualStopNow } from "./helpers/stop-fixture.js";
 import {
   createStopRequests, createWatchEventSeam, doneAdapter, passAcceptance, runWatchCli,
   seedTaskFile, waitForCondition as waitFor, workerConfigFixture,
@@ -71,11 +74,12 @@ function idleAdapter(): AgentAdapter {
   };
 }
 
-function deps(customStore: TaskStore = store): WorkerDeps {
+function deps(customStore: TaskStore = store, customStop?: StopNow, agent: AgentAdapter = adapter()): WorkerDeps {
   return {
     store: customStore,
-    adapter: adapter(),
+    adapter: agent,
     acceptance: passAcceptance,
+    ...(customStop === undefined ? {} : { stop: customStop }),
   };
 }
 
@@ -511,6 +515,66 @@ describe("watchQueue", () => {
     expect((await store.get("a")).status).toBe("done");
     expect((await store.get("b")).status).toBe("open");
   });
+
+  /** A worker turn that never ends on its own and stops when the controller cancels it. */
+  function interruptibleAdapter(onStart: () => void): AgentAdapter {
+    const base = doneAdapter({ tasksDir: tasks, sessionId: (id) => `s-${id}` });
+    return { ...base, start: () => {
+      onStart();
+      let state: "running" | "exited" = "running";
+      return { result: new Promise<never>(() => {}), inspect: () => ({ state }), cancel: async () => { state = "exited"; return true; } };
+    } };
+  }
+
+  it("an in-process stop interrupts the active task and ends watch without a file", async () => {
+    await seed(task("a"));
+    await seed(task("b"));
+    const stop = manualStopNow();
+    let began!: () => void;
+    const inFlight = new Promise<void>((resolve) => { began = resolve; });
+    const running = watchQueue(cfg, deps(store, stop, interruptibleAdapter(() => began())), { watchFs, fallbackMs: 60_000, debounceMs: 5 });
+    await inFlight;
+    stop.trigger("SIGINT");
+    await expect(running).resolves.toEqual({ reason: "stop" });
+    expect(turns).toEqual([]);
+    expect((await store.get("a")).status).toBe("open");
+    expect((await store.get("b")).status).toBe("open");
+    await expect(readFile(stopRequestPath(tasks), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  }, 8_000);
+
+  it("a stop during an automatic batch ends the batch and leaves the rest unclaimed", async () => {
+    await seed(task("a"));
+    await seed(task("b"));
+    const stop = manualStopNow();
+    let began!: () => void;
+    const inFlight = new Promise<void>((resolve) => { began = resolve; });
+    const running = watchQueue(cfg, deps(store, stop, interruptibleAdapter(() => began())), { watchFs, fallbackMs: 60_000, debounceMs: 5 });
+    await inFlight;
+    stop.trigger("file");
+    await running;
+    expect((await store.get("a")).status).toBe("open");
+    expect((await store.get("b")).status).toBe("open");
+    expect(await readAttempt(tasks, "b")).toBeNull();
+  }, 8_000);
+
+  it("watch declares no outage under a stop", async () => {
+    await seed(task("a"));
+    const stop = manualStopNow();
+    const running = watchQueue(cfg, deps(store, stop), {
+      watchFs, fallbackMs: 60_000, debounceMs: 5,
+      runOne: async (_cfg, _deps, task) => {
+        // The attempt runs out of rounds and the operator stops in the same breath: watch is serial, so part 1 would decide here.
+        await writeModelWait(tasks, task.id, {
+          runId: processRun().id, stage: "worker", rounds: MODEL_ROUNDS_DEFAULT, firstRefusedAt: new Date().toISOString(),
+          refusals: [], nextAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+        });
+        stop.trigger("file");
+        return "open";
+      },
+    });
+    await expect(running).resolves.toEqual({ reason: "stop" });
+    expect((await store.get("a")).status).toBe("open");
+  }, 8_000);
 });
 
 describe("watch and stop CLI parsing", () => {
