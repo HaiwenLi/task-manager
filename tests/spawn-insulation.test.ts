@@ -64,7 +64,9 @@ it("insulation is a hidden console on Windows and a process group everywhere els
 it("the gate and the agent CLI are insulated only when the controller asks", async () => {
   await acceptance.startAcceptance("echo plain-gate", cwd).result;
   expect(Boolean(spawns.at(-1)?.options.detached)).toBe(process.platform !== "win32"); // today's spawn
-  expect(spawns.at(-1)?.options).not.toMatchObject(INSULATED);
+  // Windows-only: on POSIX a plain gate is detached too, so `INSULATED`
+  // (`{ detached: true }`) is exactly what it carries; there is nothing to see.
+  if (process.platform === "win32") expect(spawns.at(-1)?.options).not.toMatchObject(INSULATED);
 
   await acceptance.startAcceptance("echo insulated-gate", cwd, "check", { insulated: true }).result;
   expect(spawns.at(-1)?.options).toMatchObject(INSULATED);
@@ -72,7 +74,8 @@ it("the gate and the agent CLI are insulated only when the controller asks", asy
 
   await new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: [fake] }).start({ text: "hi", cwd }).result;
   expect(Boolean(spawns.at(-1)?.options.detached)).toBe(process.platform !== "win32");
-  expect(spawns.at(-1)?.options).not.toMatchObject(INSULATED);
+  // Windows-only, for the same reason as the plain gate above.
+  if (process.platform === "win32") expect(spawns.at(-1)?.options).not.toMatchObject(INSULATED);
 
   await expect(new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: [fake], insulated: true }).start({ text: "hi", cwd }).result)
     .resolves.toEqual({ sessionId: "ses_fake123", exitCode: 0, text: "你好，任务完成。" });

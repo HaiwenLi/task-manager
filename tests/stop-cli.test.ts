@@ -194,6 +194,8 @@ it("SIGINT on an idle watch exits 130 at once and leaves the stop request", asyn
   expect(await running).toBe(130);
   expect(Date.now() - started).toBeLessThan(10_000);
   expect(await readFile(stopRequestPath(tasks), "utf8")).toBeDefined();
+  // The loud adapter proved the watch idle: nothing asked it for anything.
+  expect(adapterCalls).toEqual([]);
 }, 10_000);
 
 it.each(["a request from the board", "a signal"] as const)("an unconfirmed stop exits 1, for %s", async (asked) => {
@@ -206,6 +208,25 @@ it.each(["a request from the board", "a signal"] as const)("an unconfirmed stop 
   const running = runCli(["run", "--config", configPath], { adapter: agent, acceptance: passAcceptance, signals, log: (line) => lines.push(line), err: (line) => lines.push(line) });
   await agent.started;
   if (asked === "a signal") signals.fire("SIGINT"); else expect(await runCliQuiet(["stop", "--tasks-dir", tasks, "--now"])).toBe(0);
+  expect(await running).toBe(1);
+  expect((await store.get("a")).status).toBe("blocked");
+  expect(await settledAttempt("a")).toMatchObject({ phase: "uncertain" });
+  expect(lines.join("\n")).toContain("could not be confirmed and need reconciliation: a");
+}, 15_000);
+
+it.each(["a request from the board", "a signal"] as const)("an unconfirmed stop of a watch exits 1, for %s", async (asked) => {
+  // One case per test: an `uncertain` attempt is left behind, and a task with
+  // an unsettled attempt is not run again.
+  await seedTaskFile(tasks, task("a"));
+  const agent = hangingWorker(1, { confirm: false });
+  const signals = manualSignals();
+  const lines: string[] = [];
+  const { watchFs } = createWatchEventSeam();
+  const running = runCli(["watch", "--config", configPath], { adapter: agent, acceptance: passAcceptance, signals, log: (line) => lines.push(line), err: (line) => lines.push(line), watch: { watchFs, fallbackMs: 1_000, debounceMs: 5 } });
+  await agent.started;
+  if (asked === "a signal") signals.fire("SIGINT"); else expect(await runCliQuiet(["stop", "--tasks-dir", tasks, "--now"])).toBe(0);
+  // The unconfirmed attempt is the watch's report to give: the signal's 130 (or
+  // the board request's 0) would present it as clean.
   expect(await running).toBe(1);
   expect((await store.get("a")).status).toBe("blocked");
   expect(await settledAttempt("a")).toMatchObject({ phase: "uncertain" });
@@ -253,6 +274,9 @@ it("a second SIGINT while stopping changes nothing", async () => {
   expect(await running).toBe(130);
   expect(lines.filter((line) => line.includes("SIGINT received:"))).toHaveLength(1);
   expect(lines.filter((line) => line.includes("SIGINT received again: still stopping"))).toHaveLength(1);
+  // The repeated write queues behind the first instead of racing it on the
+  // request's temporary file.
+  expect(lines.join("\n")).not.toContain("stop request could not be written");
   expect((await store.get("a")).status).toBe("open");
 }, 10_000);
 
@@ -285,6 +309,48 @@ it("retry --review-only stopped by the operator leaves the task blocked with its
   expect(await readFile(join(tasks, "a", "review-pending.json"), "utf8")).toBe(pending);
 }, 10_000);
 
+it("retry --review-only: a stop that lands while the guard reads the catalogue answers the signal's code", async () => {
+  // The task's own model is free in the catalogue, so the guard judges the
+  // recovery allowed and reaches its second stop check, which is where the
+  // signal lands: nothing is claimed and no turn starts (D11).
+  await seedTaskFile(tasks, task("a", { verify: "human", criteria: ["C1 ok"], model: "plan/m" }));
+  expect(await runTask({ ...cfg, turnTimeoutMs: 300 }, { store, adapter: slowReviewer(), acceptance: passAcceptance }, await store.get("a"), "w1")).toBe("blocked");
+  const pending = await readFile(join(tasks, "a", "review-pending.json"), "utf8");
+  const signals = manualSignals();
+  const lines: string[] = [];
+  const agent: AgentAdapter = {
+    ...adapterOf(CATALOGUE, "plan/m"),
+    modelCatalog: async () => { signals.fire("SIGINT"); return CATALOGUE; },
+  };
+  const running = runCli(["retry", "--task", "a", "--review-only", "--config", configPath], { adapter: agent, acceptance: passAcceptance, signals, log: (line) => lines.push(line), err: (line) => lines.push(line) });
+  // `runTask` answered `skipped`; the signal's own code is the recovery's.
+  expect(await running).toBe(130);
+  expect((await store.get("a")).status).toBe("blocked");
+  expect(await readFile(join(tasks, "a", "review-pending.json"), "utf8")).toBe(pending);
+  expect(lines.join("\n")).toContain("stopped by the operator");
+  expect(lines.join("\n")).not.toContain("review-only recovery refused or still unavailable");
+}, 10_000);
+
+it("retry --review-only: an unconfirmed stop during the recovery exits 1 and says what needs reconciliation", async () => {
+  await seedTaskFile(tasks, task("a", { verify: "human", criteria: ["C1 ok"] }));
+  expect(await runTask({ ...cfg, turnTimeoutMs: 300 }, { store, adapter: slowReviewer(), acceptance: passAcceptance }, await store.get("a"), "w1")).toBe("blocked");
+  const pending = await readFile(join(tasks, "a", "review-pending.json"), "utf8");
+  const agent = hangingWorker(1, { confirm: false, text: "独立复核者" });
+  const signals = manualSignals();
+  const lines: string[] = [];
+  const running = runCli(["retry", "--task", "a", "--review-only", "--config", configPath], { adapter: agent, acceptance: passAcceptance, signals, log: (line) => lines.push(line), err: (line) => lines.push(line) });
+  await agent.started;
+  signals.fire("SIGINT");
+  // `runTask` answered `blocked` for an uncertain attempt: 1, and the line
+  // that says it needs reconciliation, not the ordinary refusal line.
+  expect(await running).toBe(1);
+  expect((await store.get("a")).status).toBe("blocked");
+  expect(await settledAttempt("a")).toMatchObject({ phase: "uncertain" });
+  expect(lines.join("\n")).toContain("could not be confirmed and need reconciliation: a");
+  expect(lines.join("\n")).not.toContain("review-only recovery refused or still unavailable");
+  expect(await readFile(join(tasks, "a", "review-pending.json"), "utf8")).toBe(pending);
+}, 10_000);
+
 it("stop --now requires --tasks-dir, like stop", async () => {
   expect(await runCliQuiet(["stop", "--now"])).toBe(2);
 });
@@ -296,5 +362,17 @@ it("the signal relay is installed for run and watch only, and removed when the c
   expect(count()).toBe(before);
   await seedTaskFile(tasks, task("a"));
   await runCliQuiet(["run", "--config", configPath], { adapter: doneAdapter({ tasksDir: tasks, sessionId: (id) => `s-${id}` }), acceptance: passAcceptance });
+  expect(count()).toBe(before);
+});
+
+it("a run that fails before it starts leaves no signal relay behind", async () => {
+  // `--log` under a regular file cannot be created, so the controller's
+  // telemetry throws before anything is claimed: the relay must not already
+  // be on the process when it does.
+  const blocking = join(root, "not-a-dir");
+  await writeFile(blocking, "x", "utf8");
+  const count = () => process.listenerCount("SIGINT") + process.listenerCount("SIGTERM");
+  const before = count();
+  expect(await runCliQuiet(["run", "--config", configPath, "--log", join(blocking, "run.log")])).toBe(1);
   expect(count()).toBe(before);
 });
