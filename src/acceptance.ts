@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { processExecution, type Execution } from "./execution.js";
+import { processExecution, type Execution, type TreeControl } from "./execution.js";
 
 /**
  * Outcome of the acceptance gate. `exitCode` is null when the command could
@@ -22,6 +22,9 @@ export type AcceptanceResult =
  * produces `report.json`-style artifacts survive its own gate.
  */
 export type AcceptanceMode = "generate" | "check";
+
+/** `trees` is the platform double a test injects; production leaves it absent. */
+export type AcceptanceOptions = { trees?: TreeControl };
 
 export type AcceptanceExecution = Execution<AcceptanceResult> & {
   /** Output captured so far, including output available after cancellation. */
@@ -47,7 +50,7 @@ export async function runAcceptance(command: string, cwd: string, mode: Acceptan
 }
 
 /** Start the gate immediately and expose its process lifecycle to the worker. */
-export function startAcceptance(command: string, cwd: string, mode: AcceptanceMode = "generate"): AcceptanceExecution {
+export function startAcceptance(command: string, cwd: string, mode: AcceptanceMode = "generate", options: AcceptanceOptions = {}): AcceptanceExecution {
   if (command.trim().length === 0) {
     return {
       result: Promise.resolve({ passed: false, skipped: true }),
@@ -85,5 +88,5 @@ export function startAcceptance(command: string, cwd: string, mode: AcceptanceMo
       resolve({ passed: code === 0, exitCode: code, output: output(), skipped: false });
     });
   });
-  return { ...processExecution(child, result), partialOutput: output };
+  return { ...processExecution(child, result, false, undefined, options.trees), partialOutput: output };
 }
