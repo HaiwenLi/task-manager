@@ -272,8 +272,10 @@ it("the kill utility's report is not needed once the tree is known to be gone", 
   } finally {
     // When the fixture never recorded the tree, `known` stays empty and the
     // `killTree` above ends only the root: the real tree is ended first, then
-    // the cancel settles the execution.
-    if (known.length === 0) await platformTreeControl.killTree(execution.inspect().pid!);
+    // the cancel settles the execution. A root that has already exited names
+    // no tree — its output pipes have closed, so no descendant that inherited
+    // them survives, and its pid may belong to another process by now.
+    if (known.length === 0 && execution.inspect().state !== "exited") await platformTreeControl.killTree(execution.inspect().pid!);
     await execution.cancel();
   }
 }, 15_000);
