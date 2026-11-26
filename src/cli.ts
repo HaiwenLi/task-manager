@@ -202,10 +202,15 @@ async function tasksDirFor(flags: Map<string, string>): Promise<string> {
   return resolveConfig(await readConfig(flags.get("config") ?? "taskctl.json"), "taskctl.json").tasksDir;
 }
 
-/** Resolve the config file for commands that need settings beyond `tasksDir`. */
+/**
+ * Resolve the config file for commands that need settings beyond `tasksDir`,
+ * keeping the path it was read from (`configPath`): the artifact digest leaves
+ * that file out when it lies in the work directory (`digestExclusions`,
+ * src/worker.ts).
+ */
 async function configFor(flags: Map<string, string>): Promise<ResolvedConfig> {
   const path = flags.get("config") ?? "taskctl.json";
-  return resolveConfig(await readConfig(path), path);
+  return { ...resolveConfig(await readConfig(path), path), configPath: path };
 }
 
 /**
@@ -367,11 +372,10 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
 
 /** `taskctl run` — load config, assemble adapter + store, drain the queue. */
 async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
-  const configPath = flags.get("config") ?? "taskctl.json";
   // One run context for the whole command: the attempts and the controller's
   // decision read the same evidence, so a deferral this process wrote is one
   // this process decides (a new run, watch or retry process is a new run).
-  const cfg = { ...resolveConfig(await readConfig(configPath), configPath), run: newRunContext() };
+  const cfg = { ...(await configFor(flags)), run: newRunContext() };
   const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
   const store = deps.store ?? new TaskStore(cfg.tasksDir);
   // Controller log: with --log every event line is teed to one operator-chosen

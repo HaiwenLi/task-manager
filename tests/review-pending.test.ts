@@ -202,6 +202,99 @@ describe("review-pending recovery", () => {
     expect(calls).toEqual(["worker"]);
   });
 
+  describe("the configuration file inside the work directory", () => {
+    // The usual layout — `taskctl.json` in the project root, the root being the work
+    // directory. The file is the controller's input, not an artifact of the work: neither the
+    // digest taken around an acceptance command nor the one a review recovery is gated on may
+    // count it (found live, 2026-11-26: the recovery was refused as "artifacts changed" for the
+    // configuration edit the outage report itself advises).
+    const roots: string[] = [];
+    afterEach(async () => {
+      for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+    });
+
+    async function layout(task: string[], settings: Record<string, unknown> = {}) {
+      const root = await mkdtemp(join(tmpdir(), "taskctl-review-pending-config-"));
+      roots.push(root);
+      const tasksDir = join(root, "tasks");
+      await mkdir(tasksDir);
+      await writeFile(join(tasksDir, "a.md"), [
+        "---", "schema: taskctl/v1", "title: Review later", "status: open", ...task,
+        "sessions: []", "retries: 0", "review_rounds: 0", "---", "Do work", "",
+      ].join("\n"), "utf8");
+      const configPath = join(root, "taskctl.json");
+      const write = (more: Record<string, unknown>) =>
+        writeFile(configPath, JSON.stringify({ tasksDir, workdir: root, ...settings, ...more }), "utf8");
+      const worker = (calls: string[]) => doneAdapter({
+        tasksDir, sessionId: () => "worker-session", beforeResult: async () => { calls.push("worker"); },
+      });
+      return { board: new TaskStore(tasksDir), configPath, write, worker };
+    }
+
+    const WITH_COMMAND = ['acceptance: "check"', "criteria:", "  - C1 work is good"];
+    const NO_COMMAND = ["criteria:", "  - C1 work is good"];
+    /** One refused round is an outage: the run stops with the review preserved. */
+    const ONE_ROUND = { modelRounds: 1, modelCooldownMs: 20 };
+
+    async function refuseThenRecover(
+      board: TaskStore, configPath: string,
+      write: (more: Record<string, unknown>) => Promise<void>,
+      worker: (calls: string[]) => AgentAdapter,
+    ) {
+      const calls: string[] = [];
+      const acceptance = vi.fn(pass);
+      expect(await runCli(["run", "--config", configPath], {
+        adapter: worker(calls), acceptance, review: async () => providerRefusal, log: () => {},
+      })).toBe(3);
+      expect((await board.get("a")).status).toBe("open");
+
+      await write({ reviewerModel: "r/two" }); // what the outage report advises
+      const review = vi.fn(async () => passVerdict);
+      const code = await runCli(["run", "--config", configPath], {
+        adapter: worker(calls), acceptance, review, log: () => {},
+      });
+      return { code, review, calls, acceptance };
+    }
+
+    it("does not send a mechanical task to review because of it", async () => {
+      const { board, configPath, write, worker } = await layout(['acceptance: "check"', "verify: mechanical"]);
+      await write({});
+      const calls: string[] = [];
+
+      expect(await runCli(["run", "--config", configPath], {
+        adapter: worker(calls), acceptance: pass, log: () => {},
+      })).toBe(0);
+
+      expect(calls).toEqual(["worker"]);
+      expect((await board.get("a")).status).toBe("done");
+    });
+
+    it("is not a changed artifact for a review that recovers by itself", async () => {
+      const { board, configPath, write, worker } = await layout(WITH_COMMAND, { reviewerModel: "r/one", ...ONE_ROUND });
+      await write({});
+
+      const { code, review, calls, acceptance } = await refuseThenRecover(board, configPath, write, worker);
+
+      expect(code).toBe(0);
+      expect(review).toHaveBeenCalledTimes(1);
+      expect(calls).toEqual(["worker"]);
+      expect(acceptance).toHaveBeenCalledTimes(1);
+      expect((await board.get("a")).status).toBe("done");
+    });
+
+    it("is not one for a task with no acceptance command either, where the preserved record takes the digest itself", async () => {
+      const { board, configPath, write, worker } = await layout(NO_COMMAND, { reviewerModel: "r/one", ...ONE_ROUND });
+      await write({});
+
+      const { code, review, calls } = await refuseThenRecover(board, configPath, write, worker);
+
+      expect(code).toBe(0);
+      expect(review).toHaveBeenCalledTimes(1);
+      expect(calls).toEqual(["worker"]);
+      expect((await board.get("a")).status).toBe("done");
+    });
+  });
+
   it("rejects review-only recovery when the definition changed", async () => {
     const calls: string[] = [];
     await park(calls);

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
 import { claim, heartbeat, lockLive, release, withOwnership, OwnershipLostError } from "./claim.js";
 import { waitReason } from "./eligibility.js";
 import { dependencySummary } from "./dependencies.js";
@@ -79,6 +79,13 @@ export type WorkerConfig = {
    * digest — the paths a task's own acceptance command is expected to write.
    */
   artifactIgnore?: string[];
+  /**
+   * The configuration file this run was started with, as the command line named
+   * it. It is the controller's input, not an artifact of the work, so the
+   * artifact digest leaves it out when it lies in the work directory (see
+   * `digestExclusions`).
+   */
+  configPath?: string;
   /**
    * The whole dispatch chain when set: head first, alternatives after. Defaults
    * to `[model]`, so a config without it keeps meaning what it always did.
@@ -1419,11 +1426,25 @@ async function clearAcceptanceFailures(r: Run): Promise<void> {
   await rm(join(r.cfg.tasksDir, r.task.id, ACCEPTANCE_FAILURES_FILE), { force: true });
 }
 
+/**
+ * What the artifact digest leaves out of the work directory besides
+ * `artifactIgnore`: the tasks directory, and the configuration file this run
+ * was started with. The configuration is the controller's input, not an
+ * artifact of the work — and the outage report's advice is to edit exactly that
+ * file and run again (found live, 2026-11-26: with `taskctl.json` in the work
+ * directory, that edit made the review-only recovery refuse every deferred
+ * review as "artifacts changed"). A file outside the work directory excludes
+ * nothing; `artifactDigest` drops what does not lie inside.
+ */
+function digestExclusions(cfg: Pick<WorkerConfig, "tasksDir" | "configPath">): string[] {
+  return [cfg.tasksDir, ...(cfg.configPath === undefined ? [] : [resolvePath(cfg.configPath)])];
+}
+
 async function resumeReviewOnly(r: Run, pending: ReviewPendingRecord): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
   if (pending.definitionDigest !== await attemptDefinition(r)) {
     throw new ReviewRequiredError("review-only recovery refused: the task definition changed; old evidence is stale");
   }
-  const artifactNow = await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir], r.cfg.artifactIgnore ?? []);
+  const artifactNow = await artifactDigest(r.cfg.workdir, digestExclusions(r.cfg), r.cfg.artifactIgnore ?? []);
   if (pending.artifactDigest !== artifactNow) {
     throw new ReviewRequiredError("review-only recovery refused: artifacts changed after the preserved worker/acceptance evidence");
   }
@@ -1485,7 +1506,7 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
     }));
     return await reviewStage(r);
   }
-  const artifactBefore = await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir], r.cfg.artifactIgnore ?? []);
+  const artifactBefore = await artifactDigest(r.cfg.workdir, digestExclusions(r.cfg), r.cfg.artifactIgnore ?? []);
   const startedAt = new Date().toISOString();
   let result: AcceptanceResult;
   try {
@@ -1502,7 +1523,7 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
       output: [err.message, err.partialOutput].filter((part) => part !== undefined && part.length > 0).join("\n"),
     };
   }
-  const artifactAfter = await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir], r.cfg.artifactIgnore ?? []);
+  const artifactAfter = await artifactDigest(r.cfg.workdir, digestExclusions(r.cfg), r.cfg.artifactIgnore ?? []);
   // All controller writers use the same mutex as takeover for final validation/write.
   // The review runs outside this guard: it takes the same mutex for its own
   // writes, and nesting would deadlock the task against itself.
@@ -1862,7 +1883,7 @@ async function reviewPendingRecord(r: Run, round: readonly { model: string; reas
   const previous = await readRuntime<ReviewPendingRecord>(r.cfg.tasksDir, r.task.id, "review-pending.json");
   const artifactDigestAfter = typeof acceptance?.artifactAfter === "string"
     ? acceptance.artifactAfter
-    : await artifactDigest(r.cfg.workdir, [r.cfg.tasksDir], r.cfg.artifactIgnore ?? []);
+    : await artifactDigest(r.cfg.workdir, digestExclusions(r.cfg), r.cfg.artifactIgnore ?? []);
   const now = new Date().toISOString();
   return {
     definitionDigest: await attemptDefinition(r),
