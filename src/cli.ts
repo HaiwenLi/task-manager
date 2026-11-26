@@ -36,7 +36,7 @@ import { judgeRefs, policyOf, renderVerdicts, reviewerModels, workerModels, type
 import { directModel } from "./models.js";
 import { modelRoundsOf, modelWaitHold, newRunContext, readModelWait } from "./model-wait.js";
 import { outageReport, renderOutageReport, statusLineFromNote, stuckLines } from "./stuck.js";
-import { requestStop, stopRequestPath } from "./stop.js";
+import { createStopNow, processSignalSource, requestStop, stopRequestPath, type SignalSource, type StopNow, type StopSignal } from "./stop.js";
 import { watchQueue, type WatchEnd, type WatchOptions } from "./watch.js";
 import { createMempalaceBackend, runRecall, type MemoryBackend, type RecallInput, type RecallRecord } from "./memory.js";
 
@@ -48,6 +48,10 @@ export type CliDeps = {
   review?: WorkerDeps["review"];
   /** Test seam: what answers instead of the MemPalace server, for run, watch and recall; production leaves it absent. */
   memory?: MemoryBackend;
+  /** Test seam: a controllable interrupt source; production polls `.taskctl/stop-now.requested`. */
+  stop?: StopNow;
+  /** Test seam for SIGINT/SIGTERM; production listens on the process. Never emit a real signal in a test. */
+  signals?: SignalSource;
   /** Test seam for watch filesystem events and timing; production leaves it absent. */
   watch?: WatchOptions;
   /** Test seam for observing watch scheduling; production leaves it absent. */
@@ -119,12 +123,14 @@ async function createControllerTelemetry(cfg: ResolvedConfig, teeTarget?: string
 }
 
 function createWorkerDeps({
-  deps, adapter, store, telemetry, log, observe,
+  deps, adapter, store, telemetry, log, observe, stop,
 }: {
   deps: CliDeps; adapter: AgentAdapter; store: TaskStore;
   telemetry: ControllerTelemetry; log: (line: string) => void;
   /** Sees every worker event after it is logged; a controller counts what it must report. */
   observe?: (evt: WorkerEvent) => void;
+  /** The controller's interrupt source; absent when the command takes no stop. */
+  stop?: StopNow;
 }): WorkerDeps {
   return {
     store,
@@ -132,6 +138,7 @@ function createWorkerDeps({
     ...(deps.acceptance === undefined ? {} : { acceptance: deps.acceptance }),
     ...(deps.review === undefined ? {} : { review: deps.review }),
     ...(deps.memory === undefined ? {} : { memory: deps.memory }),
+    ...(stop === undefined ? {} : { stop }),
     onEvent: (evt) => {
       const line = workerEventLine(evt);
       log(line);
@@ -152,11 +159,89 @@ function createWorkerDeps({
   };
 }
 
+/** One controller's interrupt bookkeeping: what the operator asked, what that interrupted, and what to say about it. */
+type ControllerStop = {
+  now: StopNow;
+  /** Counts what the controller must report: interrupted attempts, and unconfirmed ones. */
+  observe(evt: WorkerEvent): void;
+  /** Undefined when nothing asked this controller to stop. */
+  exitCode(): number | undefined;
+  /** One line on `log` saying what was interrupted, or what needs reconciliation. */
+  report(label: "scheduler" | "watch", log: (line: string) => void): void;
+  close(): Promise<void>;
+};
+
+/**
+ * The interrupt source one `run`, `watch` or `retry --review-only` controller
+ * holds: the injected test seam when there is one, otherwise a real source on
+ * the board that turns SIGINT/SIGTERM into the same durable request. The
+ * handler never exits the process and never forces anything — the stop is
+ * bounded by the worker's cancel deadline, and a repeated signal only says the
+ * controller is still stopping (D7). It is closed by every command that
+ * created it, so no other command carries the relay (D10).
+ */
+async function createControllerStop(cfg: ResolvedConfig, deps: CliDeps, log: (line: string) => void, err: (line: string) => void): Promise<ControllerStop> {
+  let owned: (StopNow & { close(): Promise<void> }) | undefined;
+  let seenSignal = false;
+  const onSignal = async (signal: StopSignal): Promise<void> => {
+    const first = !seenSignal;
+    seenSignal = true;
+    log(first
+      ? `[taskctl] ${signal} received: running work is interrupted; nothing new is claimed`
+      : `[taskctl] ${signal} received again: still stopping`);
+    // D2: the signal leaves the same two durable files `stop --now` writes.
+    // A request that cannot be written is reported and never thrown: this
+    // promise is awaited by close(), and the controller must still end itself.
+    try {
+      await requestStop(cfg.tasksDir, "now");
+    } catch (error) {
+      err(`stop request could not be written: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  const now = deps.stop !== undefined
+    ? deps.stop
+    : (owned = await createStopNow(cfg.tasksDir, { signals: deps.signals ?? processSignalSource(), onSignal }));
+  const stopped: string[] = [];
+  const unconfirmed: string[] = [];
+  const count = (ids: string[], taskId: string): void => { if (!ids.includes(taskId)) ids.push(taskId); };
+  return {
+    now,
+    observe: (evt) => {
+      // A `refused` event is neither: nothing was claimed, so nothing was interrupted (D11).
+      if (evt.type === "stopped") count(stopped, evt.taskId);
+      if (evt.type === "stop-unconfirmed") count(unconfirmed, evt.taskId);
+    },
+    exitCode: () => {
+      if (!now.isRequested()) return undefined;
+      if (unconfirmed.length > 0) return 1;
+      const source = now.source();
+      return source !== undefined && source in SIGNAL_EXIT_CODES ? SIGNAL_EXIT_CODES[source as StopSignal] : 0;
+    },
+    report: (label, line) => {
+      line(`[${label}] stopped by the operator${stopped.length > 0 ? `: ${stopped.join(", ")}` : ""}; run again to continue`);
+      if (unconfirmed.length > 0) {
+        line(`[${label}] stopped by the operator, but ${unconfirmed.length} interrupted attempt(s) could not be confirmed and need reconciliation: ${unconfirmed.join(", ")}`);
+      }
+    },
+    close: async () => {
+      await owned?.close();
+    },
+  };
+}
+
+/** The agent CLI of a controller that cancels turns itself: insulated from the console's Ctrl-C. */
+function controllerAdapter(cfg: ResolvedConfig): OpenCodeAdapter {
+  return new OpenCodeAdapter({ bin: cfg.opencodeBin, insulated: true });
+}
+
 /** Usage problem (unknown command/flag, missing value): exit code 2. */
 class UsageError extends Error {}
 
 /** The run stopped because every model refused (design §7): exit code 3, whatever else happened in it. */
 export const EXIT_OUTAGE = 3;
+
+/** Exit code of a controller that was stopped: the signal's own number, or 0 for a request from the board; 1 outranks both when an interrupted attempt is uncertain. */
+export const SIGNAL_EXIT_CODES: Readonly<Record<StopSignal, number>> = { SIGINT: 130, SIGTERM: 143 };
 
 const USAGE = [
   "usage:",
@@ -299,10 +384,10 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
       return splitCommand(flags, deps, log, err);
     case "run":
       checkFlags(command, flags, ["config", "log", "batch"], []);
-      return runCommand(flags, deps, log);
+      return runCommand(flags, deps, log, err);
     case "watch":
       checkFlags(command, flags, ["config", "resume"], ["config"]);
-      return watchCommand(flags, deps, log);
+      return watchCommand(flags, deps, log, err);
     case "stop":
       checkFlags(command, flags, ["tasks-dir", "now"], ["tasks-dir"]);
       return stopCommand(flags, log);
@@ -359,7 +444,7 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
       return reconcileCommand(flags, log);
     case "retry":
       checkFlags(command, flags, ["task", "tasks-dir", "config", "review-only"], ["task"]);
-      return retryCommand(flags, deps, log);
+      return retryCommand(flags, deps, log, err);
     case "findings":
       checkFlags(command, flags, ["task", "out", "tasks-dir", "config"], ["task"]);
       return findingsCommand(flags, log);
@@ -372,12 +457,15 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
 }
 
 /** `taskctl run` — load config, assemble adapter + store, drain the queue. */
-async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
+async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void, err: (line: string) => void): Promise<number> {
   // One run context for the whole command: the attempts and the controller's
   // decision read the same evidence, so a deferral this process wrote is one
   // this process decides (a new run, watch or retry process is a new run).
   const cfg = { ...(await configFor(flags)), run: newRunContext() };
-  const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+  const adapter = deps.adapter ?? controllerAdapter(cfg);
+  // The run's interrupt source: it reads the board from here on, so a request
+  // older than this run is its baseline and stops nothing (Review Focus 5).
+  const stop = await createControllerStop(cfg, deps, log, err);
   const store = deps.store ?? new TaskStore(cfg.tasksDir);
   // Controller log: with --log every event line is teed to one operator-chosen
   // file; by default each task's lines land in its own task dir under logs/.
@@ -388,8 +476,8 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   telemetry.refreshBoard();
   let controllerErrors = 0;
   const workerDeps = createWorkerDeps({
-    deps, adapter, store, telemetry, log,
-    observe: (evt) => { if (evt.type === "controller-error") controllerErrors += 1; },
+    deps, adapter, store, telemetry, log, stop: stop.now,
+    observe: (evt) => { if (evt.type === "controller-error") controllerErrors += 1; stop.observe(evt); },
   });
   const batch = flags.get("batch");
   const result = await (async () => {
@@ -398,6 +486,10 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
         ? await runScheduler(cfg, workerDeps)
         : await runBatch(cfg, workerDeps, batch.split(","));
     } finally {
+      // The relay goes first: close awaits the last requestStop a signal
+      // started, so the requests are on the board before the run reports, and
+      // the handlers are off the process before the exit code is chosen.
+      await stop.close();
       // Validation can fail before any event. Still settle the trailing board
       // refresh and queued log writes before the CLI returns or throws.
       await telemetry.flush();
@@ -422,6 +514,8 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   }
   // Each is said when its own count is above zero, the controller errors
   // first: a run with both must not let the earlier return hide the later line.
+  // Part 1 prints these before any exit-code decision, so an outage or a stop
+  // still says what else the run saw.
   if (controllerErrors > 0) {
     // A task blocked by a controller bug is not an ordinary outcome. The board
     // was still drained, but the run must not read as clean to a script.
@@ -442,40 +536,69 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
     // still drained, but a task that did not run must not read as clean to a script.
     log(`[scheduler] ${refused.length} task(s) refused by the budget guard; no model session was started for them`);
   }
-  // The code names why the run stopped (design §7): an outage is 3 whatever
-  // else happened — refused tasks and controller errors are printed beside the report.
+  // The code names why the run stopped, in D1's order: an interrupted attempt
+  // that could not be confirmed outranks everything; part 1's outage return is
+  // next (a stop never takes that decision, D13b, so the two do not meet);
+  // then the stop's own report, printed beside whatever makes the run exit 1
+  // anyway — a controller error, a refused task — whose code wins over the
+  // stop's; and only a stop with nothing else to say is the exit code itself.
+  const code = stop.exitCode();
+  if (code === 1) {
+    stop.report("scheduler", log);
+    return 1;
+  }
+  // An outage is 3 whatever else happened — refused tasks and controller
+  // errors are printed beside the report (part 1, design §7).
   if (outageTaskId !== undefined) return EXIT_OUTAGE;
+  if (stop.now.isRequested()) stop.report("scheduler", log);
   if (controllerErrors > 0) return 1;
-  return refused.length > 0 ? 1 : 0;
+  if (refused.length > 0) return 1;
+  return code ?? 0;
 }
 
 /** `taskctl watch` — own and drain one board until its stop request appears. */
-async function watchCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
+async function watchCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void, err: (line: string) => void): Promise<number> {
   // One run context for the whole command, as `run` builds one: the attempts
   // and the controller's decision read the same evidence, so a deferral this
   // process wrote is one this process decides.
   const cfg = { ...(await configFor(flags)), run: newRunContext() };
-  const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+  const adapter = deps.adapter ?? controllerAdapter(cfg);
+  // The watch's interrupt source, as `run` builds one: created before the
+  // queue starts, so a request on the board when it starts is its baseline,
+  // and `watch --resume` clearing it a moment later is no stop.
+  const stop = await createControllerStop(cfg, deps, log, err);
   const store = deps.store ?? new TaskStore(cfg.tasksDir);
   const telemetry = await createControllerTelemetry(cfg);
   telemetry.refreshBoard();
   let end: WatchEnd;
   try {
-    end = await watchQueue(cfg, createWorkerDeps({ deps, adapter, store, telemetry, log }),
+    end = await watchQueue(cfg, createWorkerDeps({ deps, adapter, store, telemetry, log, stop: stop.now }),
       {
         ...deps.watch,
         resume: flags.has("resume"),
         onError: deps.watch?.onError ?? ((message) => (deps.err ?? log)(message)),
       });
   } finally {
+    await stop.close();
     await telemetry.flush();
   }
-  // The report a stop for an outage owes the operator (design §7), printed as
-  // `run` prints it. The queue wrote no stop file, so the next watch needs no
-  // `--resume`; a guard refusal changes nothing here and still returns 0.
+  // The code names why the watch ended, in D1's order. `WatchEnd` says "stop"
+  // for an operator's stop as for a graceful one, so the code reads the
+  // source: an unconfirmed interrupted attempt is 1 whatever asked; the queue's
+  // own outage report comes next; then the operator's code, reported like
+  // `run` reports it. A guard refusal changes nothing here and still returns 0.
+  const code = stop.exitCode();
+  if (code === 1) {
+    stop.report("watch", log);
+    return 1;
+  }
   if (end.reason === "outage") {
     for (const line of renderOutageReport(await outageReport(cfg, await store.list(), end.taskId))) log(line);
     return EXIT_OUTAGE;
+  }
+  if (code !== undefined) {
+    stop.report("watch", log);
+    return code;
   }
   return 0;
 }
@@ -1608,14 +1731,17 @@ async function reconcileCommand(flags: Map<string, string>, log: (line: string) 
 }
 
 /** `taskctl retry --task <id>` — reopen work, or only finish a preserved review. */
-async function retryCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
+async function retryCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void, err: (line: string) => void): Promise<number> {
   const tasksDir = await tasksDirFor(flags);
   const cfg = await configFor(flags);
   const id = flags.get("task")!;
   if (flags.has("review-only")) {
     const store = deps.store ?? new TaskStore(tasksDir);
     const task = await store.get(id);
-    const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+    // The recovery is an entry point like run and watch: its agent CLI is
+    // insulated (D6) and it takes the operator's interrupt (D10) — a stop
+    // returns the parked task to `blocked` with its parked review intact (D3).
+    const adapter = deps.adapter ?? controllerAdapter(cfg);
     // Asked for inside a model window, the recovery is not run: the claim path
     // would hold it, and a `skipped` would say nothing. It says until when.
     const wait = modelWaitHold(await readModelWait(tasksDir, id), newRunContext().id, modelRoundsOf(cfg), new Date());
@@ -1630,12 +1756,20 @@ async function retryCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
     // Recovery is an entry point like run and watch: it leaves the same
     // per-task event log and the same trailing board refresh.
     const telemetry = await createControllerTelemetry(resolved);
+    // The interrupt source, created after the window check above — a recovery
+    // held by a window creates nothing, not even the stop source.
+    const stop = await createControllerStop(resolved, deps, log, err);
     let outcome: Awaited<ReturnType<typeof runTask>>;
     try {
-      outcome = await runTask(resolved, createWorkerDeps({ deps, adapter, store, telemetry, log }),
+      outcome = await runTask(resolved, createWorkerDeps({ deps, adapter, store, telemetry, log, stop: stop.now }),
         task, `review-only-${process.pid}-${id}`, { reviewOnly: true });
     } finally {
+      await stop.close();
       await telemetry.flush();
+    }
+    if (outcome === "stopped") {
+      log(`review-only recovery stopped by the operator: ${id} is blocked again; the parked review is kept`);
+      return stop.exitCode() ?? 0;
     }
     log(outcome === "done" || outcome === "awaiting-human" || outcome === "open"
       ? `review-only recovery finished: ${outcome}`

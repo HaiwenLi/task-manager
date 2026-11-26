@@ -27,6 +27,7 @@ import type { StopNow } from "../src/stop.js";
 import type { Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
 import { runTask, type WorkerConfig } from "../src/worker.js";
+import { runCli } from "../src/cli.js";
 import { buildTaskFile } from "./helpers/task-fixture.js";
 import { manualStopNow } from "./helpers/stop-fixture.js";
 import { markDoneTask, passAcceptance, seedTaskFile, workerConfigFixture } from "./helpers/watch-fixture.js";
@@ -132,3 +133,17 @@ it("an attempt's memory server is in its own group exactly when the attempt can 
     expect(insulated[0]?.options.detached).toBe(true);
   } finally { delete process.env.FAKE_MCP_MODE; }
 }, 10_000);
+
+it("run constructs an insulated agent CLI: every child of the adapter it builds is in its own group", async () => {
+  const configPath = join(cwd, "taskctl.json");
+  await writeFile(configPath, JSON.stringify({ tasksDir: tasks, workdir: work, opencodeBin: process.execPath, retryLimit: 1 }), "utf8");
+  // node standing in for opencode cannot answer `api model.list`, so the budget guard refuses the
+  // task before any turn: the catalogue reads are the only children this run starts.
+  await seedTaskFile(tasks, buildTaskFile({ id: "a", title: "a", status: "open", complexity: "simple", verify: "mechanical", acceptance: "echo gate", criteria: ["C1 ok"] }));
+  const lines: string[] = [];
+  expect(await runCli(["run", "--config", configPath], { log: (line) => lines.push(line), err: (line) => lines.push(line) })).toBe(1);
+  expect(lines.join("\n")).toContain("refused by the budget guard");
+  const children = spawns.filter((spawn) => spawn.file === process.execPath);
+  expect(children.length).toBeGreaterThan(0);
+  expect(children.every((spawn) => spawn.options.detached === true)).toBe(true);
+});
