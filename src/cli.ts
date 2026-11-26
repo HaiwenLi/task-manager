@@ -36,7 +36,8 @@ import { judgeRefs, policyOf, renderVerdicts, reviewerModels, workerModels, type
 import { directModel } from "./models.js";
 import { modelRoundsOf, modelWaitHold, newRunContext, readModelWait } from "./model-wait.js";
 import { outageReport, renderOutageReport, statusLineFromNote, stuckLines } from "./stuck.js";
-import { stopRequestPath, watchQueue, type WatchEnd, type WatchOptions } from "./watch.js";
+import { requestStop, stopRequestPath } from "./stop.js";
+import { watchQueue, type WatchEnd, type WatchOptions } from "./watch.js";
 import { createMempalaceBackend, runRecall, type MemoryBackend, type RecallInput, type RecallRecord } from "./memory.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
@@ -166,7 +167,7 @@ const USAGE = [
   "  taskctl answer --task <id> --file <path> [--tasks-dir <dir>]",
   "  taskctl run [--batch <id,id,…>] [--log <file>] [--config taskctl.json]",
   "  taskctl watch --config <file> [--resume]",
-  "  taskctl stop --tasks-dir <dir>",
+  "  taskctl stop --tasks-dir <dir> [--now]",
   "  taskctl verify --task <id> [--viewport 1440x900,390x844] [--config taskctl.json]",
   "  taskctl done --task <id> [--tasks-dir <dir>]",
   "  taskctl check --task <id> [--tasks-dir <dir>]",
@@ -303,7 +304,7 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
       checkFlags(command, flags, ["config", "resume"], ["config"]);
       return watchCommand(flags, deps, log);
     case "stop":
-      checkFlags(command, flags, ["tasks-dir"], ["tasks-dir"]);
+      checkFlags(command, flags, ["tasks-dir", "now"], ["tasks-dir"]);
       return stopCommand(flags, log);
     case "verify":
       checkFlags(command, flags, ["task", "viewport", "tasks-dir", "config"], ["task"]);
@@ -625,12 +626,12 @@ async function modelsCommand(flags: Map<string, string>, deps: CliDeps, log: (li
   return verdicts.some((verdict) => !verdict.allowed) ? 1 : 0;
 }
 
-/** `taskctl stop` — request a graceful drain; never signals a worker process. */
+/** `taskctl stop [--now]` — request a drain; `--now` also asks for running work to be interrupted. Never signals a process itself. */
 async function stopCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
-  const path = stopRequestPath(await tasksDirFor(flags));
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${new Date().toISOString()}\n`, "utf8");
-  log(`stop requested: ${path}`);
+  const tasksDir = await tasksDirFor(flags);
+  const now = flags.has("now");
+  const path = await requestStop(tasksDir, now ? "now" : "graceful");
+  log(now ? `stop requested now: ${path} (running work is interrupted)` : `stop requested: ${path}`);
   return 0;
 }
 
@@ -1214,7 +1215,7 @@ async function statusCommand(flags: Map<string, string>, log: (line: string) => 
 // `resume` was missing here until 2026-11-24: the usage text and the stop
 // refusal both send the operator to `watch --resume`, but the parser read it
 // as a value flag and exited 2, so a stopped queue could not be restarted.
-const BOOLEAN_FLAGS = new Set(["simple", "quick", "all", "apply", "json", "review-only", "resume", "stuck"]);
+const BOOLEAN_FLAGS = new Set(["simple", "quick", "all", "apply", "json", "review-only", "resume", "stuck", "now"]);
 
 /** `taskctl board` — rewrite `.taskctl/board.md` and print the same content as a table. */
 async function boardCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {

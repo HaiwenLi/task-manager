@@ -14,6 +14,7 @@ import {
   releaseWatchLock,
   watchLockPath,
 } from "../src/watch-lock.js";
+import { stopNowRequestPath } from "../src/stop.js";
 import { stopRequestPath, watchDirectory, watchQueue } from "../src/watch.js";
 import type { WorkerConfig, WorkerDeps } from "../src/worker.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
@@ -582,5 +583,60 @@ describe("watch and stop CLI parsing", () => {
     const events = await readFile(join(logsDir, logs[0]!), "utf8");
     expect(events).toContain("[a] claimed");
     expect(events).toContain("[a] done");
+  });
+
+  it("stop --now writes the graceful request and the interrupt request through the real CLI", async () => {
+    const lines: string[] = [];
+    expect(await runCli(["stop", "--tasks-dir", tasks, "--now"], { log: (line) => lines.push(line), err: () => {} })).toBe(0);
+    expect(await readFile(stopRequestPath(tasks), "utf8")).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
+    expect(await readFile(stopNowRequestPath(tasks), "utf8")).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
+    expect(lines.join("\n")).toContain("stop requested now");
+  });
+
+  it("a plain stop keeps today's meaning and leaves the interrupt request alone", async () => {
+    const lines: string[] = [];
+    expect(await runCli(["stop", "--tasks-dir", tasks], { log: (line) => lines.push(line), err: () => {} })).toBe(0);
+    expect(lines).toEqual([`stop requested: ${stopRequestPath(tasks)}`]);
+    await expect(readFile(stopNowRequestPath(tasks), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    // A later plain stop never weakens an interrupt that is already requested.
+    await writeFile(stopNowRequestPath(tasks), "2026-11-25T10:00:00.000Z\n", "utf8");
+    expect(await runCli(["stop", "--tasks-dir", tasks], { log: () => {}, err: () => {} })).toBe(0);
+    expect(await readFile(stopNowRequestPath(tasks), "utf8")).toBe("2026-11-25T10:00:00.000Z\n");
+  });
+
+  it("watch --resume clears an interrupt request too", async () => {
+    await mkdir(control, { recursive: true });
+    await writeFile(stopRequestPath(tasks), "stop", "utf8");
+    await writeFile(stopNowRequestPath(tasks), "2026-11-25T10:00:00.000Z\n", "utf8");
+    const running = runWatchCli({
+      root, tasksDir: tasks, workdir: work, agent: adapter(), acceptance: passAcceptance, resume: true,
+      watch: { watchFs, fallbackMs: 1_000, debounceMs: 5 },
+    });
+    await waitFor(() => listeners.has(tasks));
+    await expect(readFile(stopRequestPath(tasks), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(stopNowRequestPath(tasks), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    // The cleared request is not a stop: the queue goes on serving.
+    await seed(task("a"));
+    listeners.get(tasks)?.();
+    await waitFor(() => turns.includes("a"));
+    await requestStop();
+    await expect(running).resolves.toBe(0);
+    expect(turns).toEqual(["a"]);
+  });
+
+  it("watch without --resume is refused while only an interrupt request exists", async () => {
+    await mkdir(control, { recursive: true });
+    await writeFile(stopNowRequestPath(tasks), "2026-11-25T10:00:00.000Z\n", "utf8");
+    const errors: string[] = [];
+    const running = runWatchCli({
+      root, tasksDir: tasks, workdir: work, agent: adapter(), acceptance: passAcceptance,
+      err: (line) => errors.push(line), watch: { watchFs, fallbackMs: 1_000, debounceMs: 5 },
+    });
+    // Today the watch starts and serves; the stop is only so this test cannot hang on that.
+    const first = await Promise.race([running.then(() => "exited"), waitFor(() => listeners.has(tasks)).then(() => "serving", () => "no listener")]);
+    if (first === "serving") await requestStop();
+    expect(await running).toBe(1);
+    expect(errors.join("\n")).toContain("watch --resume");
+    expect(await readFile(stopNowRequestPath(tasks), "utf8")).toBe("2026-11-25T10:00:00.000Z\n");
   });
 });

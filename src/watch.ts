@@ -9,8 +9,9 @@ import { assertAcyclic, taskWorkdir } from "./scheduler.js";
 import { runTask, settleExhausted, type WorkerConfig, type WorkerDeps } from "./worker.js";
 import { controlDir, acquireWatchLock, heartbeatWatchLock, releaseWatchLock } from "./watch-lock.js";
 import { pruneGuardRefusals } from "./guard-refusals.js";
+import { readStopNowRequest, stopRequestPath, stopNowRequestPath } from "./stop.js";
 
-export const stopRequestPath = (tasksDir: string): string => join(controlDir(tasksDir), "stop.requested");
+export { stopRequestPath };
 
 /**
  * How long the queue leaves a task the budget guard refused out of its
@@ -46,6 +47,17 @@ async function stopRequested(tasksDir: string): Promise<boolean> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
+}
+
+/**
+ * Which stop request sits on the board — either file, the graceful one's path
+ * when both do, since that is the path the refusal has always named. The queue
+ * still drains on the graceful file alone ({@link stopRequested}); this only
+ * decides what the start-up refusal names and what `--resume` clears.
+ */
+async function requestedStopPath(tasksDir: string): Promise<string | undefined> {
+  if (await stopRequested(tasksDir)) return stopRequestPath(tasksDir);
+  return (await readStopNowRequest(tasksDir)) !== null ? stopNowRequestPath(tasksDir) : undefined;
 }
 
 /**
@@ -157,11 +169,13 @@ export async function watchQueue(
   };
 
   try {
-    if (await stopRequested(cfg.tasksDir)) {
-      if (!options.resume) throw new Error(`stop is already requested at ${stopRequestPath(cfg.tasksDir)}; use watch --resume to clear it explicitly`);
+    const stopPath = await requestedStopPath(cfg.tasksDir);
+    if (stopPath !== undefined) {
+      if (!options.resume) throw new Error(`stop is already requested at ${stopPath}; use watch --resume to clear it explicitly`);
       // Lock acquisition came first: a second watcher --resume cannot clear a
       // live owner's stop request.
       await rm(stopRequestPath(cfg.tasksDir), { force: true });
+      await rm(stopNowRequestPath(cfg.tasksDir), { force: true });
     }
     watchers.push(watchFs(cfg.tasksDir, onFilesystem));
     watchers.push(watchFs(controlDir(cfg.tasksDir), onFilesystem));
