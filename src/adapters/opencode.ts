@@ -24,6 +24,46 @@ type RunEvent = { sessionID?: unknown; type?: unknown; text?: unknown; part?: un
  */
 const PROVIDER_REJECTION = /rate.?limit|quota|usage limit|用量上限|insufficient|unauthorized|\b401\b|\b403\b|\b429\b|\b5\d\d\b|no-route|variant unavailable|model not found|no such model|not_found|forbidden|overloaded|bad gateway|service unavailable|model_not_found/i;
 
+/**
+ * An `error` or `retry` event the backend typed as the provider's own doing —
+ * `provider.no-route`, `provider.rate-limit`, `provider.invalid-request`, … .
+ * The type is the backend's classification and is read first, because the
+ * words are not always there: on 2026-11-26 (opencode 2.4.2) a default model
+ * that was gone answered `provider.invalid-request` with "Upstream request
+ * failed: Model is unavailable." — not one word of the list above — and, read
+ * as an ordinary failure, the turn spent a retry where a refusal would have
+ * deferred the task. The list stays for what arrives untyped, and for stderr.
+ */
+function typedByProvider(event: RunEvent): boolean {
+  const type = asObject(event.error)?.type;
+  return typeof type === "string" && type.trim().startsWith("provider.");
+}
+
+/** Cap for the one line an `error` event lends a failed turn's text. */
+const ERROR_LINE_MAX = 500;
+
+/**
+ * What an `error` event said, in the backend's own words: its type and its
+ * message on one line, cut to {@link ERROR_LINE_MAX}. A message opencode keeps
+ * by language under `data.message` is read too; an event that says neither is
+ * quoted as it printed.
+ */
+function errorLine(event: RunEvent): string {
+  const error = asObject(event.error);
+  const type = typeof error?.type === "string" ? error.type.trim() : "";
+  const message = errorWords(error);
+  const line = type.length === 0 ? message : message.length === 0 ? type : `${type}: ${message}`;
+  return (line.length === 0 ? JSON.stringify(event.error) : line).slice(0, ERROR_LINE_MAX);
+}
+
+/** The message of an error record, wherever the backend keeps it; empty when it has none. */
+function errorWords(error: JsonObject | undefined): string {
+  if (typeof error?.message === "string") return error.message.trim();
+  const data = asObject(error?.data);
+  const byLanguage = Object.values(asObject(data?.message) ?? {}).find((value): value is string => typeof value === "string");
+  return typeof byLanguage === "string" ? byLanguage.trim() : typeof data?.message === "string" ? data.message.trim() : "";
+}
+
 /** A parsed `{"location":…,"data":…}` envelope from `opencode api`. */
 type ApiEnvelope = { data?: unknown };
 
@@ -290,6 +330,12 @@ export class OpenCodeAdapter implements AgentAdapter {
       const decoder = new StringDecoder("utf8");
       let buffered = "";
       let providerFailure = false;
+      // What the backend said when it errored: its last `error` event, so a
+      // refusal that prints nothing else still carries the provider's own words
+      // (verified live, 2026-11-26: an unknown model is refused with one `error`
+      // event and an empty stderr, and the deferral record, the journal and the
+      // outage report all said "no output").
+      let lastError = "";
       // Token counts reported by step_finish events, summed. Kept separate from
       // "0": a refusal that reports nothing must not look like a turn that ran
       // and spent nothing.
@@ -317,19 +363,16 @@ export class OpenCodeAdapter implements AgentAdapter {
           sessionId = event.sessionID;
           sawSessionId = true;
         }
-        if (event.type === "error") {
+        if (event.type === "error" || event.type === "retry") {
           // opencode reports a rejected turn as an error event (provider quota,
-          // auth, 5xx). Remember it so the caller can retry instead of treating
-          // the turn as an unverifiable interruption.
-          if (PROVIDER_REJECTION.test(JSON.stringify(event))) providerFailure = true;
-          return;
-        }
-        if (event.type === "retry") {
-          // opencode's own retry loop: the provider refused this attempt
-          // (`provider.rate-limit` on the zhipuai coding plan, 2026-11-23).
-          // The turn may still succeed after a retry, so this only matters when
-          // the CLI gives up and exits non-zero.
-          if (PROVIDER_REJECTION.test(JSON.stringify(event))) providerFailure = true;
+          // auth, 5xx), and each attempt of its own retry loop as a `retry`
+          // event carrying the same kind of error (`provider.rate-limit` on the
+          // zhipuai coding plan, 2026-11-23). Remember it so the caller can
+          // retry instead of treating the turn as an unverifiable interruption.
+          // A retry may still succeed, so it only matters once the CLI gives up
+          // and exits non-zero.
+          if (typedByProvider(event) || PROVIDER_REJECTION.test(JSON.stringify(event))) providerFailure = true;
+          if (event.type === "error") lastError = errorLine(event);
           return;
         }
         if (event.type === "text") {
@@ -372,10 +415,14 @@ export class OpenCodeAdapter implements AgentAdapter {
         }
         const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
         const rejected = code !== 0 && (providerFailure || PROVIDER_REJECTION.test(stderr));
+        // A failed turn opens with what the backend said when it errored, then
+        // what the model got out, then stderr. A successful turn keeps its text
+        // alone: the error of a retry it survived is history.
+        const failed = [lastError, text].filter((part) => part.length > 0).join("\n");
         resolve({
           sessionId,
           exitCode: code ?? -1,
-          text: code === 0 ? text : withStderr(text, stderr),
+          text: code === 0 ? text : withStderr(failed, stderr),
           ...(tokensReported ? { tokens } : {}),
           ...(rejected ? { failure: "provider" as const } : {}),
         });

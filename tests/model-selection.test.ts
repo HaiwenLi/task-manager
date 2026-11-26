@@ -3,7 +3,6 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clearModelCooldown, noteModelRefusal } from "../src/model-cooldown.js";
-import { writeModelRotation } from "../src/models.js";
 import { readRuntime } from "../src/runtime.js";
 import { serializeTaskFile } from "../src/task-file.js";
 import { runTask, type WorkerConfig } from "../src/worker.js";
@@ -82,42 +81,59 @@ describe("model selection beside the shared cooldown", () => {
     expect(await readRuntime(tasks, "a", "acceptance.json")).toMatchObject({ model: "q/three" });
   });
 
-  it("wraps to an earlier model only when nothing from the recorded position is available", async () => {
-    // This task was refused on q/one earlier and its window has lapsed; another
-    // task was then refused on q/two, the model the rotation points at.
-    await writeModelRotation(tasks, "a", { worker: { index: 1, model: "q/two" } });
-    await noteModelRefusal(tasks, "q/two", { reason: "rate limited", cooldownMs: 900_000 });
+  /** The board changes between two of the round's turns: a refusal on q/two, a success on q/one. */
+  class BetweenTurnsStore extends TaskStore {
+    changed = false;
+    async readDoneMarker(id: string): Promise<boolean> {
+      if (!this.changed) {
+        this.changed = true;
+        await noteModelRefusal(tasks, "q/two", { reason: "rate limited", cooldownMs: 900_000 });
+        await clearModelCooldown(tasks, "q/one");
+      }
+      return super.readDoneMarker(id);
+    }
+  }
+
+  it("wraps to a model the round refused earlier only when nothing from its position is available", async () => {
+    // The round is refused on q/one and moves to q/two. Between two of its turns
+    // another task is refused on q/two, and a third one succeeds on q/one: the
+    // walk wraps around to q/one. The controller reads the done marker once
+    // after every turn that exited 0, which is where the board changes here.
     const seen: string[] = [];
+    let turns = 0;
     const adapter: AgentAdapter = {
       prompt: async (args) => {
         seen.push(args.model ?? "(default)");
+        if (turns++ === 0) return refuse;
+        if (turns === 2) return { sessionId: "ses-two", exitCode: 0, text: "still working" };
         await writeFile(join(tasks, "a", "done.requested"), "done");
         return { sessionId: "ses-one", exitCode: 0, text: "done" };
       },
       contextUsage: async () => 0, contextLimit: async () => 100,
     };
-    const store = new TaskStore(tasks);
 
-    expect(await run(store, config("q/one", "q/two"), adapter)).toBe("done");
-    expect(seen).toEqual(["q/one"]);
+    expect(await run(new BetweenTurnsStore(tasks), config("q/one", "q/two"), adapter)).toBe("done");
+    expect(seen).toEqual(["q/one", "q/two", "q/one"]);
   });
 
-  it("skips forward past a cooling model before it wraps", async () => {
-    await writeModelRotation(tasks, "a", { worker: { index: 2, model: "q/three" } });
-    await noteModelRefusal(tasks, "q/three", { reason: "rate limited", cooldownMs: 900_000 });
+  it("skips forward past a cooling model before it wraps around", async () => {
+    // The same board change, in a chain with a model after the position: that
+    // one is taken before the walk goes around to q/one.
     const seen: string[] = [];
+    let turns = 0;
     const adapter: AgentAdapter = {
       prompt: async (args) => {
         seen.push(args.model ?? "(default)");
+        if (turns++ === 0) return refuse;
+        if (turns === 2) return { sessionId: "ses-two", exitCode: 0, text: "still working" };
         await writeFile(join(tasks, "a", "done.requested"), "done");
-        return { sessionId: "ses-four", exitCode: 0, text: "done" };
+        return { sessionId: "ses-three", exitCode: 0, text: "done" };
       },
       contextUsage: async () => 0, contextLimit: async () => 100,
     };
-    const store = new TaskStore(tasks);
 
-    expect(await run(store, config("q/one", "q/two", "q/three", "q/four"), adapter)).toBe("done");
-    expect(seen).toEqual(["q/four"]);
+    expect(await run(new BetweenTurnsStore(tasks), config("q/one", "q/two", "q/three"), adapter)).toBe("done");
+    expect(seen).toEqual(["q/one", "q/two", "q/three"]);
   });
 
   it("labels the work with the model that ran the turn, not with whichever model is available at acceptance", async () => {

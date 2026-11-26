@@ -367,7 +367,7 @@ describe("runTask: the guard before the claim", () => {
       modelCatalog: async (cwd?: string) => { catalogueDirs.push(cwd); return CATALOGUE; },
       defaultModelRef: async (cwd?: string) => { defaultDirs.push(cwd); return "plan/m"; },
     });
-    const config = cfg({ model: "plan/m" });
+    const config = cfg({ model: undefined });
     expect(await runTask(config, watched(store, adapter), unit(), "w")).toBe("done");
 
     // The session runs in the reserved workspace, and every read of the catalogue and of the default was asked

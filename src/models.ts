@@ -11,10 +11,11 @@ import { join } from "node:path";
  * `retryLimit` is the one failure mode a single-model setup cannot escape, so
  * each role may declare a chain of alternatives after its primary model.
  *
- * The rotation lives in `tasks/<id>/models.json` rather than `attempt.json`,
- * because it has to survive the very retries it causes: a new attempt starts
- * from a fresh record, and would otherwise forget that the head of the chain is
- * the model that just refused.
+ * The rotation lives in `tasks/<id>/models.json` rather than `attempt.json`, so
+ * that it is shared by every turn of one round, the worker's and the reviewer's
+ * alike. It does not outlive the round: every round starts again at the head of
+ * the chain (`resetRotation`), and inside a round it says how far the walk has
+ * got.
  *
  * It is advisory state, not evidence, and that shapes both halves of the I/O:
  *
@@ -103,13 +104,25 @@ export function taskChain(
 }
 
 /**
- * The chain the reviewer dispatches on: its own model, then its fallbacks —
- * never the task's or the worker's. One definition of it, for the worker and
- * for the budget guard. With no reviewer model the chain is empty, and the
- * reviewer runs on the backend's default.
+ * The chain the reviewer dispatches on: its own model, then its fallbacks,
+ * when one is configured — never the task's or the worker's then. With no
+ * reviewer model the chain is the worker's (`taskChain`), so a review that
+ * inherits it starts at the task's own model. Review independence is a fresh
+ * session, not a different model: the backend's default is never chosen on the
+ * reviewer's behalf. One definition of it, for the worker and for the budget
+ * guard.
  */
-export function reviewerChain(cfg: { reviewerModel?: string; reviewerModelFallbacks?: string[] }): string[] {
-  return modelChain(cfg.reviewerModel, cfg.reviewerModelFallbacks);
+export function reviewerChain(
+  cfg: { reviewerModel?: string; reviewerModelFallbacks?: string[]; model?: string; modelChain?: string[]; modelFallbacks?: string[] },
+  task: { model?: string } = {},
+): string[] {
+  const own = modelChain(cfg.reviewerModel, cfg.reviewerModelFallbacks);
+  return own.length > 0 ? own : taskChain(cfg, task);
+}
+
+/** The one model a session that runs on a single model uses: `model`, else the head of `modelChain`; the backend's default when neither is set. */
+export function directModel(cfg: { model?: string; modelChain?: string[] }): string | undefined {
+  return cfg.model ?? cfg.modelChain?.find((model) => model.trim().length > 0)?.trim();
 }
 
 /** Where the chain actually stands: a position recorded for a different model is stale. */
@@ -172,8 +185,8 @@ export async function writeModelRotation(tasksDir: string, id: string, rotation:
  * With `maxCycles > 0` the chain is a cycle, not a queue: reaching the tail
  * wraps back to the head (a model that refused earlier may have recovered —
  * quota windows reset while the chain walks) until the wrap budget is spent.
- * Only then is the chain truly "spent" and the caller parks the task for a
- * human instead of retrying.
+ * Only then is the round over: the caller ends it with a deferral
+ * (`refusedRound` in `./worker.js`) instead of spending a retry.
  *
  * A failed write throws: the caller contains it (see `fallBack` in the worker),
  * because a rotation that cannot be recorded must not be reported as progress.
@@ -217,17 +230,19 @@ export async function rotateModel(
 }
 
 /**
- * Give a role a fresh wrap budget for a new attempt. The position stays where
- * it is — a rerun still does not retry the dead head first — but the chain may
- * wrap around to it again, so a recovered model re-enters the rotation instead
- * of the task parking forever on a tail that never comes back. Advisory, like
- * the rotation itself: a lost or unreadable file is a no-op, never an error.
+ * Put a role back at the head of its chain with a fresh wrap budget: every
+ * round is one pass over the chain, from its head. Advisory, like the rotation
+ * itself.
  */
-export async function resetChainCycles(tasksDir: string, id: string, role: ModelRole): Promise<void> {
+export async function resetRotation(tasksDir: string, id: string, role: ModelRole): Promise<void> {
   try {
     const current = await readModelRotation(tasksDir, id);
-    if ((current.cycles?.[role] ?? 0) === 0) return;
-    await writeModelRotation(tasksDir, id, { ...current, cycles: { ...current.cycles, [role]: 0 } });
+    if (current[role] === undefined && (current.cycles?.[role] ?? 0) === 0) return;
+    await writeModelRotation(tasksDir, id, {
+      ...current,
+      [role]: undefined,
+      cycles: { ...current.cycles, [role]: 0 },
+    });
   } catch {
     // Advisory state only: a reset that cannot be read or written costs at
     // most one rejected dispatch, never a task.

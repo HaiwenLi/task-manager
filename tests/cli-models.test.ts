@@ -122,11 +122,12 @@ describe("taskctl models", () => {
     expect(refs()).toEqual(["zen/p", "kimi/k"]);   // the default first (both chains are empty, so it is listed once), then the task's own model
   });
 
-  it("lists the backend default in the place of a chain that is empty", async () => {
-    // The worker's chain is set; the reviewer's is not, so a review runs on the backend's default, the paid "zen/p".
+  it("lists no backend default for a reviewer that runs on the worker's chain", async () => {
+    // The worker's chain is set and the reviewer has none of its own, so the review runs on that chain:
+    // the paid "zen/p", the backend's default, is nobody's model here and is not listed.
     config = await writeConfig({ model: "plan/m" });
-    expect(await models(adapterOf(CATALOGUE, "zen/p"))).toBe(1);
-    expect(refs()).toEqual(["plan/m", "zen/p"]);
+    expect(await models(adapterOf(CATALOGUE, "zen/p"))).toBe(0);
+    expect(refs()).toEqual(["plan/m"]);
   });
 
   it("leaves out a finished task's model, and a model that already has a line", async () => {
@@ -142,7 +143,7 @@ describe("taskctl models", () => {
       // d has no model of its own: it runs on the chain, which is already listed.
       buildTaskFile({ id: "d", title: "d" }),
     );
-    // The reviewer's chain is empty too: its default is "plan/m", already listed.
+    // The reviewer's chain is the worker's chain here: "plan/m", already listed.
     expect(await models(adapterOf(CATALOGUE, "plan/m"))).toBe(1);
     expect(refs()).toEqual(["plan/m", "kimi/k"]);
   });

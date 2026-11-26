@@ -82,15 +82,16 @@ async function run(adapter: AgentAdapter, events: WorkerEvent[]) {
 }
 
 describe("provider rejection", () => {
-  it("retries a rejected turn instead of calling it an uncertain interruption", async () => {
+  it("ends a rejected turn as a deferral instead of calling it an uncertain interruption", async () => {
     const { adapter, calls } = failingAdapter("provider");
     const events: WorkerEvent[] = [];
     const outcome = await run(adapter, events);
 
-    expect(outcome).toBe("blocked");
-    const blocked = events.find((event) => event.type === "blocked");
-    expect(blocked?.detail).toContain("retry limit");
-    expect(blocked?.detail).not.toContain("shutdown");
+    expect(outcome).toBe("open");
+    expect((await new TaskStore(tasksDir).get("t1")).retries).toBe(0);
+    expect(events.some((event) => event.type === "blocked")).toBe(false);
+    expect(events.find((event) => event.type === "model-deferred")?.detail).toContain("retries untouched");
+    expect(events.some((event) => /shutdown/.test(event.detail ?? ""))).toBe(false);
     expect(calls.cancel).toBe(0);
   });
 

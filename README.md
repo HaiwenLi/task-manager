@@ -37,7 +37,7 @@ npx tsx src/main.ts <子命令> [参数]
 | `tasksDir` | string | `tasks` | 任务目录（绝对或相对当前目录） |
 | `workdir` | string | 当前目录 | agent 会话的工作目录，任务的改动都发生在这里 |
 | `agent` | string | `opencode` | v0.1 仅支持 `opencode` |
-| `model` | string | — | 兜底模型（`provider/model`）；任务 frontmatter 的 `model` 优先 |
+| `model` | string | — | 兜底模型（`provider/model`）；任务 frontmatter 的 `model` 优先。未设置时，`taskctl add` 的澄清会话与 `taskctl split` 的规划器改用 `modelChain` 的链首，而不是后端默认模型；两者都由预算护栏先判定 |
 | `effort` | string | — | 兜底努力档（如 `high`）；任务 frontmatter 的 `effort` 优先 |
 | `contextThreshold` | number | `0.8` | 上下文用量比例达到该值即触发收尾交接 |
 | `retryLimit` | number | `3` | 失败尝试（失败回合 / 收尾失败 / 验收失败）上限，达到即 `blocked` |
@@ -50,13 +50,14 @@ npx tsx src/main.ts <子命令> [参数]
 | `parallel` | number | `2` | 同时执行的任务数；同一工作目录仍只跑一个。`watch` 不读它，严格串行 |
 | `batchMaxTasks` | number | `5` | watch 自动连续批次的任务数上限；`1` = 关闭自动成批，手动 `run --batch` 仍可用 |
 | `maxReviewRounds` | number | `2` | 复核失败几轮后 `blocked` |
-| `reviewerModel` | string | 后端默认 | 复核会话单独用的模型；**不设置时用 opencode 自己的默认模型**，不会继承 `model` |
+| `reviewerModel` | string | 同 worker 链 | 复核会话单独用的模型。**不设置复核链时，复核链就是 worker 链**（`modelChain` / `model`，含任务自己的 `model`）；复核的独立性来自新会话，不来自换模型 |
 | `reviewerEffort` | string | 同 `effort` | 复核会话的努力档 |
 | `modelFallbacks` | string[] | `[]` | 模型被 provider 拒绝时依次换用的模型（`provider/model`）。排在任务 `model`（或配置 `model`）之后；没有主模型时整条链为空 |
-| `reviewerModelFallbacks` | string[] | `[]` | 复核会话的降级链，排在 `reviewerModel` 之后；没配 `reviewerModel` 时整条链为空 |
-| `modelChain` | string[] | 等价于 `[model]` | 整条派发链：第一个是主模型，其后是替代。设置了就替代 `model` 作为链首，`modelFallbacks` 仍追加在末尾。配额耗尽时按这条链推进（见「派发失败」） |
-| `chainCycles` | number | `0` | 模型链走到链尾后还能回绕到链首几次；`0` = 线性链，到链尾即视为耗尽。回绕是重探此前拒绝过的模型（它的配额窗口可能已经重置），退避照常；整个循环都耗尽才 `blocked` 等所有者决策。新一轮 attempt / 复核轮重新计圈，轮换位置保留 |
-| `modelCooldownMs` | number | `900000` | 某个模型被 provider 拒绝后，在整个看板内共享的冷却窗口。期间其他 Task 和后续 run 跳过它；到期重探，成功清除，显式 `chainCycles` 仍可在本任务内重探 |
+| `reviewerModelFallbacks` | string[] | `[]` | 复核会话的降级链，排在 `reviewerModel` 之后；没配 `reviewerModel` 时复核链为空，于是沿用 worker 链 |
+| `modelChain` | string[] | 等价于 `[model]` | 整条派发链：第一个是主模型，其后是替代。设置了就替代 `model` 作为链首，`modelFallbacks` 仍追加在末尾。被 provider 拒绝时按这条链推进（见「模型拒绝与轮次」） |
+| `chainCycles` | number | `0` | 模型链走到链尾后还能回绕到链首几次；`0` = 线性链，到链尾即视为耗尽。回绕是重探此前拒绝过的模型（它的配额窗口可能已经重置），退避照常；回绕只在一轮之内发生，整个循环都被拒绝即本轮结束（见「模型拒绝与轮次」）。每一轮（也就是每次 attempt）与每个复核轮重新计圈 |
+| `modelCooldownMs` | number | `60000` | 某个模型被 provider 拒绝后，在整个看板内共享的跳过窗口。期间其他 Task 和后续 run 不再向它派发；到期重探，成功清除，显式 `chainCycles` 仍可在本任务内重探。它只是窗口，不会让任务 `blocked` |
+| `modelRounds` | number | `4` | 一个任务在同一次执行里连续几轮被链上所有模型拒绝之后才做判断；必须是正整数。轮次与判断规则见「模型拒绝与轮次」 |
 | `failureFingerprintLimit` | number | `3` | 验收连续给出**同一失败**（归一化后的指纹相同）几次后转 `blocked` 等人工，不再自动重试 |
 | `opencodeBin` | string | `opencode` | opencode 可执行文件。**Windows 下 `.cmd` shim 无法被 `shell:false` 直接启动**，应在本地配置实际 `.exe`，不要提交机器专属路径 |
 | `chromeBin` | string | 自动探测 | 渲染验收用的浏览器可执行文件；也可用环境变量 `TASKCTL_CHROME`。找不到时渲染任务 `blocked`，不会当成通过 |
@@ -85,6 +86,22 @@ npx tsx src/main.ts <子命令> [参数]
 | `maxChars` | number | `2000` | 记忆节的字符上限 |
 | `itemChars` | number | `400` | 单条的字符上限，超出截断并加 `…` |
 | `timeoutMs` | number | `20000` | 一次召回从握手到检索完成的总超时 |
+
+**推荐配置（只用编码套餐里的模型）**：`modelChain` 按你的顺序列出套餐里的模型，`allowedProviders` 点名套餐的 provider——目录把它们报成免费、或不报成本，都放行：
+
+```json
+{
+  "modelChain": [
+    "zhipuai-coding-plan/glm-5.4",
+    "zhipuai-coding-plan/glm-5.3",
+    "zhipuai-coding-plan/glm-5.3-highspeed",
+    "zhipuai-coding-plan/glm-5.3-flash"
+  ],
+  "allowedProviders": ["zhipuai-coding-plan"]
+}
+```
+
+这样配置之后，护栏只放行这个 provider 的免费和成本未知的模型：别的 provider 的免费模型、任何按量计费的模型（包括同名的按量孪生，如 `zhipuai/glm-5.3`）、以及别的 provider 里目录不报成本、又没被 `allowedModels` 点名的模型，一律拒绝——要用套餐之外的模型，把它写进 `modelChain`，再按它的成本放行：**免费**模型只认 provider——把它的 provider 加进 `allowedProviders`（`allowedModels` 对免费模型不起作用）；**按量计费**的模型用 `allowedModels` 点名，或开 `allowPaidModels`，或把 `maxCostPerMillion` 提到不低于它的单价（`allowedProviders` 放行不了按量模型）；目录不报成本的模型，`allowedModels` 或 `allowedProviders` 点到一个就行。跑之前先用 `taskctl models` 看一遍判定。
 
 ## 任务文件
 
@@ -134,7 +151,7 @@ retries: 0
 
 `schema: taskctl/v1` 是显式注册：`tasks/` 目录里可以放别的 Markdown（手抄的快照、草稿、导出的旧任务），只有声明了这一行的文件才会被调度。缺这行或 frontmatter 解析不了的文件不领取、不排期，`taskctl status` 会在看板后面单独列出 `ignored` 及原因；已注册但内容坏掉的任务仍然照常报错，不会被静默忽略。`taskctl add` 生成的文件自带这一行。
 
-辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`definition.json`（领取时写下的定义快照，本次尝试的判据）、`acceptance.json`（命令、验收模式、时间、输出、身份摘要与实际使用的模型）、`acceptance-failures.json`（连续同一验收失败的指纹与次数）、`review.json`（复核判决、模型、被容忍的外部变更与实际注入的改动证据）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`execution-state.json`（持久升级与最近 worker session）、`review-pending.json`（只待复核的保留现场）、`classification.json`（接入分类：实际/建议车道、是否兜底升级、信息充分性、理由）、`questions.md`（待回答的问题；存在期间不能 approve）、`split-plan.json`（拆分计划：子任务、继承字段与整合步骤）、`split-applied.json`（父任务已连接到哪份计划）、`split-plan.rejected.txt`（被拒绝的规划器原话）、`usage.jsonl`（每回合资源快照与增量）、`recall.json`（记忆召回的审计记录：查询串、命中的抽屉 id 与相似度，不复制全文）、`done.requested`（完成请求）、`logs/`（控制器逐任务日志与 worker 的 `$TASKCTL_LOG_DIR`）、`scratch/`（回合后清扫的落点，只进不出）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
+辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`definition.json`（领取时写下的定义快照，本次尝试的判据）、`acceptance.json`（命令、验收模式、时间、输出、身份摘要与实际使用的模型）、`acceptance-failures.json`（连续同一验收失败的指纹与次数）、`review.json`（复核判决、模型、被容忍的外部变更与实际注入的改动证据）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`model-wait.json`（模型窗口的推迟记录：轮次、本次执行里第一次被拒的时间、每个模型的拒绝原话、下次可领取时间）、`execution-state.json`（持久升级与最近 worker session）、`review-pending.json`（只待复核的保留现场）、`classification.json`（接入分类：实际/建议车道、是否兜底升级、信息充分性、理由）、`questions.md`（待回答的问题；存在期间不能 approve）、`split-plan.json`（拆分计划：子任务、继承字段与整合步骤）、`split-applied.json`（父任务已连接到哪份计划）、`split-plan.rejected.txt`（被拒绝的规划器原话）、`usage.jsonl`（每回合资源快照与增量）、`recall.json`（记忆召回的审计记录：查询串、命中的抽屉 id 与相似度，不复制全文）、`done.requested`（完成请求）、`logs/`（控制器逐任务日志与 worker 的 `$TASKCTL_LOG_DIR`）、`scratch/`（回合后清扫的落点，只进不出）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
 
 ## 车道与验收方式
 
@@ -185,7 +202,7 @@ taskctl approve --task <id>                      # 修订后的定义要重新�
 
 - **continuous**：先给一个完整 worker 回合（其中可有很多工具调用）。未请求完成、验收失败、Review fail、显式 `ESCALATE:` 或需要交接时才升级为 iterative；不会先空转到默认 40 回合。
 - **iterative**：验收失败会把退出码、输出尾部和失败指纹写进交接笔记；同模型时续用当前 worker session 返工，provider 切换仍强制新 session。普通 Review fail 在同一 claim 内继续，不再先回 `open` 等调度器重新认领。
-- **Reviewer 不可用**：不增加 worker retry，也不重放已成功的 worker/验收。任务以 `blocked + review-pending.json` 保留现场；换到健康 Reviewer 后执行 `taskctl retry --task <id> --review-only`，定义和产物摘要一致才只跑 Review。恢复时评审员看到的时间窗是**产出这些证据的那次尝试**的时间窗（第一次保留现场时记进 `review-pending.json`），不是恢复这次尝试的。
+- **Reviewer 不可用**：reviewer 被 provider 拒绝不增加 worker retry，也不重放已成功的 worker/验收。任务带着保留的现场回到 `open`（`review-pending.json` 与推迟记录），窗口一到控制器自己只跑复核；连续 `modelRounds` 轮被拒后由控制器按证据规则决定（见「模型拒绝与轮次」）。reviewer **超时**则照旧以 `blocked + review-pending.json` 保留现场：换到健康 Reviewer 后执行 `taskctl retry --task <id> --review-only`，定义和产物摘要一致才只跑 Review。reviewer **崩溃**不是拒绝，判不出来转 `awaiting-human`。没有单独配复核链时复核沿用 worker 链。恢复时评审员看到的时间窗是**产出这些证据的那次尝试**的时间窗（第一次保留现场时记进 `review-pending.json`），不是恢复这次尝试的。
 - **没有 criteria**：即使需要 Review，也不会让 reviewer 凭空判断；quick 等无判据任务仍转 `awaiting-human`。
 
 ## 复核流水线
@@ -329,9 +346,28 @@ npx tsx src/main.ts run [--log <file>] [--config taskctl.json]
 
 **故障隔离**：控制器内部错误只影响所在任务——该尝试结算、工作区释放、任务 `blocked` 并发出 `controller-error` 事件，其余任务照常排空；此时 `run` 仍排空看板，但退出码为 1。任务被预算护栏拒绝时同样是排空看板、退出码 1，见「已知陷阱」。预期内的情况不算内部错误：复核超时（已确认停止）只保留待复核的现场（`review-pending.json`，用 `taskctl retry --review-only` 恢复），验收时模型进入冷却不影响已完成的回合。
 
-同一实际工作目录（含路径别名）不可并行执行；共享 Git common directory 的 worktree 暂按串行处理。当前不自动创建/合并 worktree。验收前后对源码产物做摘要；验收命令改变产物会要求复核，不会把旧检查套到新版本。摘要排除 Git 内部、依赖目录及任务运行时目录（另可用 `artifactIgnore` 忽略任务自产物的路径，见下节）；详见 `src/workspace.ts`。
+**退出码**：`0` 跑完（包括有任务以 `blocked` 或 `awaiting-human` 结束）；`1` 运行错误，或有任务因控制器内部错误而 `blocked`，或有任务被预算护栏拒绝；`2` 用法错误；`3` 因模型不可用停下——每个模型的原因、几轮、多久、还在等的任务都会打印出来，没有任何任务被 `blocked`，改好 `modelChain`（需要的话补上 `allowedModels`，先用 `taskctl models` 看判定）后直接再跑一次即可（见「模型拒绝与轮次」）。因模型不可用停下时一律是 `3`：同一次执行里有任务被护栏拒绝、或有任务因控制器内部错误而 `blocked` 也一样，护栏那几行和控制器错误照常打印在报告旁边。`run` 等模型窗口时先打印一行 `[<id>] model-wait waiting …`。
+
+同一实际工作目录（含路径别名）不可并行执行；共享 Git common directory 的 worktree 暂按串行处理。当前不自动创建/合并 worktree。验收前后对源码产物做摘要；验收命令改变产物会要求复核，不会把旧检查套到新版本。摘要排除 Git 内部、依赖目录、任务运行时目录，以及本次运行的配置文件本身——`taskctl.json` 放在工作目录里时，改它不算产物变化（另可用 `artifactIgnore` 忽略任务自产物的路径，见下节）；详见 `src/workspace.ts`。
 
 **控制器日志（`--log`）**：`--log <file>` 把每个 `[<id>] …` 事件行连时间戳 tee 进指定文件（stdout 照常输出；文件目录不存在会自动创建）。不指定时，每个任务的事件行缺省写进它自己的 `tasks/<id>/logs/run-<ISO>.log`（ISO 是本次 run 的启动时刻，`:` 换成 `-` 以便 Windows 文件名）。这取代了以前"外部 `Tee-Object` 到仓库根目录"的做法——控制器日志从此落在任务目录里，不再污染工作区。日志写失败只忽略，不会拖垮 run。
+
+### 模型拒绝与轮次
+
+provider 拒绝（429 / 配额 / 鉴权 / 5xx / `no-route` 等，即 adapter 标出的 `failure: "provider"`）说的是账号或模型，不是任务。adapter 先看后端给错误标的类型：标成 `provider.*` 的一律算拒绝，不看措辞；没有类型的，按错误文字和标准错误里的关键词认。无论被拒的回合是否已经干了活，它都**不花 `retries`**，也**不会让任务 `blocked`**：
+
+- **一轮**是把派发链（`modelChain` → `modelFallbacks`）从头走一遍，每个模型试一次；被拒就立刻换下一个。每一轮都从链首开始；`chainCycles` 与配额退避只在一轮之内生效。
+- 一轮里每个模型都拒绝（或都还在共享冷却窗口内），这次 attempt 结束：任务回到 `open`，带一份**推迟记录** `tasks/<id>/model-wait.json`——轮次、本次执行里第一次被拒的时间、每个模型的拒绝原话、下次可领取时间（`modelCooldownMs`，默认 60 秒）。时间没到之前，调度器和领取处都不会碰它，和依赖没完成时一样。
+- `run` 在没有别的任务可跑时，等到最近的下一次时间再来一轮（等之前打印一行 `[<id>] model-wait waiting …`）；`watch` 每 30 秒醒一次，同样只靠领取处的这道门。看板级共享冷却表 `.taskctl/model-cooldowns.json` 只负责「窗口内别再撞同一个模型」，不再造成 `blocked`，也**不当作证据**。只有任务自己被拒的那一轮才计数；整个链都因为别的任务的拒绝而在冷却、于是什么都没派发的那一次不计数，它的下次时间是这些窗口里最早到期的那个。
+- 连续 `modelRounds` 轮（默认 4，约 4–5 分钟）没有任何模型接受之后，attempt 自己**不做判断**，只把轮次记下。控制器等到没有任何尝试在跑时才看这次执行自己的证据：**期间有没有别的任务在链上某个模型上成功过一个回合。** 另一个任务的回合正在跑时就先等它结算——它可能就是证据。
+  - 有：模型是好的，问题在这个任务自己。只把它 `blocked`，交接笔记逐个写出每个模型和它的拒绝原话；依赖它的任务照常等，其余任务继续。
+  - 没有：这是模型不可用。任务原样留在 `open`、`retries` 不动，整次 `run` 或 `watch` 停下并打印报告（每个模型的原因——后端自己的原话，几轮、多久、还在等的任务），退出码 **3**。改好 `modelChain`（需要的话补上 `allowedModels`，先用 `taskctl models` 看判定）后直接再跑一次 `taskctl run`（或 `taskctl watch`），所有等待的任务自动继续，不需要逐个 `retry`。
+- 「成功过一个回合」指 worker 回合退出码为 0，或 reviewer 的回合不是 provider 拒绝且有自己的会话（哪怕它崩了、没给出判决）；超时的复核回合（照旧 park）和退出码非 0 的 worker 回合不算。证据按模型记在这一次执行里，不落盘，也从不读共享冷却表——那张表每个模型只有一条，会被最近一次拒绝覆盖。
+- 同一次执行里轮次用尽的任务不会再被提供；新的一次 `run` / `watch` 从第 0 轮算起。手工 `taskctl retry` 不归档推迟记录：它保留已经记下的最早可领取时间，把轮次和第一次被拒的时间清零——这次 `retry` 买到全新的一轮 `modelRounds`；共享冷却表照旧不清，刚拒绝过的模型不会被立刻再撞。
+- **预算护栏的拒绝不是这里的拒绝。** 护栏判定的是「这个模型要不要花钱」，被拒的任务没有会话启动、没有模型被问，所以不开始一轮、不写推迟记录、也不算证据。`run` 对它只提供一次，照常打印护栏原话并以退出码 1 结束；`watch` 五分钟内不再拿它，批次在它那里停下。被拒的任务记在 `.taskctl/guard-refusals.json`，`taskctl status --stuck` 据此列出它。推迟在调度器里是护栏之外的**第二重**排除：两者都不算进展，都等到各自的时间为止。两种等待并不一样——推迟会让 `run` 等一等再试，因为 provider 的拒绝会过去；护栏的拒绝不会，因为读到的目录在进程存活期间不会变。
+- 复核阶段同理：reviewer 被拒不花任何额度，也不重放 worker 的工作和验收。窗口一到，控制器自己对保留下来的证据只跑复核（`review-pending.json` 与它的摘要门）；`modelRounds` 轮之后由控制器按同一条证据规则决定——留给人（`blocked` + `review-pending.json`），或按模型不可用停下并保留证据。reviewer **超时不是拒绝**，保持今天的 park（`blocked` + `review-pending.json`，`taskctl retry --review-only` 恢复）；**崩溃也不是拒绝**，保持今天的处理：判不出来转 `awaiting-human`。复核阶段的轮次单独计数，所以一个任务可以先作为 worker、再作为被复核的任务，各被推迟 `modelRounds` 轮。窗口还没到时执行 `taskctl retry --review-only`，命令不会跑，而是打印等到几点再来。复核没有单独配链时沿用 worker 链；worker 的链首刚拒绝过，复核就从接手的那个模型开始。
+
+随时可以问「哪些任务卡住了、为什么」：`taskctl status --stuck`。
 
 ### taskctl run --batch — 连续批次
 
@@ -341,7 +377,7 @@ npx tsx src/main.ts run --batch C,B,A [--log <file>] [--config taskctl.json]
 
 批次只是调度策略，不是把多项任务合成一个“大任务”。它严格按命令行给出的 `C,B,A` 顺序执行，先整选校验，再从普通 `run` 队列之外**只领取这些任务**。每项都必须：`execution: continuous`（或从 `simple` 推导）、同一解析后的 workdir、`verify: mechanical` / `render`、普通风险、无 `human_check`、依赖已 `done` 或排在所选顺序的前面，并且没有活跃或未结算的旧执行。高风险、人工门禁、跨 workdir、显式 iterative 会被拒绝，不会静默放宽。
 
-每个任务仍然单独领锁、保存定义快照、跑自己的验收和必要的复核，写自己的 `acceptance.json`、session 与 usage 增量；验收**不会**推迟到批次末尾。每次领取前还会重读看板并比较原定义和 workdir，中途改动在被改任务领取前拒绝。复核 `fail` 在当前领取内返工，不会把任务退回 `open`；批次对 `open` 结果的重试是为将来的调度器结果保留的防御分支，目前只有测试接缝能到达。`blocked` / `awaiting-human` / `skipped`（领取被拒、任务已不在 `open`/`running`、依赖未就绪、所有权丢失）会停止批次，后续任务不被领取。
+每个任务仍然单独领锁、保存定义快照、跑自己的验收和必要的复核，写自己的 `acceptance.json`、session 与 usage 增量；验收**不会**推迟到批次末尾。每次领取前还会重读看板并比较原定义和 workdir，中途改动在被改任务领取前拒绝。复核 `fail` 在当前领取内返工，不会把任务退回 `open`；批次对 `open` 结果的重试是为将来的调度器结果保留的防御分支，目前只有测试接缝能到达。`blocked` / `awaiting-human` / `skipped`（领取被拒、任务已不在 `open`/`running`、依赖未就绪、所有权丢失）会停止批次，后续任务不被领取。当前任务被推迟（等模型窗口）时批次停下并打印下次可领取时间，退出码 `0`——到点再跑一次即可，批次自己不等待。`--batch` 显式选中的任务若还在推迟窗口内，整批在领取前就被拒绝并说明时间。批次里出现模型不可用时同样打印报告并以退出码 `3` 退出。
 
 上一任务干净结算后，只有实际 model 与 canonical workdir 都一致、worker session 标记 clean、后端探测返回 `reusable` 时，下一任务才续用该 session。model 不匹配或探测 `unavailable` 会记 journal 后新开；`active` 会阻塞待 reconcile，不会启动竞争 worker。
 
@@ -355,7 +391,7 @@ npx tsx src/main.ts stop --tasks-dir tasks              # 另一个终端：请�
 
 watch 用文件事件（250ms 去抖）和 30 秒兜底扫描发现新任务；空转不做模型调用、完整产物摘要或看板重写。未完成的非活跃 `running` 任务优先，随后按看板顺序处理就绪任务；`draft`、`awaiting-human`、`blocked` 仍留在看板上，但不会绕过门禁执行。
 
-至少两个连续合格任务时自动成批，上限是 `batchMaxTasks`（默认 5）。自动成批只取 `ready()` 队首的**连续合格前缀**，不会让后面的任务越过更早的高风险、人工门禁或其它不合格任务；单个任务直接普通执行，`batchMaxTasks: 1` 关闭自动成批。批次进行中新到的任务等下一个调度边界，不会插进当前选择。被预算护栏拒绝的任务五分钟内不在候选里，之后重新判一次；这期间后面的任务照常调度。
+至少两个连续合格任务时自动成批，上限是 `batchMaxTasks`（默认 5）。自动成批只取 `ready()` 队首的**连续合格前缀**，不会让后面的任务越过更早的高风险、人工门禁或其它不合格任务；单个任务直接普通执行，`batchMaxTasks: 1` 关闭自动成批。批次进行中新到的任务等下一个调度边界，不会插进当前选择。被预算护栏拒绝的任务五分钟内不在候选里，之后重新判一次；这期间后面的任务照常调度。被推迟（等模型窗口）的任务不参与选择，排在它后面的任务照常调度；它的窗口一到，最晚 30 秒后自动再试。出现模型不可用时 watch 打印与 `run` 相同的报告并以退出码 `3` 退出；不会写下 stop 文件，所以下一次 `taskctl watch` 不需要 `--resume`。
 
 一个看板只有一个 watch 所有者，记录在 `.taskctl/watch.lock`，带完整 owner generation 和 heartbeat。第二个活跃 watcher 会直接拒绝；stale / 损坏记录只诊断，不自动接管，确认旧进程已消失后需人工清理。
 
@@ -449,10 +485,22 @@ taskctl note --task <id> --status <一句话状态> --done <已完成> --found <
 ### taskctl status — 看板
 
 ```bash
-npx tsx src/main.ts status [--tasks-dir <dir>]
+npx tsx src/main.ts status [--stuck] [--tasks-dir <dir>]
 ```
 
 每任务一行：id、status、retries、sessions 数、最新笔记的 Status 行。没有 `schema: taskctl/v1` 的 Markdown（或 frontmatter 解析不了的文件）单独列为 `ignored`，不参与调度。
+
+`taskctl status --stuck` 只列出受阻或等待的任务，每个一行，只读文件、不问后端：
+
+| 行 | 说明 |
+| --- | --- |
+| `已阻塞` | 原因（来自交接笔记或最近一条 blocked 日志）、起始时间；因模型拒绝而阻塞的逐个列出模型和拒绝原话；只差复核的写 `只差复核：<模型>：<原因>` |
+| `等受阻依赖` | 等的是哪个任务（隔了一层时写 `A（经 B）`），以及那个任务为什么受阻 |
+| `等模型窗口` | 第 n/`modelRounds` 轮、下次可领取时间；轮次用尽的：有尝试在跑时写明等它们结算后判断，没有时写明等所有者处理，新的 `taskctl run` 从第 0 轮开始 |
+| `等护栏放行` | 被预算护栏拒绝的任务：护栏当时的原话和判定时间（来自 `.taskctl/guard-refusals.json`）；现在的判定以 `taskctl models` 为准 |
+| `等放行` / `等签字` / `待回答问题` | `awaiting-human`、等签字的 `draft`（含待回答的问题） |
+
+没有这样的任务时只打印一行「没有受阻或等待的任务」。当你问「哪些任务卡住了」，答案就是这个命令的输出。
 
 所有「写临时文件、再改名覆盖」的落盘——任务文件、`attempt.json` 等运行记录、任务锁与 watch 锁的心跳、模型轮转、共享冷却表、usage、看板——都走同一个带重试的改名（`src/replace.ts`）：Windows 上杀软/索引器偶尔会短暂占用目标文件（EPERM/EBUSY/EACCES），重试耗尽才报错。心跳写失败**不等于**所有权丢失：只有锁记录不再属于自己（`heartbeat` 返回 false，或受保护写入前的所有权检查失败）才结束尝试或 watcher；写不进去不会被当成丢锁：任务尝试记一条 `heartbeat-write-failed` 日志（每个尝试一条），watch 报告一次（每次 watch 一条），下一个心跳周期重试。看板文件 `.taskctl/board.md` 是每次 `status` 重新生成的派生视图，重试耗尽也只影响这一次看板刷新。运行中的事件刷新会合并突发写入，只保留正在写的一次和最后一次最新状态。
 
@@ -463,17 +511,18 @@ npx tsx src/main.ts status [--tasks-dir <dir>]
 - **仓库根目录自带一个 open 任务**：`tasks/example.md`（`status: open`）。在仓库根目录直接 `taskctl run` 会真的派发它 —— 真实 agent 会在当前目录创建 `hello.txt` 并消耗模型额度。请换到自己的工作目录运行，或先删掉 / 关掉该示例任务。
 - **`--config` 路径写错不报错**：配置文件读不到（ENOENT）时按"全默认"处理（`tasksDir=tasks`、`workdir=当前目录`）。路径拼错不会失败，只会让任务跑在非预期的目录。请核对拼写与相对路径基准（当前目录，不是仓库根）。
 - **预算护栏会拒绝现有配置**：按量计费和成本未知的模型默认不放行，升级后第一次 `taskctl run` 会拒绝这样的任务，直到补上 `allowedProviders` 和 `allowedModels`。先跑 `taskctl models`：它只读模型目录、不启动任何会话，把每个模型的判定列出来，有被拒的就退出码 1。
+- **升级后，旧版本保留的复核会被摘要挡下一次**：2026-11-26 起产物摘要不再计入配置文件。在那之前的版本写下 `review-pending.json`、工作目录里又放着 `taskctl.json` 的任务，升级后第一次恢复会 `blocked`，报 `artifacts changed after the preserved worker/acceptance evidence`——其实什么都没变，变的是摘要的算法；`taskctl retry --review-only` 同样被挡。对这样的任务做一次完整的 `taskctl retry`，再 `run`（worker、验收、复核都会重跑）。配置文件在工作目录外的任务不受影响，照常自己恢复。
 - **目录和默认模型按会话所在的目录读**：后端按目录回答 `model.list` 和 `model.default`，项目里放一份 `opencode.json` 就会改变两者。`taskctl models` 判的是配置里的 `workdir`：从任务的目录运行它，或者把 `workdir` 指过去，否则看到的不是任务真正会用的那份目录。
 - **模型目录的条目带凭据**：条目里有 `settings.apiKey` 和 `headers`，任何路径都不打印、不记录它。`opencode api` 调用失败时，拒绝理由里只有操作名和一个代码（如 `opencode api model.list failed: exit 1`），不引用服务的输出。
-- **被护栏拒绝是什么样子**：任务保持 `open`，没有模型会话被启动，不需要人工恢复。领取之前的那次拒绝什么都不写。领取之后、会话启动之前还会按重读到的任务再判一次，调度器的快照和领取之间被改过 `model` 的任务就在这里被拦；那条路上锁和工作目录预留已经写下、又都释放了（执行状态读不出来时 journal 里会留一条 `execution-state-invalid`）。同一个任务、同一条理由在一个进程里只报一次，理由变了会再报。`taskctl run` 打印 `[scheduler] N task(s) refused by the budget guard; no model session was started for them` 并以退出码 1 结束；`watch` 五分钟内不再拿出这个任务，之后重新判。
-- **目录读不到、或读回来是空的，一律按拒绝处理**：这样的答案不会被记住，下一次会再读，后端恢复后重跑 `run` 就能过。后端报不出默认模型时，链为空的那个角色被拒，理由是 `后端默认模型无法确认`（配置里一个模型都没写，或者只写了 `model` 没写 `reviewerModel`，都会落到这里）。`opencode` 还是 npm 的 `.cmd` shim 时，理由是 `opencode api model.list failed: ENOENT`，原因和下面「Windows 下 spawn opencode 失败」相同：把 `opencodeBin` 指向真实的 exe。
+- **被护栏拒绝是什么样子**：任务保持 `open`，没有模型会话被启动，不需要人工恢复。领取之前的那次拒绝什么都不写。领取之后、会话启动之前还会按重读到的任务再判一次，调度器的快照和领取之间被改过 `model` 的任务就在这里被拦；那条路上锁和工作目录预留已经写下、又都释放了（执行状态读不出来时 journal 里会留一条 `execution-state-invalid`）。同一个任务、同一条理由在一个进程里只报一次，理由变了会再报。被拒的任务记在看板级的 `.taskctl/guard-refusals.json`（任务、判定时间、护栏原话），`taskctl status --stuck` 据此列出它；任务下一次被提供且未被拒绝、或者离开 `open` 时，这条记录随之删除。`taskctl run` 打印 `[scheduler] N task(s) refused by the budget guard; no model session was started for them` 并以退出码 1 结束；`watch` 五分钟内不再拿出这个任务，之后重新判。
+- **目录读不到、或读回来是空的，一律按拒绝处理**：这样的答案不会被记住，下一次会再读，后端恢复后重跑 `run` 就能过。后端报不出默认模型时，链为空的那个角色被拒，理由是 `后端默认模型无法确认`（配置里一个模型都没写时会落到这里；只写了 `model` 没写 `reviewerModel` 时复核沿用 worker 链，不判后端默认模型）。`opencode` 还是 npm 的 `.cmd` shim 时，理由是 `opencode api model.list failed: ENOENT`，原因和下面「Windows 下 spawn opencode 失败」相同：把 `opencodeBin` 指向真实的 exe。
 - **记忆召回默认关闭**：`memory.backend` 不是 `mempalace` 时没有召回、没有 `recall.json`、没有子进程。开着时后端出任何问题都只降级，任务不会因此 `blocked`。`memory.rooms` 不能为空。召回拉起的子进程在 Windows 上总会被结束；POSIX 上一个忽略 SIGTERM 的服务可以在两秒等待之后继续活着。
 - **固定来源读不到不拦任务**：`fixedSources` 里的文件找不到或读不出来，那次尝试照样跑，只是不带这个文件，journal 留一条 `sources`。文件挪了位置不会在当时报出来，所以挪完跑一次 `taskctl recall`：有文件读不到它就退出码 1。
 - **固定来源只带文件名，文件内容原样进提示词**：taskctl 不把规范文件的路径写进提示词、journal 和输出，只带文件名；但文件内容原样进提示词，文件里自己写了路径，那条路径就到了 worker 手里。
 
 ## 排障
 
-**任务变 blocked** —— 原因包括重试耗尽、缺少验收、任务/产物变化、工作目录被占用、执行停止未确认、验收连续同一失败，以及派发链上所有模型都配额耗尽。先看事件日志、`attempt.json`、`acceptance.json`、`acceptance-failures.json` 与交接笔记。只有普通、已停止的失败才可修复后重开；不确定执行不能只改状态绕过。
+**任务变 blocked** —— 原因包括重试耗尽、缺少验收、任务/产物变化、工作目录被占用、执行停止未确认、验收连续同一失败。模型拒绝**不再**让任务 `blocked`：它只会推迟任务，最多在连续 `modelRounds` 轮、且期间另有任务被服务之后，才以「本任务自身的问题」阻塞。先看事件日志、`attempt.json`、`acceptance.json`、`acceptance-failures.json` 与交接笔记。只有普通、已停止的失败才可修复后重开；不确定执行不能只改状态绕过。
 
 **同一条验收失败反复出现** —— 验收连续给出同一个失败（归一化后的指纹相同；时间、绝对路径、耗时的差异不算不同）达到 `failureFingerprintLimit`（默认 3）次，任务 `blocked` 等人工，不再自动重跑。计数写在 `tasks/<id>/acceptance-failures.json`，所以跨尝试仍然有效（每轮都是新尝试，内存计数永远归 1）；任何一次验收通过就清掉。重复同一条失败重跑不会再给新信息：先决定是改判据、修门，还是承认证据不足。
 
@@ -486,9 +535,9 @@ taskctl reconcile --task <id>   # 只读诊断：lock / attempt 阶段 / 归属�
 taskctl retry --task <id>       # 归档旧证据后重开；仅在 attempt 已 settled、无活跃锁、无匹配预留时执行
 ```
 
-`reconcile` 只报告不改状态，结论是 `retry-allowed` / `manual-review` / `already-terminal` 之一；归属路径无法确定时一律 `manual-review`。`retry` 会拒绝任何"还可能有执行在跑"或"归属路径不确定"的情况，并把 `attempt.json`、`acceptance.json`、`review.json`、`models.json` 移入 `tasks/<id>/archive/<时间戳>/`、重置 `retries` 与 `review_rounds`、写一条 `human retry` 日志。
+`reconcile` 只报告不改状态，结论是 `retry-allowed` / `manual-review` / `already-terminal` 之一；归属路径无法确定时一律 `manual-review`。`retry` 会拒绝任何"还可能有执行在跑"或"归属路径不确定"的情况，并把 `attempt.json`、`acceptance.json`、`review.json`、`models.json`、`review-pending.json` 移入 `tasks/<id>/archive/<时间戳>/`、重置 `retries` 与 `review_rounds`、写一条 `human retry` 日志。推迟记录 `model-wait.json` 不归档：`retry` 保留它已经记下的最早可领取时间，把轮次和第一次被拒的时间清零——这次 `retry` 买到的是全新的一轮 `modelRounds`，而刚拒绝过的模型不会被立刻再撞。
 
-若任务因 Reviewer provider 全部不可用而阻塞，且存在 `review-pending.json`，`reconcile` 会建议 `taskctl retry --task <id> --review-only`。这条路径不调用 worker、不重跑验收，只在定义与产物摘要未变时恢复 Review；共享冷却仍然生效，所以通常应等窗口结束或换健康 Reviewer。普通 `retry` 仍是明确的全量重试。
+若任务因 Reviewer provider 全部不可用而阻塞，且存在 `review-pending.json`，`reconcile` 会建议 `taskctl retry --task <id> --review-only`。这条路径不调用 worker、不重跑验收，只在定义与产物摘要未变时恢复 Review（配置文件不算产物：改完 `taskctl.json` 再恢复，不会被摘要门拒绝）；共享冷却仍然生效，所以通常应等窗口结束或换健康 Reviewer。普通 `retry` 仍是明确的全量重试。从 2026-11-26 之前的版本升级时留意：那时保留的复核，在工作目录里放着 `taskctl.json` 的任务上会被挡下一次，`retry --review-only` 清不掉，要一次完整的 `retry`（见「已知陷阱」）。
 
 **taskctl 不按记录的 PID 杀进程。** PID 会被复用，`attempt.json` 里的 pid 不能证明它仍属于那次执行（ADR-0007）。需要停止执行时，由人核实进程身份后自行处理；执行停止未确认（`attempt.phase` 不是 `settled`）的任务，`retry` 一律拒绝，仍需按下面的手工流程归档证据。
 
@@ -498,15 +547,13 @@ taskctl retry --task <id>       # 归档旧证据后重开；仅在 attempt 已 
 
 **回合 / 验收超时** —— 单回合默认 30 分钟、验收 10 分钟。请求停止并确认停止后才允许计失败重试；无法确认则阻塞并保留工作目录预留。OpenCode CLI 被杀不代表其独立后端会话已停，因此 OpenCode 回合被中断按不确定处理，须人工核实。未做真实后端取消验证。
 
-**provider 拒绝（429 / 鉴权 / 5xx）** —— 这类失败说明回合根本没开始干活，adapter 会把它标成 `failure: "provider"`：复核阶段按失败重试而不是转人工。它与"执行停止未确认"是两回事，不会把任务卡进需要人工对账的状态。worker 侧要注意共享冷却（见下文）：这次失败计一次重试，**同时**把该模型记入看板级冷却表（默认 15 分钟），冷却期内不再向它派发——所以没配降级链时，任务通常在这一回合之后就 `blocked`，交接笔记会写明已派发的回合数和下一次可探测时间。
+**provider 拒绝（429 / 鉴权 / 5xx / 配额耗尽）** —— adapter 把它标成 `failure: "provider"`。这类失败说的是账号或模型，不是任务：不花 `retries`，不 `blocked`，立刻换链上的下一个模型；一整轮都被拒就把任务推迟到下一个窗口（`modelCooldownMs`，默认 60 秒）。连续 `modelRounds` 轮之后才由控制器做判断，规则与报告见「模型拒绝与轮次」。想立刻知道哪些任务在等：`taskctl status --stuck`。
 
-**配额耗尽（weekly limit / usage limit / quota 等）** —— 同属 provider 拒绝，但多了一个事实：窗口过一阵会恢复，任务本身没有任何问题。所以这类拒绝**不花 `retries`**：先退避等待（默认 1s 起翻倍、封顶 30s），再把这一回合交给链上的下一个模型；整条链都拒绝时 `blocked`，交接笔记（`blocked:needs-owner`）逐条列出每个模型和它的拒绝原因，并写明"换有额度的模型或等窗口重置后 `taskctl retry`，不要把它当成任务失败去改判据"。识别靠错误文本里的额度措辞；没有措辞时看形状——回合几秒内返回且 token 数为 0，说明根本没进到模型。这条路径来自 2026-11-17：一个周限额加两个五小时限额，在一天内把几个真任务打成 `blocked` 并花掉了它们的重试额度。
+**模型降级链** —— 配了 `modelChain` / `modelFallbacks` / `reviewerModelFallbacks` 时，被 provider 拒绝的那一次不会去花重试额度，而是把这一回合交给链上的下一个模型。换模型同时是**会话边界**：上一个后端创建的会话不会交给下一个模型续，被拒的回合也不记进 `sessions`（它没干活）。复核被拒时在复核阶段内部换模型重试，不会把任务退回 worker 重跑——非幂等任务（写表、移文件）不能为了重试一次复核而被执行两遍。
 
-**模型降级链** —— 配了 `modelChain` / `modelFallbacks` / `reviewerModelFallbacks` 时，被 provider 拒绝的那一次不会去花重试额度，而是把这一回合交给链上的下一个模型：换个账号就能继续，不必等到 `retryLimit` 用光才 blocked。换模型同时是**会话边界**：上一个后端创建的会话不会交给下一个模型续，被拒的回合也不记进 `sessions`（它没干活）。复核被拒时在复核阶段内部换模型重试，不会把任务退回 worker 重跑——非幂等任务（写表、移文件）不能为了重试一次复核而被执行两遍。
+一轮之内当前选中的模型记在 `tasks/<id>/models.json`；每一轮从链首开始——一轮就是把链走一遍，窗口内刚拒绝过的模型由共享冷却表挡住，不会再撞。`taskctl retry` 会把它和旧证据一起归档。
 
-当前选中的模型记在 `tasks/<id>/models.json`，所以重试时不会又先撞那个已经打满的模型；`taskctl retry` 会把它和旧证据一起归档，回到链首（配额恢复后手动重开就从主模型重来）。链走完才算失败，链的长度由配置决定，因此仍然是有限的。
-
-`models.json` 是提示性状态不是证据：**读**不到、读坏了、或者记的位置属于另一个模型（比如主模型被改过），一律按"从链首开始"，绝不因为一个缓存文件把已结算的回合改成不确定；**写**不进去则不算换成了，按普通重试计失败——位置本身是"下次别再撞同一堵墙"的唯一凭据，没记下来就不能假装已经换过。
+`models.json` 是提示性状态不是证据：**读**不到、读坏了、或者记的位置属于另一个模型（比如主模型被改过），一律按"从链首开始"；**写**不进去则不算换成了——本轮到此结束（推迟），并记一条 `model-fallback-failed` 日志。显式 `chainCycles` 在一轮之内的重探仍按原语义执行。
 
 看板级 `.taskctl/model-cooldowns.json` 还会跨 Task、跨 run 记录模型拒绝与下一可探测时间。冷却期间不再发起已知拒绝，换到不同健康模型时不做无意义退避；到期才重探，成功清除。手工 retry 不清这张表，显式 `chainCycles` 在本任务内的重探仍按原语义执行。
 
@@ -544,7 +591,7 @@ Phase 2 的有界真实验证（两任务批次共用一个 session、逐任务 
 - 示例使用相对路径；机器专属可执行文件路径仅保存在本地，不提交到 Git。
 - `.env`、密钥文件、私人记忆和实际任务运行数据默认忽略；`tasks/example.md` 是公开示例，不含真实任务记录。
 - `attempt.json`、`acceptance.json`、交接笔记和模型输出可能含任务内容、运行路径或敏感数据；提交附件或共享日志前另行检查。`.gitignore` 不会清除已经提交的历史。
-- 2026-11-24 做过有界 Live 验证（`scripts/smoke.ps1 -Live` 与 `scripts/live-phase2.ps1 -Live`）：真实后端上的领取、验收、复核、跨任务 session 复用、usage、watch 发现与 `stop`/`--resume` 均已跑通。真实后端的取消与中断恢复仍未验证（见 [ADR-0007](docs/adr/0007-fenced-execution-and-evidence.md)），其余结论仍以离线测试为据。
+- 2026-11-24 做过有界 Live 验证（`scripts/smoke.ps1 -Live` 与 `scripts/live-phase2.ps1 -Live`）：真实后端上的领取、验收、复核、跨任务 session 复用、usage、watch 发现与 `stop`/`--resume` 均已跑通。真实后端的取消与中断恢复仍未验证（见 [ADR-0007](docs/adr/0007-fenced-execution-and-evidence.md)），其余结论仍以离线测试为据。2026-11-26 在 opencode 2.4.2 上用编码套餐的模型验证了模型拒绝这条线（真实拒绝、整体故障停止与退出码 3、改好配置后不靠 `retry` 恢复、被拒的复核自己恢复）；同一天 `scripts/smoke.ps1 -Live` 因后端默认模型不可用而失败（脚本不指定模型），`scripts/live-phase2.ps1 -Live` 还没有在 2.4.2 上重跑。
 
 ## 设计文档
 

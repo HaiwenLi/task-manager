@@ -93,7 +93,7 @@ describe("watch heartbeat", () => {
 
     expect(errors.filter((message) => /heartbeat/.test(message))).toHaveLength(1);
     await stop.request();
-    await expect(queue).resolves.toBeUndefined();
+    await expect(queue).resolves.toEqual({ reason: "stop" });
     expect((await store.get("a")).status).toBe("done");
   });
 

@@ -33,7 +33,10 @@ import { resolveArtifacts } from "./artifacts.js";
 import { runSelfCheck } from "./self-check.js";
 import { runBatch } from "./batch.js";
 import { judgeRefs, policyOf, renderVerdicts, reviewerModels, workerModels, type ModelVerdict } from "./budget.js";
-import { stopRequestPath, watchQueue, type WatchOptions } from "./watch.js";
+import { directModel } from "./models.js";
+import { modelRoundsOf, modelWaitHold, newRunContext, readModelWait } from "./model-wait.js";
+import { outageReport, renderOutageReport, statusLineFromNote, stuckLines } from "./stuck.js";
+import { stopRequestPath, watchQueue, type WatchEnd, type WatchOptions } from "./watch.js";
 import { createMempalaceBackend, runRecall, type MemoryBackend, type RecallInput, type RecallRecord } from "./memory.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
@@ -151,6 +154,9 @@ function createWorkerDeps({
 /** Usage problem (unknown command/flag, missing value): exit code 2. */
 class UsageError extends Error {}
 
+/** The run stopped because every model refused (design §7): exit code 3, whatever else happened in it. */
+export const EXIT_OUTAGE = 3;
+
 const USAGE = [
   "usage:",
   "  taskctl add \"<意图>\" [--type code|office|research|design] [--simple] [--quick] [--verify human|mechanical|render] [--execution continuous|iterative] [--target <a.html,b.html>] [--id <id>] [--config taskctl.json]",
@@ -165,7 +171,7 @@ const USAGE = [
   "  taskctl done --task <id> [--tasks-dir <dir>]",
   "  taskctl check --task <id> [--tasks-dir <dir>]",
   "  taskctl note --task <id> --status <s> --done <d> --found <f> --next <n> [--files <a,b>] [--tasks-dir <dir>]",
-  "  taskctl status [--tasks-dir <dir>]",
+  "  taskctl status [--stuck] [--tasks-dir <dir>]",
   "  taskctl board [--all] [--json] [--tasks-dir <dir>]",
   "  taskctl report --task <id> [--tasks-dir <dir>]",
   "  taskctl accept --task <id> [--note \"…\"] [--tasks-dir <dir>]",
@@ -196,10 +202,15 @@ async function tasksDirFor(flags: Map<string, string>): Promise<string> {
   return resolveConfig(await readConfig(flags.get("config") ?? "taskctl.json"), "taskctl.json").tasksDir;
 }
 
-/** Resolve the config file for commands that need settings beyond `tasksDir`. */
+/**
+ * Resolve the config file for commands that need settings beyond `tasksDir`,
+ * keeping the path it was read from (`configPath`): the artifact digest leaves
+ * that file out when it lies in the work directory (`digestExclusions`,
+ * src/worker.ts).
+ */
 async function configFor(flags: Map<string, string>): Promise<ResolvedConfig> {
   const path = flags.get("config") ?? "taskctl.json";
-  return resolveConfig(await readConfig(path), path);
+  return { ...resolveConfig(await readConfig(path), path), configPath: path };
 }
 
 /**
@@ -242,7 +253,8 @@ async function recordHumanFeedback(
  * Parse argv and run one subcommand. Hand-rolled `--flag value` parsing —
  * no CLI dependency (binding constraint). Values pass through untouched, so
  * newlines, quotes and Chinese land in note files verbatim (Review Focus 5).
- * Returns the process exit code: 0 ok, 1 runtime error, 2 usage error.
+ * Returns the process exit code: 0 ok, 1 runtime error, 2 usage error, 3 a stop
+ * for an outage (`run`, `watch`, `EXIT_OUTAGE`).
  */
 export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number> {
   const log = deps.log ?? ((line: string) => console.log(line));
@@ -312,7 +324,7 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
       ]);
       return noteCommand(flags, log);
     case "status":
-      checkFlags(command, flags, ["tasks-dir", "config"], []);
+      checkFlags(command, flags, ["tasks-dir", "config", "stuck"], []);
       return statusCommand(flags, log);
     case "board":
       checkFlags(command, flags, ["tasks-dir", "config", "all", "json"], []);
@@ -360,8 +372,10 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
 
 /** `taskctl run` — load config, assemble adapter + store, drain the queue. */
 async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
-  const configPath = flags.get("config") ?? "taskctl.json";
-  const cfg = resolveConfig(await readConfig(configPath), configPath);
+  // One run context for the whole command: the attempts and the controller's
+  // decision read the same evidence, so a deferral this process wrote is one
+  // this process decides (a new run, watch or retry process is a new run).
+  const cfg = { ...(await configFor(flags)), run: newRunContext() };
   const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
   const store = deps.store ?? new TaskStore(cfg.tasksDir);
   // Controller log: with --log every event line is teed to one operator-chosen
@@ -389,7 +403,7 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
     }
   })();
   if (batch !== undefined && "stoppedAt" in result && result.stoppedAt !== undefined) {
-    log(`[batch] stopped at ${result.stoppedAt} (${result.outcome}); unclaimed: ${result.pending.join(", ") || "none"}`);
+    log(`[batch] stopped at ${result.stoppedAt} (${result.outcome})${result.deferredUntil === undefined ? "" : `; deferred until ${result.deferredUntil}, run again then`}; unclaimed: ${result.pending.join(", ") || "none"}`);
   } else if (result.pending.length > 0) {
     // Work left in `open` with no explanation reads as "nothing to do". It is not.
     log(
@@ -397,14 +411,20 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
       + `${result.pending.join(", ")}. Run taskctl run again to continue.`,
     );
   }
+  // The report a stop for an outage owes the operator (design §7), printed
+  // beside whatever else this run has to say.
+  const outageTaskId = batch === undefined
+    ? ("outage" in result ? result.outage?.taskId : undefined)
+    : "stoppedAt" in result && result.stoppedAt !== undefined && result.outcome === "outage" ? result.stoppedAt : undefined;
+  if (outageTaskId !== undefined) {
+    for (const line of renderOutageReport(await outageReport(cfg, await store.list(), outageTaskId))) log(line);
+  }
   // Each is said when its own count is above zero, the controller errors
   // first: a run with both must not let the earlier return hide the later line.
-  let failed = false;
   if (controllerErrors > 0) {
     // A task blocked by a controller bug is not an ordinary outcome. The board
     // was still drained, but the run must not read as clean to a script.
     log(`[scheduler] ${controllerErrors} task(s) blocked by a controller error; see the controller-error line(s) above`);
-    failed = true;
   }
   // What was refused is read off the result, never off the events: those are
   // reported once per process per task, and an exit code must not depend on
@@ -420,20 +440,27 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
     // The guard's verdicts are in the `refused` line(s) above. The board was
     // still drained, but a task that did not run must not read as clean to a script.
     log(`[scheduler] ${refused.length} task(s) refused by the budget guard; no model session was started for them`);
-    failed = true;
   }
-  return failed ? 1 : 0;
+  // The code names why the run stopped (design §7): an outage is 3 whatever
+  // else happened — refused tasks and controller errors are printed beside the report.
+  if (outageTaskId !== undefined) return EXIT_OUTAGE;
+  if (controllerErrors > 0) return 1;
+  return refused.length > 0 ? 1 : 0;
 }
 
 /** `taskctl watch` — own and drain one board until its stop request appears. */
 async function watchCommand(flags: Map<string, string>, deps: CliDeps, log: (line: string) => void): Promise<number> {
-  const cfg = await configFor(flags);
+  // One run context for the whole command, as `run` builds one: the attempts
+  // and the controller's decision read the same evidence, so a deferral this
+  // process wrote is one this process decides.
+  const cfg = { ...(await configFor(flags)), run: newRunContext() };
   const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
   const store = deps.store ?? new TaskStore(cfg.tasksDir);
   const telemetry = await createControllerTelemetry(cfg);
   telemetry.refreshBoard();
+  let end: WatchEnd;
   try {
-    await watchQueue(cfg, createWorkerDeps({ deps, adapter, store, telemetry, log }),
+    end = await watchQueue(cfg, createWorkerDeps({ deps, adapter, store, telemetry, log }),
       {
         ...deps.watch,
         resume: flags.has("resume"),
@@ -441,6 +468,13 @@ async function watchCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
       });
   } finally {
     await telemetry.flush();
+  }
+  // The report a stop for an outage owes the operator (design §7), printed as
+  // `run` prints it. The queue wrote no stop file, so the next watch needs no
+  // `--resume`; a guard refusal changes nothing here and still returns 0.
+  if (end.reason === "outage") {
+    for (const line of renderOutageReport(await outageReport(cfg, await store.list(), end.taskId))) log(line);
+    return EXIT_OUTAGE;
   }
   return 0;
 }
@@ -657,14 +691,16 @@ async function refreshBoardFile(tasksDir: string): Promise<void> {  const tasks 
 }
 
 /**
- * The budget guard for a session that runs on one model, the configured one
- * or else the backend's default: the clarify session of `add`, the planner
- * session of `split`. The verdicts that were not allowed; empty when the
- * session may start. An adapter that cannot list models is not guarded.
+ * The budget guard for a session that runs on one model — `model`, else the
+ * head of `modelChain`, else the backend's default: the clarify session of
+ * `add`, the planner session of `split`. The verdicts that were not allowed;
+ * empty when the session may start. An adapter that cannot list models is not
+ * guarded.
  */
 async function sessionRefusals(cfg: ResolvedConfig, adapter: AgentAdapter): Promise<ModelVerdict[]> {
   // Asked in `cfg.workdir`: the directory the session starts in, which the backend answers by.
-  const verdicts = await judgeRefs(cfg.model ? [cfg.model] : [], policyOf(cfg), adapter, undefined, cfg.workdir);
+  const judged = directModel(cfg);
+  const verdicts = await judgeRefs(judged === undefined ? [] : [judged], policyOf(cfg), adapter, undefined, cfg.workdir);
   return verdicts.filter((verdict) => !verdict.allowed);
 }
 
@@ -770,7 +806,7 @@ async function addCommand(
   const result = await adapter.prompt({
     text: prompt,
     cwd: cfg.workdir,
-    model: cfg.model,
+    model: directModel(cfg),
     effort: cfg.effort,
     title: task.title,
   });
@@ -808,7 +844,7 @@ async function addCommand(
   await writeRuntime(tasksDir, id, "classification.json", {
     lane, proposedLane: assessment.laneEscalated ? null : assessment.lane, laneEscalated: assessment.laneEscalated,
     sufficiency: assessment.sufficiency,
-    reason: assessment.reason, model: cfg.model ?? "(backend-default)", type, at: new Date().toISOString(),
+    reason: assessment.reason, model: directModel(cfg) ?? "(backend-default)", type, at: new Date().toISOString(),
   });
   if (assessment.sufficiency === "needs-information") {
     // "Insufficient" with nothing to ask is a model that broke the format, not
@@ -1026,7 +1062,7 @@ async function splitCommand(
     const result = await adapter.prompt({
       text: buildSplitPrompt({ parent, spec }),
       cwd: cfg.workdir,
-      model: cfg.model,
+      model: directModel(cfg),
       effort: cfg.effort,
       title: `split: ${parent.title}`,
     });
@@ -1037,7 +1073,7 @@ async function splitCommand(
     }
     try {
       plan = parseSplitPlan(result.text, {
-        parent, spec, board: await store.list(), model: cfg.model ?? "(backend-default)", now: new Date(),
+        parent, spec, board: await store.list(), model: directModel(cfg) ?? "(backend-default)", now: new Date(),
       });
     } catch (err) {
       if (!(err instanceof SplitError)) throw err;
@@ -1137,10 +1173,19 @@ async function noteCommand(flags: Map<string, string>, log: (line: string) => vo
   return 0;
 }
 
-/** `taskctl status` — one table row per task, then the files it refused to register. */
+/** `taskctl status` — one table row per task, then the files it refused to register; `--stuck` lists only what is held or waiting. */
 async function statusCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
   const tasksDir = await tasksDirFor(flags);
   const store = new TaskStore(tasksDir);
+  if (flags.has("stuck")) {
+    // Files only: the config for `modelRounds`/`lockTtlMs`, the board, and what
+    // the attempts wrote. No adapter is built, so the guard's backend catalogue
+    // is never asked — the list prints what was judged when each record was
+    // written, and today's judgement is `taskctl models`' business.
+    const cfg = await configFor(flags);
+    for (const line of await stuckLines(tasksDir, await store.list(), cfg)) log(line);
+    return 0;
+  }
   const { tasks, ignored } = await store.scan();
   const rows: string[][] = [["id", "status", "retries", "sessions", "note"]];
   for (const task of tasks) {
@@ -1169,7 +1214,7 @@ async function statusCommand(flags: Map<string, string>, log: (line: string) => 
 // `resume` was missing here until 2026-11-24: the usage text and the stop
 // refusal both send the operator to `watch --resume`, but the parser read it
 // as a value flag and exited 2, so a stopped queue could not be restarted.
-const BOOLEAN_FLAGS = new Set(["simple", "quick", "all", "apply", "json", "review-only", "resume"]);
+const BOOLEAN_FLAGS = new Set(["simple", "quick", "all", "apply", "json", "review-only", "resume", "stuck"]);
 
 /** `taskctl board` — rewrite `.taskctl/board.md` and print the same content as a table. */
 async function boardCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
@@ -1570,6 +1615,13 @@ async function retryCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
     const store = deps.store ?? new TaskStore(tasksDir);
     const task = await store.get(id);
     const adapter = deps.adapter ?? new OpenCodeAdapter({ bin: cfg.opencodeBin });
+    // Asked for inside a model window, the recovery is not run: the claim path
+    // would hold it, and a `skipped` would say nothing. It says until when.
+    const wait = modelWaitHold(await readModelWait(tasksDir, id), newRunContext().id, modelRoundsOf(cfg), new Date());
+    if (wait?.kind === "window") {
+      log(`review-only recovery is held by a model window until ${wait.nextAt}; ask again then`);
+      return 1;
+    }
     // Every other entry point resolves the task's own workdir before reserving
     // and hashing it. Recovery must too, or a task that declares a workdir is
     // re-digested against another tree and refused as changed for good.
@@ -1712,6 +1764,7 @@ export const CONFIG_KEYS = new Set([
   "maxTurnsPerSession",
   "chainCycles",
   "modelCooldownMs",
+  "modelRounds",
   "maxReviewRounds",
   "reviewerModel",
   "reviewerEffort",
@@ -1762,6 +1815,7 @@ export function resolveConfig(raw: Record<string, unknown>, path: string): Resol
     maxTurnsPerSession: integer(raw, "maxTurnsPerSession", path),
     chainCycles: nonNegativeInteger(raw, "chainCycles", path),
     modelCooldownMs: number(raw, "modelCooldownMs", path),
+    modelRounds: integer(raw, "modelRounds", path),
     maxReviewRounds: integer(raw, "maxReviewRounds", path),
     reviewerModel: string(raw, "reviewerModel", path),
     reviewerEffort: string(raw, "reviewerEffort", path),
@@ -1967,29 +2021,6 @@ function nonNegativeNumber(raw: Record<string, unknown>, key: string, path: stri
     throw new Error(`config ${path}: field "${key}" must be a non-negative finite number`);
   }
   return value;
-}
-
-/**
- * The `## Status` section's first non-empty line — the "一句话状态" a
- * `taskctl note` leaves behind. Multiline statuses are represented by their
- * first line so every table row stays a single line.
- */
-function statusLineFromNote(markdown: string): string {
-  const lines = markdown.split(/\r?\n/);
-  const heading = lines.indexOf("## Status");
-  if (heading === -1) {
-    return "-";
-  }
-  for (let i = heading + 1; i < lines.length; i++) {
-    const line = lines[i]!;
-    if (line.startsWith("## ")) {
-      break;
-    }
-    if (line.trim().length > 0) {
-      return line.trim();
-    }
-  }
-  return "-";
 }
 
 /** Pad every column to the widest cell; the last column is trim-ended. */

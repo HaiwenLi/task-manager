@@ -163,9 +163,14 @@ export function workerModels(cfg: WorkerConfig, task: Task): string[] {
   return unique(taskChain(cfg, task));
 }
 
-/** The models the reviewer may run on: its own chain (`reviewerChain`), never the task's or the worker's. */
-export function reviewerModels(cfg: WorkerConfig): string[] {
-  return unique(reviewerChain(cfg));
+/**
+ * The models the reviewer may run on: `reviewerChain(cfg, task)` — its own
+ * chain when one is configured, else the worker's chain, the task's own model
+ * included. The task is optional so `taskctl models` keeps judging the
+ * configuration alone: a task's own model is listed there on its own.
+ */
+export function reviewerModels(cfg: WorkerConfig, task: Pick<Task, "model"> = { model: undefined }): string[] {
+  return unique(reviewerChain(cfg, task));
 }
 
 /**

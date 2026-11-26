@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CONFIG_KEYS, resolveConfig } from "../src/cli.js";
+import { CONFIG_KEYS, resolveConfig, runCli } from "../src/cli.js";
 
 describe("resolveConfig", () => {
   it("resolves only fields it also accepts (the allowlist and the parser never drift apart)", () => {
@@ -15,6 +17,29 @@ describe("resolveConfig", () => {
     expect(resolveConfig({ modelCooldownMs: 900_000 }, "taskctl.json").modelCooldownMs).toBe(900_000);
     expect(resolveConfig({}, "taskctl.json").modelCooldownMs).toBeUndefined();
     expect(() => resolveConfig({ modelCooldownMs: 0 }, "taskctl.json")).toThrow(/positive/);
+  });
+
+  it("accepts a round budget as a positive integer and leaves it undefined when absent", () => {
+    expect(resolveConfig({ modelRounds: 2 }, "taskctl.json").modelRounds).toBe(2);
+    expect(resolveConfig({}, "taskctl.json").modelRounds).toBeUndefined();
+    expect(() => resolveConfig({ modelRounds: 0 }, "taskctl.json")).toThrow(/positive/);
+    expect(() => resolveConfig({ modelRounds: 1.5 }, "taskctl.json")).toThrow(/integer/);
+    expect(() => resolveConfig({ modelRounds: "2" }, "taskctl.json")).toThrow(/positive/);
+  });
+
+  it("every command still accepts a config that carries the new key", async () => {
+    // A key that is parsed but missing from the allowlist makes every command
+    // refuse the config that carries it: `taskctl retry --config` dead on arrival.
+    const dir = await mkdtemp(join(tmpdir(), "taskctl-config-keys-"));
+    const path = join(dir, "taskctl.json");
+    await writeFile(path, JSON.stringify({ tasksDir: dir, modelRounds: 3, modelCooldownMs: 30_000 }), "utf8");
+    const errors: string[] = [];
+
+    const code = await runCli(["retry", "--task", "nope", "--config", path], { log: () => {}, err: (line) => errors.push(line) });
+
+    await rm(dir, { recursive: true, force: true });
+    expect(code).toBe(1); // the task does not exist; the config was accepted
+    expect(errors.join("\n")).not.toContain("unknown field");
   });
 
   it("accepts a wrap budget for the model chain, zero included", () => {
