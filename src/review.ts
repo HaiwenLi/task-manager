@@ -281,6 +281,9 @@ export function startReview(deps: ReviewDeps, evidence: ReviewEvidence): Executi
       result: inner.result.then(finish),
       inspect: inner.inspect,
       cancel: inner.cancel,
+      // A cooperative inner execution is raced against no stop: dropping the
+      // flag would let `controlled` cancel a turn that cannot prove it stopped.
+      ...(inner.interruptible === undefined ? {} : { interruptible: inner.interruptible }),
     };
   }
   let state: "running" | "exited" = "running";

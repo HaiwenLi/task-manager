@@ -147,6 +147,24 @@ it("a stop during a worker turn ends the attempt as stopped by the operator: ope
   expect(agent.sessionIds).toHaveLength(1);
 }, 8_000);
 
+it("a stop's journal line that cannot be written still settles the attempt as stopped", async () => {
+  await seedTaskFile(tasks, mechanical("a"));
+  const stop = manualStopNow();
+  const agent = scriptedTurns([{ hang: "confirm" }], { beforeHang: async () => {
+    // The journal is a record, not state: a directory named `journal.md`
+    // makes the stop's own line unwritable after the claim that wrote it.
+    await rm(join(tasks, "a", "journal.md"));
+    await mkdir(join(tasks, "a", "journal.md"));
+  } });
+  const running = runTask(cfg, deps(agent, stop), await store.get("a"), "w1");
+  await agent.hanging;
+  stop.trigger("file");
+  expect(await settles(running)).toBe("stopped");
+  expect(await store.get("a")).toMatchObject({ status: "open", retries: 0 });
+  expect(await readAttempt(tasks, "a")).toMatchObject({ phase: "settled", operation: "agent turn", reason: "stopped by operator" });
+  expect(events).toContainEqual(expect.objectContaining({ type: "stopped", taskId: "a" }));
+}, 8_000);
+
 it("the session a cut turn ran on is marked dirty, so the rerun starts a fresh one", async () => {
   await seedTaskFile(tasks, mechanical("a"));
   const stop = manualStopNow();
@@ -213,6 +231,26 @@ it("nothing is claimed once a stop was already requested", async () => {
   expect(await store.get("a")).toMatchObject({ status: "open" });
   expect(await readAttempt(tasks, "a")).toBeNull();
   expect(await lockHeld("a")).toBe(false);
+});
+
+it("runTask says why an attempt that never started was skipped", async () => {
+  await seedTaskFile(tasks, mechanical("a"));
+  // A stop already requested: nothing is claimed.
+  const caused: Array<"stop" | "claim"> = [];
+  const stopped = manualStopNow();
+  stopped.trigger("file");
+  const agent = scriptedTurns(["done"]);
+  expect(await runTask(cfg, deps(agent, stopped), await store.get("a"), "w1", { onSkipped: (cause) => caused.push(cause) })).toBe("skipped");
+  expect(caused).toEqual(["stop"]);
+  expect(await readAttempt(tasks, "a")).toBeNull();
+  expect(await lockHeld("a")).toBe(false);
+  // A live owner that is not this attempt holds the lock: the claim fails.
+  const claimed: Array<"stop" | "claim"> = [];
+  await mkdir(join(tasks, "a"), { recursive: true });
+  await writeFile(join(tasks, "a", "lock.json"), JSON.stringify({ worker: "someone-else", heartbeat: Date.now() }), "utf8");
+  expect(await runTask(cfg, deps(agent, manualStopNow()), await store.get("a"), "w2", { onSkipped: (cause) => claimed.push(cause) })).toBe("skipped");
+  expect(claimed).toEqual(["claim"]);
+  expect(agent.sessionIds).toEqual([]);
 });
 
 it("a pending stop asks the guard nothing, and a refusal is not a stop", async () => {
@@ -662,4 +700,23 @@ it("a stop during the memory recall waits for the recall, dispatches no turn and
   expect(agent.sessionIds).toEqual([]);
   expect(await store.get("a")).toMatchObject({ status: "open", retries: 0 });
   await expect(readFile(join(tasks, "a", "acceptance.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+}, 8_000);
+
+it("a recall that failed does not announce itself at a later stop", async () => {
+  await seedTaskFile(tasks, mechanical("a"));
+  const stop = manualStopNow();
+  // `runRecall` never throws, so the way out that leaves the flag set is the
+  // spec read just before it: a directory where the spec file would be. The
+  // context switches keep `readContextSections` from reading it first, so the
+  // failing read is the recall's own, with the flag already up.
+  await mkdir(join(tasks, "a"), { recursive: true });
+  await mkdir(join(tasks, "a", "spec.md"));
+  const memory: MemoryBackend = { name: "fake", searchAll: async () => { throw new Error("memory down"); } };
+  const agent = scriptedTurns(["done"]);
+  expect(await runTask({ ...cfg, memory: memoryOn(), workerContext: { spec: false, preferences: false } }, deps(agent, stop, { memory }), await store.get("a"), "w1")).toBe("done");
+  // The attempt is over; a stop on the same controller's source is the next
+  // attempt's news, never this task's recall still running.
+  stop.trigger("file");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(events.filter((event) => event.type === "stop-requested" && event.detail?.startsWith("memory recall in progress"))).toEqual([]);
 }, 8_000);

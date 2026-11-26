@@ -207,6 +207,14 @@ export type RunTaskOptions = {
     preamble: string;
     resumeFrom?: WorkerSessionFact;
   };
+  /**
+   * Why `runTask` answered `skipped` before anything was claimed. `"stop"`: an
+   * interrupt was already pending at one of the two stop checks, so nothing
+   * was claimed. `"claim"`: the claim was refused because another live owner
+   * holds the task. The review-only recovery's exit code depends on which one
+   * it was — a lost claim is reported beside the stop's, not answered as it.
+   */
+  onSkipped?: (cause: "stop" | "claim") => void;
 };
 type ReviewPendingRecord = {
   definitionDigest: string;
@@ -424,7 +432,7 @@ export async function runTask(
   const owner = `${workerId}:${randomUUID()}`;
   // Once an interrupt is pending nothing is started for the task, the guard's
   // read of the catalogue included (D11).
-  if (deps.stop !== undefined && (deps.stop.isRequested() || await deps.stop.check())) return "skipped";
+  if (deps.stop !== undefined && (deps.stop.isRequested() || await deps.stop.check())) { options.onSkipped?.("stop"); return "skipped"; }
   // The budget guard, before anything is claimed: every model this attempt
   // may run on is judged first, and a refusal here leaves the task `open`,
   // with nothing written into its directory and no session started. A
@@ -441,8 +449,8 @@ export async function runTask(
   }
   // An interrupt that arrived while the guard judged is seen here, and nothing
   // is claimed.
-  if (deps.stop !== undefined && (deps.stop.isRequested() || await deps.stop.check())) return "skipped";
-  if (!await claim(cfg.tasksDir, task.id, owner, cfg.lockTtlMs)) return "skipped";
+  if (deps.stop !== undefined && (deps.stop.isRequested() || await deps.stop.check())) { options.onSkipped?.("stop"); return "skipped"; }
+  if (!await claim(cfg.tasksDir, task.id, owner, cfg.lockTtlMs)) { options.onSkipped?.("claim"); return "skipped"; }
   let notifyLost!: () => void;
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
   const now = new Date().toISOString();
@@ -664,10 +672,13 @@ async function stopAttempt(r: Run, label: string, inFlight: boolean): Promise<"s
     }
     await r.deps.store.clearDoneMarker(r.task.id);
     await r.deps.store.setStatus(r.task.id, back);
+    // The journal is a record, not state: a line that cannot be written is
+    // lost, and the attempt still answers "stopped" — a failed write must not
+    // turn the stop into a rejected `runTask` after the status was set.
     await appendJournal(r.cfg.tasksDir, r.task.id, {
       stage: "worker", event: "stopped",
       detail: `operator stop ${inFlight ? "during" : "after"} ${label}; ${inFlight ? "cancellation confirmed; " : "nothing was interrupted; "}task returned to ${back}; retries untouched`,
-    });
+    }).catch(() => {});
   });
   emit(r, "stopped", `${label}; ${inFlight ? "cancellation confirmed" : "nothing was interrupted"}; task returned to ${back}; retries untouched`);
   return "stopped";
@@ -1284,28 +1295,33 @@ async function readSections(r: Run): Promise<WorkerContext> {
       void r.deps.stop?.observed.then(() => {
         if (recalling) emit(r, "stop-requested", "memory recall in progress; it ends before anything else is asked of the worker (bounded by memory.timeoutMs)");
       });
-      const memory = await runRecall(
-        r.cfg.memory,
-        // The server is kept out of the console's Ctrl-C only for an attempt
-        // that can be stopped (D6); `taskctl recall` keeps today's spawn.
-        r.deps.memory ?? createMempalaceBackend(r.cfg.memory, callTools, r.deps.stop !== undefined),
-        {
-          title: r.task.title, description: r.task.description,
-          // Read again, and whole: the query wants the spec's goal, which the
-          // clipped section may have lost with the middle.
-          spec: (await readSpec(r.cfg.tasksDir, r.task.id)) ?? null,
-          at: new Date().toISOString(),
-        },
-        {
-          // Through the ownership guard, like every other write of the attempt.
-          write: (record) => owned(r, () => writeRuntime(r.cfg.tasksDir, r.task.id, "recall.json", record)),
-          journal: (event, detail) => owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, { stage: "worker", event, detail })),
-        },
-      );
-      // The wait is over: a stop observed from here on is the loop's own news.
-      recalling = false;
-      // `null` is every other outcome: nothing kept, or the backend could not answer.
-      if (memory !== null) sections.memory = memory;
+      try {
+        const memory = await runRecall(
+          r.cfg.memory,
+          // The server is kept out of the console's Ctrl-C only for an attempt
+          // that can be stopped (D6); `taskctl recall` keeps today's spawn.
+          r.deps.memory ?? createMempalaceBackend(r.cfg.memory, callTools, r.deps.stop !== undefined),
+          {
+            title: r.task.title, description: r.task.description,
+            // Read again, and whole: the query wants the spec's goal, which the
+            // clipped section may have lost with the middle.
+            spec: (await readSpec(r.cfg.tasksDir, r.task.id)) ?? null,
+            at: new Date().toISOString(),
+          },
+          {
+            // Through the ownership guard, like every other write of the attempt.
+            write: (record) => owned(r, () => writeRuntime(r.cfg.tasksDir, r.task.id, "recall.json", record)),
+            journal: (event, detail) => owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, { stage: "worker", event, detail })),
+          },
+        );
+        // `null` is every other outcome: nothing kept, or the backend could not answer.
+        if (memory !== null) sections.memory = memory;
+      } finally {
+        // The flag belongs to this attempt alone: however the recall ended —
+        // the spec read that feeds it throwing included — a later stop on the
+        // controller's shared source must not claim the recall is still running.
+        recalling = false;
+      }
     }
   } catch (err) {
     if (err instanceof OwnershipLostError) throw err;

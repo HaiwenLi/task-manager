@@ -36,7 +36,7 @@ import { judgeRefs, policyOf, renderVerdicts, reviewerModels, workerModels, type
 import { directModel } from "./models.js";
 import { modelRoundsOf, modelWaitHold, newRunContext, readModelWait } from "./model-wait.js";
 import { outageReport, renderOutageReport, statusLineFromNote, stuckLines } from "./stuck.js";
-import { createStopNow, processSignalSource, requestStop, stopRequestPath, type SignalSource, type StopNow, type StopSignal } from "./stop.js";
+import { createStopNow, processSignalSource, requestStop, type SignalSource, type StopNow, type StopSignal } from "./stop.js";
 import { watchQueue, type WatchEnd, type WatchOptions } from "./watch.js";
 import { createMempalaceBackend, runRecall, type MemoryBackend, type RecallInput, type RecallRecord } from "./memory.js";
 
@@ -1779,13 +1779,16 @@ async function retryCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
     // held by a window creates nothing, not even the stop source.
     const stop = await createControllerStop(resolved, deps, log, err);
     let outcome: Awaited<ReturnType<typeof runTask>>;
+    // Why a `skipped` came back with nothing claimed: a pending stop, or a
+    // claim another live owner holds. The two are not the same report.
+    let skippedFor: "stop" | "claim" | undefined;
     try {
       outcome = await runTask(resolved, createWorkerDeps({
         deps, adapter, store, telemetry, log, stop: stop.now,
         // The recovery counts an unconfirmed interruption exactly as `run` does.
         observe: (evt) => stop.observe(evt),
       }),
-        task, `review-only-${process.pid}-${id}`, { reviewOnly: true });
+        task, `review-only-${process.pid}-${id}`, { reviewOnly: true, onSkipped: (cause) => { skippedFor = cause; } });
     } finally {
       await stop.close();
       await telemetry.flush();
@@ -1794,13 +1797,26 @@ async function retryCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
       log(`review-only recovery stopped by the operator: ${id} is blocked again; the parked review is kept`);
       return stop.exitCode() ?? 0;
     }
-    if ((outcome === "skipped" || outcome === "blocked") && stop.now.isRequested()) {
-      // The stop is what the recovery has to report: `skipped` is a stop that
-      // landed before the claim, `blocked` an interrupted attempt that could
-      // not be confirmed. Either way its own code is the recovery's (D1), not
-      // today's refusal 1.
+    if (outcome === "skipped" && stop.now.isRequested()) {
+      // Only a stop that landed before the claim is the operator's own report.
+      // A claim lost to another owner, or an ownership generation that changed
+      // under the attempt, is the ordinary refusal — said beside the stop, and
+      // exiting 1, never answered with the stop's own code.
       stop.report("scheduler", log);
+      if (skippedFor !== "stop") {
+        log("review-only recovery refused or still unavailable: skipped");
+        return 1;
+      }
       return stop.exitCode() ?? 0;
+    }
+    if (outcome === "blocked" && stop.now.isRequested()) {
+      // `exitCode` answers 1 exactly for an interruption that could not be
+      // confirmed; any other block is a reason of the controller's own (say,
+      // no valid parked review) and is reported as the ordinary refusal.
+      const unconfirmed = stop.exitCode() === 1;
+      stop.report("scheduler", log);
+      if (!unconfirmed) log(`review-only recovery refused or still unavailable: ${outcome}`);
+      return 1;
     }
     log(outcome === "done" || outcome === "awaiting-human" || outcome === "open"
       ? `review-only recovery finished: ${outcome}`

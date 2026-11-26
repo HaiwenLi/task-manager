@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { buildReviewPrompt, parseVerdict, runReview } from "../src/review.js";
+import { buildReviewPrompt, parseVerdict, runReview, startReview } from "../src/review.js";
 import { parseTaskFile } from "../src/task-file.js";
 import type { AgentAdapter, PromptResult } from "../src/adapters/types.js";
+import type { Execution } from "../src/execution.js";
 import { buildTaskFile } from "./helpers/task-fixture.js";
 
 const criteria = ["C1 npm test 全绿", "C2 401 时文案正确"];
@@ -210,5 +211,28 @@ and a second line`, failure: "provider" })).refusalText).toBe("Error: 429 too ma
     expect(crashed.failure).toBeUndefined();
     expect(crashed).not.toHaveProperty("refusalText");
     expect(await review({ sessionId: "s", exitCode: 0, text: '{"verdict":"unclear"}' })).not.toHaveProperty("refusalText");
+  });
+});
+
+describe("the review execution's handle", () => {
+  const task = buildTaskFile({ id: "001-a", title: "登录改版", status: "review", criteria: ["C1 npm test 全绿"] });
+  const evidence = { task, spec: "", acceptanceMarkdown: "exit 0", handoff: null, journal: [], window: { startedAt: "2026-11-16T00:00:00.000Z", finishedAt: "2026-11-16T00:20:00.000Z" } };
+  const result: PromptResult = { sessionId: "s", exitCode: 0, text: '{"verdict":"pass","criteria":[{"id":"C1","pass":true,"evidence":"ok"}],"defects":[],"summary":"ok"}' };
+
+  it("startReview keeps the execution's interruptible flag", () => {
+    const execution: Execution<PromptResult> = {
+      result: Promise.resolve(result),
+      inspect: () => ({ state: "exited" }),
+      cancel: async () => false,
+      interruptible: false,
+    };
+    const adapter: AgentAdapter = {
+      prompt: async () => result, contextUsage: async () => 0, contextLimit: async () => 100,
+      start: () => execution,
+    };
+    // The inner handle's `interruptible: false` is what makes `controlled`
+    // treat the review as cooperative; dropping it would race a turn that
+    // cannot be proven stopped.
+    expect(startReview({ adapter, cwd: "." }, evidence).interruptible).toBe(false);
   });
 });

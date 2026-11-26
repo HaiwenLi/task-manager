@@ -28,6 +28,7 @@ import type { Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
 import { runTask, type WorkerConfig } from "../src/worker.js";
 import { runCli } from "../src/cli.js";
+import { writeRuntime } from "../src/runtime.js";
 import { buildTaskFile } from "./helpers/task-fixture.js";
 import { manualStopNow } from "./helpers/stop-fixture.js";
 import { markDoneTask, passAcceptance, seedTaskFile, workerConfigFixture } from "./helpers/watch-fixture.js";
@@ -122,6 +123,31 @@ it("an insulated gate is still cancelled as a tree", async () => {
   await expect(execution.cancel()).resolves.toBe(true);
   for (const pid of Object.values(tree!)) expect(() => process.kill(pid, 0)).toThrow();
 }, 15_000);
+
+it("retry --review-only constructs an insulated adapter: every child of it is in its own group", async () => {
+  const configPath = join(cwd, "taskctl.json");
+  // node stands in for opencode: it cannot answer `api model.list`, so the
+  // guard refuses before any turn — the adapter's catalogue read is the child
+  // this run starts.
+  await writeFile(configPath, JSON.stringify({ tasksDir: tasks, workdir: work, opencodeBin: process.execPath, retryLimit: 1 }), "utf8");
+  // A task parked the way a reviewer that timed out parks it, staged without a
+  // process: a settled attempt and a valid review-pending record.
+  await seedTaskFile(tasks, buildTaskFile({ id: "a", title: "a", status: "blocked", complexity: "simple", verify: "human", criteria: ["C1 ok"] }));
+  const now = new Date().toISOString();
+  await mkdir(join(tasks, "a"), { recursive: true });
+  await writeRuntime(tasks, "a", "attempt.json", { attemptId: "old", backend: "fixture", workspace: work, startedAt: now, updatedAt: now, phase: "settled", operation: "finished" });
+  await writeRuntime(tasks, "a", "review-pending.json", { definitionDigest: "d", artifactDigest: "d", createdAt: now, updatedAt: now, refusals: [] });
+  spawns.length = 0;
+  const lines: string[] = [];
+  expect(await runCli(["retry", "--task", "a", "--review-only", "--config", configPath], { log: (line) => lines.push(line), err: (line) => lines.push(line) })).toBe(1);
+  expect(lines.join("\n")).toContain("review-only recovery refused or still unavailable: refused");
+  const children = spawns.filter((spawn) => spawn.file === process.execPath);
+  expect(children.length).toBeGreaterThan(0);
+  for (const child of children) {
+    expect(child.options).toMatchObject(INSULATED);
+    if (process.platform === "win32") expect(child.options.detached).not.toBe(true);
+  }
+});
 
 it("the worker's gate is insulated: the controller cancels it itself", async () => {
   await seedTaskFile(tasks, mechanical("a", { acceptance: "echo worker-gate" }));

@@ -351,6 +351,58 @@ it("retry --review-only: an unconfirmed stop during the recovery exits 1 and say
   expect(await readFile(join(tasks, "a", "review-pending.json"), "utf8")).toBe(pending);
 }, 10_000);
 
+it("retry --review-only: an attempt that lost its ownership is not reported as the operator's stop", async () => {
+  await seedTaskFile(tasks, task("a", { verify: "human", criteria: ["C1 ok"] }));
+  expect(await runTask({ ...cfg, turnTimeoutMs: 300 }, { store, adapter: slowReviewer(), acceptance: passAcceptance }, await store.get("a"), "w1")).toBe("blocked");
+  const pending = await readFile(join(tasks, "a", "review-pending.json"), "utf8");
+  const agent = hangingWorker(1, { text: "独立复核者" });
+  const signals = manualSignals();
+  const lines: string[] = [];
+  const running = runCli(["retry", "--task", "a", "--review-only", "--config", configPath], {
+    adapter: agent, acceptance: passAcceptance, signals,
+    log: (line) => {
+      lines.push(line);
+      // The stop lands only after the worker has already decided the attempt
+      // was skipped: the recovery must not read that skip as the stop's own.
+      if (line.startsWith("[a] ownership-lost")) signals.fire("SIGINT");
+    },
+    err: (line) => lines.push(line),
+  });
+  await agent.started;
+  // The generation changed under the attempt: the lock belongs to a successor.
+  await writeFile(join(tasks, "a", "lock.json"), JSON.stringify({ worker: "successor", heartbeat: Date.now() }), "utf8");
+  expect(await running).toBe(1);
+  expect(lines.join("\n")).toContain("stopped by the operator");
+  expect(lines.join("\n")).toContain("review-only recovery refused or still unavailable: skipped");
+  // A lost generation moves nothing: the attempt had already set the task
+  // `review` for its reviewer turn, and the successor is the one to reconcile
+  // it — the same rule that leaves a lost worker attempt `running`.
+  expect((await store.get("a")).status).toBe("review");
+  expect(await readFile(join(tasks, "a", "review-pending.json"), "utf8")).toBe(pending);
+}, 10_000);
+
+it("retry --review-only: a task blocked for the controller's own reason is said so beside the stop's report", async () => {
+  await seedTaskFile(tasks, task("a", { verify: "human", criteria: ["C1 ok"] }));
+  expect(await runTask({ ...cfg, turnTimeoutMs: 300 }, { store, adapter: slowReviewer(), acceptance: passAcceptance }, await store.get("a"), "w1")).toBe("blocked");
+  // The park's record is gone: the recovery blocks on its own reason, not on
+  // an interruption that could not be confirmed.
+  await rm(join(tasks, "a", "review-pending.json"));
+  const signals = manualSignals();
+  const lines: string[] = [];
+  const running = runCli(["retry", "--task", "a", "--review-only", "--config", configPath], {
+    adapter: hangingWorker(1, { text: "独立复核者" }), acceptance: passAcceptance, signals,
+    log: (line) => {
+      lines.push(line);
+      if (line.startsWith("[a] blocked ")) signals.fire("SIGINT");
+    },
+    err: (line) => lines.push(line),
+  });
+  expect(await running).toBe(1);
+  expect(lines.join("\n")).toContain("stopped by the operator");
+  expect(lines.join("\n")).toContain("review-only recovery refused or still unavailable: blocked");
+  expect((await store.get("a")).status).toBe("blocked");
+}, 10_000);
+
 it("stop --now requires --tasks-dir, like stop", async () => {
   expect(await runCliQuiet(["stop", "--now"])).toBe(2);
 });
