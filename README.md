@@ -559,7 +559,7 @@ taskctl retry --task <id>       # 归档旧证据后重开；仅在 attempt 已 
 
 人工修改共享预留注册表之前，先停止所有使用该注册表的 taskctl 控制器；仅处理已核对身份的那条预留及其本地标记，不清空其他任务的记录。当前没有自动“强制恢复”命令。缺少验收造成的普通待审则补上验收并重开任务即可，不需要清理已正常释放的预留。
 
-**回合 / 验收超时** —— 单回合默认 30 分钟、验收 10 分钟。请求停止并确认停止后才允许计失败重试；无法确认则阻塞并保留工作目录预留。OpenCode CLI 被杀不代表其独立后端会话已停，因此 OpenCode 回合被中断按不确定处理，须人工核实。未做真实后端取消验证。
+**回合 / 验收超时** —— 单回合默认 30 分钟、验收 10 分钟。请求停止并确认停止后才允许计失败重试；无法确认则阻塞并保留工作目录预留。OpenCode CLI 被杀不代表其独立后端会话已停，因此 OpenCode 回合被中断按不确定处理，须人工核实。真实后端的取消已于 2026-11-27 在 opencode v2.4.2 上验证：由控制器发起的停止会让服务确认被切断的会话已经 idle，确认不了时才记 `uncertain`（`scripts/live-stop.ps1 -Live`，17 项 PASS）。
 
 **provider 拒绝（429 / 鉴权 / 5xx / 配额耗尽）** —— adapter 把它标成 `failure: "provider"`。这类失败说的是账号或模型，不是任务：不花 `retries`，不 `blocked`，立刻换链上的下一个模型；一整轮都被拒就把任务推迟到下一个窗口（`modelCooldownMs`，默认 60 秒）。连续 `modelRounds` 轮之后才由控制器做判断，规则与报告见「模型拒绝与轮次」。想立刻知道哪些任务在等：`taskctl status --stuck`。
 
@@ -612,7 +612,7 @@ Phase 2 的有界真实验证（两任务批次共用一个 session、逐任务 
 - 示例使用相对路径；机器专属可执行文件路径仅保存在本地，不提交到 Git。
 - `.env`、密钥文件、私人记忆和实际任务运行数据默认忽略；`tasks/example.md` 是公开示例，不含真实任务记录。
 - `attempt.json`、`acceptance.json`、交接笔记和模型输出可能含任务内容、运行路径或敏感数据；提交附件或共享日志前另行检查。`.gitignore` 不会清除已经提交的历史。
-- 2026-11-24 做过有界 Live 验证（`scripts/smoke.ps1 -Live` 与 `scripts/live-phase2.ps1 -Live`）：真实后端上的领取、验收、复核、跨任务 session 复用、usage、watch 发现与 `stop`/`--resume` 均已跑通。真实后端的取消与中断恢复仍未验证（见 [ADR-0007](docs/adr/0007-fenced-execution-and-evidence.md)），其余结论仍以离线测试为据。2026-11-26 在 opencode 2.4.2 上用编码套餐的模型验证了模型拒绝这条线（真实拒绝、整体故障停止与退出码 3、改好配置后不靠 `retry` 恢复、被拒的复核自己恢复）；同一天 `scripts/smoke.ps1 -Live` 因后端默认模型不可用而失败（脚本不指定模型），`scripts/live-phase2.ps1 -Live` 还没有在 2.4.2 上重跑。
+- 2026-11-24 做过有界 Live 验证（`scripts/smoke.ps1 -Live` 与 `scripts/live-phase2.ps1 -Live`）：真实后端上的领取、验收、复核、跨任务 session 复用、usage、watch 发现与 `stop`/`--resume` 均已跑通。真实后端的取消与中断恢复已于 2026-11-27 在 opencode v2.4.2 上验证（走 [ADR-0007](docs/adr/0007-fenced-execution-and-evidence.md) 的路径：控制器取消自己仍握着句柄的子进程树）：`scripts/live-stop.ps1 -Live` 在编码套餐的 flash 模型上 **LIVE STOP PASS（17 项）**（四个 worker 回合）——`stop --now` 打断回合和验收命令，服务确认被切断的会话已 idle，任务回到 `open`、`retries` 不动，`watch` 退出 0，重跑用新会话，没有进程残留。控制台里按 Ctrl-C 的实测同日单独记录。其余结论仍以离线测试为据。2026-11-26 在 opencode 2.4.2 上用编码套餐的模型验证了模型拒绝这条线（真实拒绝、整体故障停止与退出码 3、改好配置后不靠 `retry` 恢复、被拒的复核自己恢复）；同一天 `scripts/smoke.ps1 -Live` 因后端默认模型不可用而失败（脚本不指定模型），`scripts/live-phase2.ps1 -Live` 还没有在 2.4.2 上重跑。
 
 ## 设计文档
 
