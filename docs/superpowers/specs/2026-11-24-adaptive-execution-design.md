@@ -645,6 +645,8 @@ selection; watch does not require the user to select batches by hand.
 
 ### 17.3 Graceful stop
 
+> **2026-11-25 更新**：本节「It never converts stop into a process-tree kill」只对不带 `--now` 的 `stop` 成立。`taskctl stop --now` 以及 `run` / `watch` 上的 `SIGINT` / `SIGTERM` 会取消正在运行的回合与验收命令；确认后任务回到 `open`，确认不了则按 `uncertain` 对账。见 [model trouble and operator control](2026-11-25-model-trouble-and-operator-control-design.md) §9。
+
 `taskctl stop --tasks-dir <dir>` writes `.taskctl/stop.requested`. Watch stops claiming new tasks,
 finishes the current controlled operation or a safe handoff, settles/releases its records and exits.
 It never converts stop into a process-tree kill or an uncertain replay. Starting watch clears the stop

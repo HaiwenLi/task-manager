@@ -220,6 +220,7 @@ taskctl run                 并发执行 → 验收命令 → 独立复核 → d
 taskctl run --batch C,B,A   严格按给定顺序跑连续批次；每项仍独立领取、验收、留证
 taskctl watch --config taskctl.json [--resume]   常驻看板；新任务自动调度，合格任务自动成批；逐任务事件与 run 一样落 tasks/<id>/logs/run-*.log
 taskctl stop --tasks-dir tasks   请求优雅收尾；当前 attempt 结算后退出，不强杀 worker
+taskctl stop --tasks-dir tasks --now   # 另一个终端：立即中断——取消回合的进程树和正在跑的验收命令；任务回到 open，重新 run 即可
 taskctl board               总台账（同时重写 .taskctl/board.md，可用浏览器打开）
 taskctl report --task <id>  单任务证据页
 taskctl accept [--note "…"] 人工放行，可附一条给下次的备注
@@ -377,7 +378,7 @@ npx tsx src/main.ts run --batch C,B,A [--log <file>] [--config taskctl.json]
 
 批次只是调度策略，不是把多项任务合成一个“大任务”。它严格按命令行给出的 `C,B,A` 顺序执行，先整选校验，再从普通 `run` 队列之外**只领取这些任务**。每项都必须：`execution: continuous`（或从 `simple` 推导）、同一解析后的 workdir、`verify: mechanical` / `render`、普通风险、无 `human_check`、依赖已 `done` 或排在所选顺序的前面，并且没有活跃或未结算的旧执行。高风险、人工门禁、跨 workdir、显式 iterative 会被拒绝，不会静默放宽。
 
-每个任务仍然单独领锁、保存定义快照、跑自己的验收和必要的复核，写自己的 `acceptance.json`、session 与 usage 增量；验收**不会**推迟到批次末尾。每次领取前还会重读看板并比较原定义和 workdir，中途改动在被改任务领取前拒绝。复核 `fail` 在当前领取内返工，不会把任务退回 `open`；批次对 `open` 结果的重试是为将来的调度器结果保留的防御分支，目前只有测试接缝能到达。`blocked` / `awaiting-human` / `skipped`（领取被拒、任务已不在 `open`/`running`、依赖未就绪、所有权丢失）会停止批次，后续任务不被领取。当前任务被推迟（等模型窗口）时批次停下并打印下次可领取时间，退出码 `0`——到点再跑一次即可，批次自己不等待。`--batch` 显式选中的任务若还在推迟窗口内，整批在领取前就被拒绝并说明时间。批次里出现模型不可用时同样打印报告并以退出码 `3` 退出。
+每个任务仍然单独领锁、保存定义快照、跑自己的验收和必要的复核，写自己的 `acceptance.json`、session 与 usage 增量；验收**不会**推迟到批次末尾。每次领取前还会重读看板并比较原定义和 workdir，中途改动在被改任务领取前拒绝。复核 `fail` 在当前领取内返工，不会把任务退回 `open`；批次对 `open` 结果的重试是为将来的调度器结果保留的防御分支，目前只有测试接缝能到达。`blocked` / `awaiting-human` / `skipped`（领取被拒、任务已不在 `open`/`running`、依赖未就绪、所有权丢失）会停止批次，后续任务不被领取。被操作员中断的任务（`stop --now`、Ctrl-C）同样停止批次。当前任务被推迟（等模型窗口）时批次停下并打印下次可领取时间，退出码 `0`——到点再跑一次即可，批次自己不等待。`--batch` 显式选中的任务若还在推迟窗口内，整批在领取前就被拒绝并说明时间。批次里出现模型不可用时同样打印报告并以退出码 `3` 退出。
 
 上一任务干净结算后，只有实际 model 与 canonical workdir 都一致、worker session 标记 clean、后端探测返回 `reusable` 时，下一任务才续用该 session。model 不匹配或探测 `unavailable` 会记 journal 后新开；`active` 会阻塞待 reconcile，不会启动竞争 worker。
 
@@ -387,6 +388,7 @@ npx tsx src/main.ts run --batch C,B,A [--log <file>] [--config taskctl.json]
 npx tsx src/main.ts watch --config taskctl.json          # 常驻调度
 npx tsx src/main.ts watch --config taskctl.json --resume # 明确清除上次 stop 请求后启动
 npx tsx src/main.ts stop --tasks-dir tasks              # 另一个终端：请求优雅收尾
+npx tsx src/main.ts stop --tasks-dir tasks --now        # 另一个终端：立即中断正在运行的工作
 ```
 
 watch 用文件事件（250ms 去抖）和 30 秒兜底扫描发现新任务；空转不做模型调用、完整产物摘要或看板重写。未完成的非活跃 `running` 任务优先，随后按看板顺序处理就绪任务；`draft`、`awaiting-human`、`blocked` 仍留在看板上，但不会绕过门禁执行。
@@ -396,6 +398,16 @@ watch 用文件事件（250ms 去抖）和 30 秒兜底扫描发现新任务；�
 一个看板只有一个 watch 所有者，记录在 `.taskctl/watch.lock`，带完整 owner generation 和 heartbeat。第二个活跃 watcher 会直接拒绝；stale / 损坏记录只诊断，不自动接管，确认旧进程已消失后需人工清理。
 
 `stop` 只写 `.taskctl/stop.requested`，不发送进程树终止信号。watch 不再领取新任务，让当前 worker attempt 安全结算并释放记录后退出；stop 文件保留，因此下次启动必须显式 `watch --resume`。恢复清 stop 的动作发生在取得 watch 锁之后，第二个 watcher 不能清掉正在运行者的停止请求。停止的粒度是整个 attempt（可能含多个回合），不是单个回合。
+
+`stop --now` 在此之上**立即中断**：它多写一个 `.taskctl/stop-now.requested`，正在运行的 `run` / `watch` 在下一个调度边界看到它，正在执行的 attempt 则最多 250 毫秒内看到它（只在有 attempt 运行时轮询这一个文件，等模型窗口的 `run` 也轮询，所以另一个终端的 `stop --now` 会立刻结束那次等待），于是取消当前回合的进程树（同时请 opencode 服务停掉该会话）以及正在执行的验收命令。确认成功后，这次 attempt 记为「被操作员停止」：任务回到 `open`，不消耗 `retries`，被切断的验收、渲染检查和复核一律不判定，journal 记一条 `stopped`，`attempt.json` 是 `settled` + `stopped by operator`，任务锁和工作区预留都已释放——直接再跑 `taskctl run`（或 `watch --resume`）即可。被中断的 worker 会话标为不可续用，重跑会新开会话；它已经写进工作区的东西原样保留（不回滚，也不做回合后清扫）；worker 不会收到任何「请收尾」的指示，它只是被取消。领取之前的预算护栏判定不会被 stop 打断：stop 已经在等时护栏根本不会被问（没有会话启动，也没有目录读取）；护栏正在判的时候落下的 stop，会在判定结束、领取之前被看到。护栏拒绝的任务不是被中断的尝试——结局仍是护栏的 `refused`。
+
+在 `run` / `watch` 上按 **Ctrl-C**（SIGINT）或收到 SIGTERM 与 `stop --now` 完全相同：同样中断、同样留下两个 stop 文件（所以下一次 `watch` 需要 `--resume`），只复位 `retry --review-only` 的任务会被放回 `blocked` 并保留 `review-pending.json`（自动续跑的推迟复核是从 `open` 领取的，停止后回到 `open`，保留的证据和推迟记录都原样留着）。`stop --now` 落在批次上时中断的是批次当前任务的回合，批次随即停止，后面的任务不被领取，下一批不会续用被切断的会话。被操作员停下的 `run` / `watch` 不会判定为模型不可用：不打印那份报告，也不以 3 退出；正在等模型窗口的 `run` 收到 stop 立即结束等待。比控制器更早发出的 stop 请求对新的 `run` 不起作用；超过取消上限（8 秒）仍无法确认时——例如 opencode 服务不应答 `session.interrupt`、或进程树里有它够不着的进程——这次 attempt 记为 `uncertain`、任务 `blocked`、退出码 1，和超时后的处理一样需要人工对账，绝不会伪装成干净的停止。
+
+退出码：`run`、`watch` 和 `retry --review-only` 一样——`stop --now` 确认成功 → 0；SIGINT → 130；SIGTERM → 143；只要有一次中断未能确认 → 1（优先于前两者），并打印一行点名需要人工对账的 attempt。同一次执行里还有任务被护栏拒绝、或有任务因控制器错误而 `blocked` 时，`run` 仍退出 1（停止报告照常打印）；只有一次干净的 `stop --now`、而且没有别的要报告时才是 0。130/143 是入口进程自己的退出码：直接 `node node_modules/tsx/dist/cli.mjs src/main.ts …` 启动时 shell 显示的就是它；经 `npx` 包装启动时 shell 显示的是包装进程的退出码。第二次 Ctrl-C 不会强杀控制器，只提示 `still stopping`，整个过程有上限。`add` / `split` / `verify` / `check` / `models` / `recall` 不装信号处理，Ctrl-C 的行为和以前一样。
+
+渲染检查（无头浏览器）今天不是可取消的执行：`--now` 落在它身上时会打印一行 `stop-requested`，等它自己结束（每一步有 30 秒上限），然后同样不判定、任务回到 `open`。记忆召回（`memory.backend` 为 `mempalace` 时，每个 attempt 第一个回合之前的一次查询）也不是可取消的执行：同样先打印一行 `stop-requested`，等它自己结束（上限是 `memory.timeoutMs`，默认 20 秒），然后不派发任何回合、任务回到 `open`。
+
+Windows 上，取消时会用系统自带的 Windows PowerShell 列一次进程表，核对根进程之下是否还有活着的进程，再等输出管道关闭；列不出来（PowerShell 不可用）时退回到按 `taskkill` 的报告确认。父进程在取消开始前就已退出的「孤儿」进程无法归属（见 ADR-0007：不按旧 PID 杀进程），仍按 `uncertain` 处理。非 Windows 平台按进程组终止，不做进程表核对。为了让 Ctrl-C 只到达控制器，`run` / `watch` 把 `opencode run`、验收命令的 shell、`opencode api` 调用（护栏读取模型目录、遥测、取消时的 `session.interrupt`）以及记忆召回的 MCP 服务器都启动在控制器的按键到不了的地方：Windows 上各自开一个隐藏的控制台，其它平台各自一个进程组；Windows 上没有改用不带控制台的独立进程，是因为它们启动的程序会因此拿不回输出。
 
 watch 严格串行，不读 `parallel`。调度边界出错——某个已注册任务文件写坏、依赖成环、选中的任务被别的控制器先领走——不会让 watch 退出：它报出原因并等下一次事件，看板修好后自动恢复，期间 `stop` 仍然有效。
 
@@ -539,9 +551,11 @@ taskctl retry --task <id>       # 归档旧证据后重开；仅在 attempt 已 
 
 若任务因 Reviewer provider 全部不可用而阻塞，且存在 `review-pending.json`，`reconcile` 会建议 `taskctl retry --task <id> --review-only`。这条路径不调用 worker、不重跑验收，只在定义与产物摘要未变时恢复 Review（配置文件不算产物：改完 `taskctl.json` 再恢复，不会被摘要门拒绝）；共享冷却仍然生效，所以通常应等窗口结束或换健康 Reviewer。普通 `retry` 仍是明确的全量重试。从 2026-11-26 之前的版本升级时留意：那时保留的复核，在工作目录里放着 `taskctl.json` 的任务上会被挡下一次，`retry --review-only` 清不掉，要一次完整的 `retry`（见「已知陷阱」）。
 
-**taskctl 不按记录的 PID 杀进程。** PID 会被复用，`attempt.json` 里的 pid 不能证明它仍属于那次执行（ADR-0007）。需要停止执行时，由人核实进程身份后自行处理；执行停止未确认（`attempt.phase` 不是 `settled`）的任务，`retry` 一律拒绝，仍需按下面的手工流程归档证据。
+**taskctl 不按记录的 PID 杀进程。** PID 会被复用，`attempt.json` 里的 pid 不能证明它仍属于那次执行（ADR-0007）。需要停止执行时，由人核实进程身份后自行处理；正在运行的控制器可以用 `stop --now` 或 Ctrl-C 请它取消自己仍握着句柄的子进程树（见「常驻队列与优雅停止」）；执行停止未确认（`attempt.phase` 不是 `settled`）的任务，`retry` 一律拒绝，仍需按下面的手工流程归档证据。
 
 **worker 崩溃 / 不确定执行** —— 先核实原控制器、子进程树与后端会话均已停止，再检查产物。保留证据后，人工归档旧 `attempt.json` 和对应工作目录预留，再按需重开任务。不能仅按旧 PID 杀进程、删任务锁或改 `status` 后自动重跑。互斥目录 `.mutation.lock` 若因崩溃遗留也必须先确认原操作已停止，不能按时间强抢。
+
+**stop --now 之后任务仍是 blocked** —— 看 `attempt.json`：`phase` 是 `uncertain` 说明取消没能在 8 秒内确认（服务不应答、进程树里有够不着的进程），按上面的「worker 崩溃 / 不确定执行」处理；`phase` 是 `settled` 且 `reason` 是 `stopped by operator` 才是干净的中断，此时任务已是 `open`，不需要 `retry`。
 
 人工修改共享预留注册表之前，先停止所有使用该注册表的 taskctl 控制器；仅处理已核对身份的那条预留及其本地标记，不清空其他任务的记录。当前没有自动“强制恢复”命令。缺少验收造成的普通待审则补上验收并重开任务即可，不需要清理已正常释放的预留。
 
