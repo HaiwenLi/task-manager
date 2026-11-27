@@ -151,7 +151,7 @@ retries: 0
 
 `schema: taskctl/v1` 是显式注册：`tasks/` 目录里可以放别的 Markdown（手抄的快照、草稿、导出的旧任务），只有声明了这一行的文件才会被调度。缺这行或 frontmatter 解析不了的文件不领取、不排期，`taskctl status` 会在看板后面单独列出 `ignored` 及原因；已注册但内容坏掉的任务仍然照常报错，不会被静默忽略。`taskctl add` 生成的文件自带这一行。
 
-辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`definition.json`（领取时写下的定义快照，本次尝试的判据）、`acceptance.json`（命令、验收模式、时间、输出、身份摘要与实际使用的模型）、`acceptance-failures.json`（连续同一验收失败的指纹与次数）、`review.json`（复核判决、模型、被容忍的外部变更与实际注入的改动证据）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`model-wait.json`（模型窗口的推迟记录：轮次、本次执行里第一次被拒的时间、每个模型的拒绝原话、下次可领取时间）、`execution-state.json`（持久升级与最近 worker session）、`review-pending.json`（只待复核的保留现场）、`classification.json`（接入分类：实际/建议车道、是否兜底升级、信息充分性、理由）、`questions.md`（待回答的问题；存在期间不能 approve）、`split-plan.json`（拆分计划：子任务、继承字段与整合步骤）、`split-applied.json`（父任务已连接到哪份计划）、`split-plan.rejected.txt`（被拒绝的规划器原话）、`usage.jsonl`（每回合资源快照与增量）、`recall.json`（记忆召回的审计记录：查询串、命中的抽屉 id 与相似度，不复制全文）、`done.requested`（完成请求）、`logs/`（控制器逐任务日志与 worker 的 `$TASKCTL_LOG_DIR`）、`scratch/`（回合后清扫的落点，只进不出）、`sessions/0001-handoff.md`（交接笔记）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
+辅助文件：`tasks/<id>/lock.json`（所有权与心跳）、`attempt.json`（执行事实与不确定状态）、`definition.json`（领取时写下的定义快照，本次尝试的判据）、`acceptance.json`（命令、验收模式、时间、输出、身份摘要与实际使用的模型）、`acceptance-failures.json`（连续同一验收失败的指纹与次数）、`review.json`（复核判决、模型、被容忍的外部变更与实际注入的改动证据）、`render.json`（渲染验收的逐视口测量与截图路径）、`evidence/`（截图）、`models.json`（模型降级链的当前位置）、`model-wait.json`（模型窗口的推迟记录：轮次、本次执行里第一次被拒的时间、每个模型的拒绝原话、下次可领取时间）、`execution-state.json`（持久升级与最近 worker session）、`review-pending.json`（只待复核的保留现场）、`classification.json`（接入分类：实际/建议车道、是否兜底升级、信息充分性、理由）、`questions.md`（待回答的问题；存在期间不能 approve）、`split-plan.json`（拆分计划：子任务、继承字段与整合步骤）、`split-applied.json`（父任务已连接到哪份计划）、`split-plan.rejected.txt`（被拒绝的规划器原话）、`usage.jsonl`（每回合资源快照与增量）、`recall.json`（记忆召回的审计记录：查询串、命中的抽屉 id 与相似度，不复制全文）、`done.requested`（完成请求）、`logs/`（控制器逐任务日志与 worker 的 `$TASKCTL_LOG_DIR`）、`scratch/`（回合后清扫的落点，只进不出）、`sessions/0001-handoff.md`（交接笔记）、`rework.md`（返工说明：上一回合为什么被打回、要改什么；任务通过后删除，2026-11-27）。运行时记录不拥有任务状态，Markdown 仍是唯一状态源。
 
 ## 车道与验收方式
 
@@ -201,7 +201,7 @@ taskctl approve --task <id>                      # 修订后的定义要重新�
 `execution` 与 `complexity`、`verify` 分工如下：
 
 - **continuous**：先给一个完整 worker 回合（其中可有很多工具调用）。未请求完成、验收失败、Review fail、显式 `ESCALATE:` 或需要交接时才升级为 iterative；不会先空转到默认 40 回合。
-- **iterative**：验收失败会把退出码、输出尾部和失败指纹写进交接笔记；同模型时续用当前 worker session 返工，provider 切换仍强制新 session。普通 Review fail 在同一 claim 内继续，不再先回 `open` 等调度器重新认领。
+- **iterative**：验收失败会把退出码、输出尾部和失败指纹写进交接笔记；同模型时续用当前 worker session 返工，provider 切换仍强制新 session。普通 Review fail 在同一 claim 内继续，不再先回 `open` 等调度器重新认领。每次返工前，控制器把「为什么被打回、要改什么」写成 `tasks/<id>/rework.md`，提示词只用一行指向这个文件，不把内容塞进提示词；换模型或上下文交接之后新开的 session 同样被指向它（2026-11-27）。
 - **Reviewer 不可用**：reviewer 被 provider 拒绝不增加 worker retry，也不重放已成功的 worker/验收。任务带着保留的现场回到 `open`（`review-pending.json` 与推迟记录），窗口一到控制器自己只跑复核；连续 `modelRounds` 轮被拒后由控制器按证据规则决定（见「模型拒绝与轮次」）。reviewer **超时**则照旧以 `blocked + review-pending.json` 保留现场：换到健康 Reviewer 后执行 `taskctl retry --task <id> --review-only`，定义和产物摘要一致才只跑 Review。reviewer **崩溃**不是拒绝，判不出来转 `awaiting-human`。没有单独配复核链时复核沿用 worker 链。恢复时评审员看到的时间窗是**产出这些证据的那次尝试**的时间窗（第一次保留现场时记进 `review-pending.json`），不是恢复这次尝试的。
 - **没有 criteria**：即使需要 Review，也不会让 reviewer 凭空判断；quick 等无判据任务仍转 `awaiting-human`。
 
@@ -238,7 +238,8 @@ taskctl template --type …   看某类任务的必答/可推/补问模板
 - **复核是独立会话**：新会话、不给执行者的对话，只给 spec、验收命令与结果、产物摘要、交接笔记、日志尾部、工作区改动清单（`git status --porcelain` 与 `git diff --stat`，各截断至 200 行、超长标注），以及本次执行的时间窗口。输出必须是 JSON；解析不了按 `unclear` 转人工，不会当成失败去重跑。实际注入的改动清单原文记在 `review.json` 的 `evidence` 字段，复盘复核误判时可以核对 reviewer 当时到底看到了什么；非 git 工作目录会显式标注「不可用」而不是中断复核。
 - **容忍的外部变更**：任务可以声明 `tolerate`，告诉复核"这些差异不是我干的"。声明之外的结构变化（删列、改表头含义等）仍按原规则判 fail；本任务自己该写的内容没写全，**不能**拿外部变更当挡箭牌；涉及交付内容（该写的行、该改对的单元格）时判不出先后的，也按本任务的问题处理。被容忍的差异不做静默处理：写进 `review.json` 的 `externalChanges`、journal 记一条 `verdict external=N`、`report` 里逐条列出，`taskctl accept` 放行前也会打印一遍（人工闸门是最后一道）。为什么需要它：真跑过的表格任务里，运行期间别人加了 1 列、删了 1 行、改了 4 个单元格，复核按"零附带改动"判 fail，白跑 20 分钟一轮。
 - **定义不能被被审对象自己改**：`tolerate`、`criteria`、`risk`、`verify`、`complexity` 等都属于任务定义，进 `definitionDigest`。执行回合里改了它（哪怕是 worker 自己 shell 出去改 frontmatter），本次验收直接作废、任务 `blocked` 等人工重新确认——否则"给自己放宽判定标准"就成了合法动作。判据是领取时写下的 `tasks/<id>/definition.json` 快照，事后改文件不会把旧证据重新判成合格。生命周期字段（`retries`、`sessions`、`status`）不在定义里：降重试数、记会话 id 不会作废正在进行的尝试。复核判决里记录的是**当时那份声明**，事后把 `tolerate` 收窄不会让旧判决看起来像是被允许过更多。
-- **返工**：复核不过会写一条 `review-failed` 笔记，并在同一 claim 内回到 worker；同模型续用 session。超过允许的返工轮次后 `blocked`。人工 `reject` 才代表另一次调度尝试，重新打开为 `open`——除非归因是 `clarify`，见下。
+- **返工**：复核不过会写一条 `review-failed` 笔记和 `rework.md`，并在同一 claim 内回到 worker；同模型续用 session。超过允许的返工轮次后 `blocked`。人工 `reject` 才代表另一次调度尝试，重新打开为 `open`——除非归因是 `clarify`，见下。
+- **返工说明（`rework.md`，2026-11-27）**：每次返工前 `tasks/<id>/rework.md` 都在：控制器为本次尝试里的否决重写它，沿用前一个 attempt 留下的那一份时原样指向。提示词在 `## 工作规则` 下固定多出一条：「- 上一回合没有通过。开始之前先读 `<路径>`：里面写了原因，以及必须改什么。」不是返工回合时没有这一行，连空行都不留。内容只来自控制器已经掌握的事实：验收命令的退出码与输出结尾（最多 4000 字符，截断时写明完整输出在 `acceptance.json`）；复核未通过的标准、复核者的依据与缺陷；渲染验收失败的页面、视口与截图位置；连续执行的任务第一个回合没有请求完成、会话回合预算用尽、或 worker 自己写了 `ESCALATE:`（附它的原因；worker 在本次尝试里写过 `ESCALATE:` 的，此后每份说明都附上它的原因）。迭代任务的普通进度回合不写它，回合崩溃、被 provider 拒绝或超时也不写——那些不是被打回。任务通过（`done` 或 `awaiting-human`）时文件删除；`blocked` 之后 `taskctl retry` 重开时它仍在，新 attempt 的第一个回合照样被指向它。模型全部被拒而推迟时（`tasks/<id>/model-wait.json`）文件同样留着，窗口过后新 attempt 的第一个回合照样被指向它。被 `taskctl stop --now` 打断时也一样。
 - **人工节点**：`risk: high`、`human_check: true`、以及复核无法判定的任务停在 `awaiting-human`，只有 `accept` 能放行。
 - **归因**：`reject`/`audit` 都会记录问题出在 `clarify`（标准本身错）、`worker`（没做到）、还是 `reviewer`（漏判），`metrics` 按环节汇总。归到 `clarify` 的 `reject` 会把任务退回 `draft` 而不是 `open`：规格本身错了，再跑一遍 worker 只是在执行一份已被否定的定义。原因作为待答问题写进 `questions.md`，`taskctl answer` 之后重新 `approve` 才会再次执行；worker/reviewer 归因保持原有返工行为。
 
@@ -261,13 +262,13 @@ taskctl template --type …   看某类任务的必答/可推/补问模板
 
 ### worker 拿到什么
 
-worker 会话的提示词按固定顺序组装。标了「新」的五节都是可选的：输入缺省或为空时整节省略，连空行都不留，所以没有这些文件的任务，提示词和加这五节之前逐字节相同。
+worker 会话的提示词按固定顺序组装。标了「新」的五节都是可选的：输入缺省或为空时整节省略，连空行都不留，所以没有这些文件的任务，提示词和加这五节之前逐字节相同。工作规则里还有一行可选的（2026-11-27）：只在返工回合出现，指向 `tasks/<id>/rework.md`；不是返工回合时整行省略，同样连空行都不留。
 
 | 顺序 | 节 | 来源 | 上限 |
 | --- | --- | --- | --- |
 | 1 | 任务（标题和正文） | 任务文件 | — |
 | 2 | 已批准的规格（新） | `tasks/<id>/spec.md` | 8,000 字符；超出时保留前 70% 和后 30%，中段留可见的截断标记 |
-| 3 | 工作规则 | 固定文案 | 8 条，不变 |
+| 3 | 工作规则 | 固定文案 | 8 条，不变；返工回合时在最前面多一行指向 `tasks/<id>/rework.md`（见「返工说明」） |
 | 4 | 用户本人的规范（新） | `fixedSources` 列的文件，默认关闭 | 每个文件 8,000 字符；超出时保留前 70% 和后 30%，中段留可见的截断标记，并写明文件总长 |
 | 5 | 用户偏好（新） | `.taskctl/profile.md` | 2,000 字符；超出时只保留最新的部分，并写明档案总长 |
 | 6 | 同类任务上人工给过的纠正（新） | `.taskctl/feedback.jsonl` | 5 条、1,500 字符 |

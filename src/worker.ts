@@ -19,7 +19,8 @@ import {
   artifactsOrDefault, logDirOf, scratchDirOf, snapshotRoot, sweepRoot, taskDirOf,
   LOG_DIR_ENV, TASK_DIR_ENV, type ArtifactsConfig, type SweepOutcome,
 } from "./artifacts.js";
-import { definitionDigest, readAttempt, readDefinitionSnapshot, readRuntime, writeDefinitionSnapshot, writeRuntime, type AttemptRecord } from "./runtime.js";
+import { definitionDigest, readAttempt, readDefinitionSnapshot, readRuntime, writeDefinitionSnapshot, writeRuntime, writeRuntimeText, type AttemptRecord } from "./runtime.js";
+import { REWORK_FILE, carriedRework, renderRwork, reworkPathOf, type ReworkFeedback } from "./rework.js";
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
 import { chainPosition, readModelRotation, resetRotation, rotateModel, reviewerChain as configuredReviewerChain, taskChain, type Handover, type ModelRole } from "./models.js";
@@ -291,6 +292,10 @@ type Run = {
   budgetUnavailableNoted: boolean;
   /** The lock heartbeat's first write failure was already journaled for this attempt. */
   heartbeatWriteFailureNoted: boolean;
+  /** Why the worker was sent back; null until something does. */
+  rework: ReworkFeedback | null;
+  /** The worker's own `ESCALATE:` reason in this attempt, if it gave one. */
+  workerEscalation?: string;
 };
 const emit = (r: Run, type: WorkerEventType, detail?: string) => r.deps.onEvent?.({ type, taskId: r.task.id, detail });
 const owned = <T>(r: Run, fn: () => Promise<T>) => withOwnership(r.cfg.tasksDir, r.task.id, r.owner, fn);
@@ -454,7 +459,7 @@ export async function runTask(
   let notifyLost!: () => void;
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
   const now = new Date().toISOString();
-  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, batch: options.batch, previousSettled: false, sweepSkipNoted: false, budgetUnavailableNoted: false, heartbeatWriteFailureNoted: false,
+  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, batch: options.batch, previousSettled: false, sweepSkipNoted: false, budgetUnavailableNoted: false, heartbeatWriteFailureNoted: false, rework: null,
     run: cfg.run ?? processRun(),
     record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing", turnTimeoutMs: cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT } };
   let reservation: WorkspaceReservation | null = null;
@@ -519,6 +524,12 @@ export async function runTask(
         stage: "worker", event: "execution-state-invalid", detail: r.executionState!.diagnostic!,
       }));
     }
+    // A document left by an earlier attempt means that attempt sent the work
+    // back and no turn has answered it yet: this attempt's first turn is the
+    // rework turn. A review-only claim runs no worker, so it is not pointed
+    // at one (its automatic review resumption stands above, where
+    // `r.reviewOnly` got its final value).
+    if (!r.reviewOnly) r.rework = await carriedRework(cfg.tasksDir, task.id);
     const previous = await readAttempt(cfg.tasksDir, task.id);
     r.previousSettled = previous?.phase === "settled";
     if (r.reviewOnly) {
@@ -578,6 +589,9 @@ export async function runTask(
     releaseStop = deps.stop?.hold();
     tick(); emit(r, "running");
     const outcome = r.reviewOnly ? await resumeReviewOnly(r, reviewPending!) : await loop(r);
+    // The document is owed exactly while a rework is owed: a pass clears it,
+    // every other outcome leaves it for the next attempt.
+    await settleRework(r, outcome);
     // The entire run stays active between operations, including telemetry/handoffs.
     await checkpoint(r, "settled", "finished");
     return outcome;
@@ -719,6 +733,23 @@ async function escalate(r: Run, reason: string): Promise<void> {
   });
   emit(r, "escalated", reason);
 }
+
+/**
+ * The feedback for a turn that ended well but did not request completion, once
+ * something changed with it. Only one such layer exists: a second one replaces
+ * the first and keeps the reasons the first carried as its
+ * `仍然适用的上一轮否决`, so a no-completion never stacks on a no-completion.
+ */
+function unanswered(previous: ReworkFeedback | null, why: string): ReworkFeedback {
+  return { kind: "no-completion", why, previous: previous?.kind === "no-completion" ? previous.previous : previous };
+}
+
+/**
+ * What the worker is told when it escalated and did not ask to be judged: the
+ * branch that wraps a session up and the branch that only records the
+ * escalation tell it the same thing, so they share these words.
+ */
+const WORKER_ESCALATED_WHY = "上一回合正常结束，但没有请求完成（没有运行 taskctl done）；你在这一回合里把任务升级了（见下文）。控制器没有可以验收的成果。";
 
 /** A cooperative legacy adapter can complete normally, but cannot prove cancellation. */
 function legacyExecution<T>(fn: () => Promise<T>): Execution<T> {
@@ -1346,6 +1377,36 @@ async function noteContext(r: Run, event: string, detail: string): Promise<void>
     });
 }
 
+/**
+ * Write `rework.md` from the rejection the attempt still owes its worker.
+ * The caller holds the task lock and has checked `r.rework !== null`.
+ */
+async function writeRwork(r: Run): Promise<void> {
+  await writeRuntimeText(r.cfg.tasksDir, r.task.id, REWORK_FILE, renderRwork({ task: { id: r.task.id, title: r.task.title }, tasksDir: r.cfg.tasksDir, at: new Date().toISOString(), feedback: r.rework!, ...(r.workerEscalation === undefined ? {} : { escalation: r.workerEscalation }) }));
+}
+
+/**
+ * A document exists exactly while a rework is owed. A pass (`done`, or
+ * `awaiting-human`, where a review that could not decide also leaves the task)
+ * clears it — the record on `Run` and the file on disk — so a session opened
+ * after a human `reject` is never pointed at a rejection that no longer
+ * stands. Every other outcome keeps it: `open` hands it to the next attempt,
+ * `blocked` keeps it for a `taskctl retry`, which does not archive it. A
+ * removal that throws is journaled and never propagates: a document that
+ * cannot be removed must not turn a finished task into a controller error.
+ */
+async function settleRework(r: Run, outcome: TaskOutcome): Promise<void> {
+  if (outcome !== "done" && outcome !== "awaiting-human") return;
+  r.rework = null;
+  try {
+    await rm(reworkPathOf(r.cfg.tasksDir, r.task.id), { force: true });
+  } catch (err) {
+    await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
+      stage: "worker", event: "rework-clear-failed", detail: err instanceof Error ? err.message : String(err),
+    })).catch(() => {});
+  }
+}
+
 async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
   let sessionId: string | undefined;
   let recordedSession = "", sessionsUsed = r.task.sessions.length, turns = 0;
@@ -1370,6 +1431,9 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
     // Nothing new is dispatched once a stop was observed: the attempt settles instead.
     assertNotStopped(r);
     const note = await latestNote(r.cfg.tasksDir, r.task.id);
+    // A carried document is already on disk and keeps the time it was written:
+    // only a record this attempt produced is written out again.
+    if (r.rework !== null && r.rework.kind !== "carried") await owned(r, () => writeRwork(r));
     const protocol = buildWorkerPrompt(r.task, {
       handoff: note?.markdown, workdir: r.cfg.workdir, tasksDir: r.cfg.tasksDir,
       taskDir: taskDirOf(r.cfg.tasksDir, r.task.id), logDir: logDirOf(r.cfg.tasksDir, r.task.id),
@@ -1379,6 +1443,7 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       ...(context.feedback === undefined ? {} : { feedback: context.feedback }),
       ...(context.fixedSources === undefined ? {} : { fixedSources: context.fixedSources }),
       ...(context.memory === undefined ? {} : { memory: context.memory }),
+      ...(r.rework === null ? {} : { rework: reworkPathOf(r.cfg.tasksDir, r.task.id) }),
     });
     const prompt = r.batch === undefined ? protocol : `${r.batch.preamble}${protocol}`;
     let model: string | undefined;
@@ -1431,7 +1496,13 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
     // was given. That claim is not taken on trust for anything except the bar it
     // raises: it can only add a review, never remove one.
     const marker = ESCALATE_MARKER.exec(result.text ?? "");
-    if (marker) await escalate(r, marker[1]!.trim());
+    const workerEscalatedThisTurn = marker !== null;
+    if (marker) {
+      // The worker's own words about why the task outgrew its lane travel with
+      // every document written for the rest of this attempt.
+      r.workerEscalation = marker[1]!.trim();
+      await escalate(r, r.workerEscalation);
+    }
     let fresh = false;
     // A failed/aborted turn cannot submit successful completion even if it wrote a marker.
     if (result.exitCode !== 0) {
@@ -1475,38 +1546,52 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       if (effectiveExecution(r) === "continuous") {
         await escalate(r, "continuous verification failed; iterative rework is required");
       }
-      // The controller just wrote concrete failure feedback. Resume this
-      // same-model session instead of opening a fresh session that cannot see it.
-    } else if (effectiveExecution(r) === "continuous") {
-      // One agent turn may contain many tool calls, but a continuous task does
-      // not spend dozens of turns discovering whether it needs iteration.
-      await escalate(r, "continuous turn ended without a completion request");
-    } else if (turns >= (r.cfg.maxTurnsPerSession ?? MAX_TURNS_PER_SESSION_DEFAULT)) {
-      // Running out of turns is evidence about the task, not just about the
-      // session: whatever this was, it did not fit in one go.
-      await escalate(r, "session turn budget exhausted");
-      if (await fail(r)) return "blocked";
-      fresh = true;
-    } else if (await overBudget(r, sessionId, model)) {
-      await escalate(r, "context budget exhausted; a session handoff was needed");
-      const wrap = await workedTurn(r, WRAP_UP_INSTRUCTION, model, sessionId);
-      const after = await latestNote(r.cfg.tasksDir, r.task.id);
-      if (!after || after.seq <= (note?.seq ?? 0)) {
-        if (wrap.failure === "provider") {
-          // The wrap-up turn was refused like any other: same table entry, same round.
-          const noted = await noteTurnRefusal(r, refusals, model, wrap);
-          refusals = noted.refusals;
-          const handedOver = handovers < maxHandovers
-            && await fallBack(r, "worker", `wrap-up rejected by ${modelKey(model)}`);
-          if (handedOver) handovers++;
-          else return await refusedRound(r, "worker", refusals, true);
-        } else {
-          if (!wrap.timedOut) await owned(r, () => writeNote(r.cfg.tasksDir, fallbackNote(r.task, note?.seq ?? 0, wrap.text)));
-          emit(r, "handoff", sessionId);
-          if (await fail(r)) return "blocked";
-        }
-      } else emit(r, "handoff", sessionId);
-      fresh = true;
+      // The controller wrote rework.md and the next turn is pointed at it. Resume this
+      // same-model session, which also sees the handoff note.
+    } else {
+      // The turn ended without asking to be judged. That is a fact for the
+      // worker only when something changed with it: the continuous lane gave
+      // way, the session's turn budget ran out, or the worker escalated. Plain
+      // progress through an iterative task is not a rejection and says nothing.
+      const max = r.cfg.maxTurnsPerSession ?? MAX_TURNS_PER_SESSION_DEFAULT;
+      if (effectiveExecution(r) === "continuous") {
+        // One agent turn may contain many tool calls, but a continuous task does
+        // not spend dozens of turns discovering whether it needs iteration.
+        r.rework = unanswered(r.rework, "上一回合正常结束，但没有请求完成（没有运行 taskctl done）。连续执行的任务本应在一个回合内做完并请求验收；没有做到，任务已升级为迭代执行（iterative）。控制器没有可以验收的成果。");
+        await escalate(r, "continuous turn ended without a completion request");
+      } else if (turns >= max) {
+        // Running out of turns is evidence about the task, not just about the
+        // session: whatever this was, it did not fit in one go.
+        r.rework = unanswered(r.rework, `本会话的 ${max} 个回合已用完，仍没有请求完成（没有运行 taskctl done）。任务保持迭代执行，并换一个新会话接着做。`);
+        await escalate(r, "session turn budget exhausted");
+        if (await fail(r)) return "blocked";
+        fresh = true;
+      } else if (await overBudget(r, sessionId, model)) {
+        // The worker escalated and did not finish, and this session must wrap
+        // up: the session that replaces it is told both, through the document.
+        if (workerEscalatedThisTurn) r.rework = unanswered(r.rework, WORKER_ESCALATED_WHY);
+        await escalate(r, "context budget exhausted; a session handoff was needed");
+        const wrap = await workedTurn(r, WRAP_UP_INSTRUCTION, model, sessionId);
+        const after = await latestNote(r.cfg.tasksDir, r.task.id);
+        if (!after || after.seq <= (note?.seq ?? 0)) {
+          if (wrap.failure === "provider") {
+            // The wrap-up turn was refused like any other: same table entry, same round.
+            const noted = await noteTurnRefusal(r, refusals, model, wrap);
+            refusals = noted.refusals;
+            const handedOver = handovers < maxHandovers
+              && await fallBack(r, "worker", `wrap-up rejected by ${modelKey(model)}`);
+            if (handedOver) handovers++;
+            else return await refusedRound(r, "worker", refusals, true);
+          } else {
+            if (!wrap.timedOut) await owned(r, () => writeNote(r.cfg.tasksDir, fallbackNote(r.task, note?.seq ?? 0, wrap.text)));
+            emit(r, "handoff", sessionId);
+            if (await fail(r)) return "blocked";
+          }
+        } else emit(r, "handoff", sessionId);
+        fresh = true;
+      } else if (workerEscalatedThisTurn) {
+        r.rework = unanswered(r.rework, WORKER_ESCALATED_WHY);
+      }
     }
     if (fresh) {
       if (sessionsUsed >= (r.cfg.maxSessionsPerTask ?? MAX_SESSIONS_PER_TASK_DEFAULT) && await fail(r)) return "blocked";
@@ -1622,7 +1707,9 @@ async function resumeReviewOnly(r: Run, pending: ReviewPendingRecord): Promise<"
   const outcome = await reviewStage(r, preservedWindow(pending));
   if (outcome === "retry") {
     // A real fail verdict needs worker side effects, which a review-only claim
-    // deliberately cannot perform. The judge already wrote the feedback note.
+    // deliberately cannot perform. The judge already wrote the feedback note,
+    // and the document the next attempt's worker will be pointed at.
+    await owned(r, () => writeRwork(r));
     await owned(r, () => r.deps.store.setStatus(r.task.id, "open"));
     return "open";
   }
@@ -1766,6 +1853,7 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
       event: "rework",
       detail: `acceptance failed (exit ${result.exitCode ?? "null"}); the worker resumes with the failure output`,
     });
+    r.rework = { kind: "acceptance", command, exitCode: result.exitCode, output: result.output ?? "" };
     return "retry";
   });
   if (outcome === "review") {
@@ -1871,6 +1959,7 @@ async function acceptRender(
   // record above and this retry spends nothing.
   if (r.deps.stop?.isRequested()) throw new OperatorStoppedError("render check", false);
   if (await fail(r)) return "blocked";
+  r.rework = { kind: "render", failures };
   return "retry";
 }
 
@@ -2171,6 +2260,7 @@ async function judge(
     emit(r, "blocked", `review rounds exhausted (${rounds}/${limit})`);
     return "blocked";
   }
+  r.rework = { kind: "review", round: rounds, summary: result.summary, failed: result.criteria.filter((criterion) => !criterion.pass), defects: [...result.defects] };
   const seq = ((await latestNote(r.cfg.tasksDir, id))?.seq ?? 0) + 1;
   await owned(r, async () => {
     await writeNote(r.cfg.tasksDir, reviewNote(r.task, seq, result));

@@ -56,9 +56,14 @@ export async function readRuntime<T>(tasksDir: string, id: string, name: string)
 }
 
 export async function writeRuntime(tasksDir: string, id: string, name: string, record: unknown): Promise<void> {
+  await writeRuntimeText(tasksDir, id, name, JSON.stringify(record, null, 2));
+}
+
+/** The text twin of {@link writeRuntime}: the same landing, the text written verbatim. */
+export async function writeRuntimeText(tasksDir: string, id: string, name: string, text: string): Promise<void> {
   const file = join(tasksDir, id, name);
   const tmp = `${file}.${randomUUID()}.tmp`;
-  await writeFile(tmp, JSON.stringify(record, null, 2), "utf8");
+  await writeFile(tmp, text, "utf8");
   await renameWithRetry(tmp, file);
 }
 
