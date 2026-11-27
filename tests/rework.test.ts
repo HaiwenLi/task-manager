@@ -76,6 +76,12 @@ function gate(...results: AcceptanceResult[]): (command: string, cwd: string) =>
   return async () => results[Math.min(runs++, results.length - 1)]!;
 }
 
+/** A reviewer: the first turn answers `verdicts[0]`, the second `verdicts[1]`, every later one the last. */
+function judge(...verdicts: ReviewResult[]): () => Promise<ReviewResult> {
+  let rounds = 0;
+  return async () => verdicts[Math.min(rounds++, verdicts.length - 1)]!;
+}
+
 type PromptArgs = Parameters<AgentAdapter["prompt"]>[0];
 type PromptResult = Awaited<ReturnType<AgentAdapter["prompt"]>>;
 type Turn = { text: string; sessionId: string | undefined; model: string | undefined; rework: string | null };
@@ -351,5 +357,32 @@ describe("an acceptance failure", () => {
     expect(turns).toHaveLength(3);
     expect(turns[2]!.rework).toContain("控制器的验收命令失败了（exit 1）。");
     expect(turns[2]!.text).toContain(pointer());
+  });
+});
+
+describe("a failed review", () => {
+  it("is written to rework.md with each failed criterion, the reviewer's evidence and the defects, and the review note stays", async () => {
+    await seed();
+    const { turns, adapter } = recorder();
+
+    expect(await runTask(config(), { store, adapter, acceptance: gate(passed), review: judge(failVerdict, passVerdict) }, await store.get("a"), "w1")).toBe("done");
+
+    expect(turns[1]!.rework).toContain("独立复核没有通过（第 1 轮）：未达 C1");
+    expect(turns[1]!.rework).toContain("- C1：读了 src/a.ts，看到宽度写死");
+    expect(turns[1]!.rework).not.toContain("C2：");
+    expect(turns[1]!.rework).toContain("- 🔴 宽度改为自适应");
+    expect(turns[1]!.rework).toContain(`taskctl done --task a --tasks-dir "${tasks}"`);
+    expect(turns[1]!.text).toContain(pointer());
+    const note = await latestNote(tasks, "a");
+    expect(note?.markdown).toContain("## Status\nreview-failed");
+    expect(note?.markdown).toContain("🔴 宽度改为自适应");
+  });
+
+  it("writes nothing for a verdict that blocks the task instead of sending it back", async () => {
+    await seed();
+    const { turns, adapter } = recorder();
+    expect(await runTask(config({ maxReviewRounds: 0 }), { store, adapter, acceptance: gate(passed), review: judge(failVerdict) }, await store.get("a"), "w1")).toBe("blocked");
+    expect(turns).toHaveLength(1);
+    expect(await readRwork(tasks, "a")).toBeNull();
   });
 });

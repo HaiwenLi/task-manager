@@ -2185,6 +2185,7 @@ async function judge(
     emit(r, "blocked", `review rounds exhausted (${rounds}/${limit})`);
     return "blocked";
   }
+  r.rework = { kind: "review", round: rounds, summary: result.summary, failed: result.criteria.filter((criterion) => !criterion.pass), defects: [...result.defects] };
   const seq = ((await latestNote(r.cfg.tasksDir, id))?.seq ?? 0) + 1;
   await owned(r, async () => {
     await writeNote(r.cfg.tasksDir, reviewNote(r.task, seq, result));
