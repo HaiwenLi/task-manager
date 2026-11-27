@@ -137,10 +137,16 @@ it("a stop during a worker turn ends the attempt as stopped by the operator: ope
   expect(await settles(running)).toBe("stopped");
   expect(await store.get("a")).toMatchObject({ status: "open", retries: 0, reviewRounds: 0, sessions: [] });
   expect(await readAttempt(tasks, "a")).toMatchObject({ phase: "settled", operation: "agent turn", reason: "stopped by operator" });
-  expect(await readJournal(tasks, "a")).toEqual(expect.arrayContaining([
-    expect.objectContaining({ stage: "worker", event: "stopped", detail: expect.stringContaining("operator stop during agent turn") }),
-  ]));
-  expect(events).toContainEqual({ type: "stopped", taskId: "a", detail: expect.stringContaining("agent turn") });
+  expect(await readJournal(tasks, "a")).toContainEqual(
+    expect.objectContaining({
+      stage: "worker", event: "stopped",
+      detail: "operator stop during agent turn; cancellation confirmed; task returned to open; no interrupted step was judged",
+    }),
+  );
+  expect(events).toContainEqual({
+    type: "stopped", taskId: "a",
+    detail: "agent turn; cancellation confirmed; task returned to open; no interrupted step was judged",
+  });
   expect(await lockHeld("a")).toBe(false);
   expect(await workspaceFree()).toBe(true);
   // The worker was given no stop input: nothing was dispatched after the cut turn.

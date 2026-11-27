@@ -675,12 +675,16 @@ async function stopAttempt(r: Run, label: string, inFlight: boolean): Promise<"s
     // The journal is a record, not state: a line that cannot be written is
     // lost, and the attempt still answers "stopped" — a failed write must not
     // turn the stop into a rejected `runTask` after the status was set.
+    // Not "retries untouched": a step that had already finished when the stop
+    // landed is recorded by its outcome and may have counted a retry or a
+    // review round; what holds in every case is that nothing interrupted is
+    // judged.
     await appendJournal(r.cfg.tasksDir, r.task.id, {
       stage: "worker", event: "stopped",
-      detail: `operator stop ${inFlight ? "during" : "after"} ${label}; ${inFlight ? "cancellation confirmed; " : "nothing was interrupted; "}task returned to ${back}; retries untouched`,
+      detail: `operator stop ${inFlight ? "during" : "after"} ${label}; ${inFlight ? "cancellation confirmed; " : "nothing was interrupted; "}task returned to ${back}; no interrupted step was judged`,
     }).catch(() => {});
   });
-  emit(r, "stopped", `${label}; ${inFlight ? "cancellation confirmed" : "nothing was interrupted"}; task returned to ${back}; retries untouched`);
+  emit(r, "stopped", `${label}; ${inFlight ? "cancellation confirmed" : "nothing was interrupted"}; task returned to ${back}; no interrupted step was judged`);
   return "stopped";
 }
 
