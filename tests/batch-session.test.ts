@@ -2,10 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentAdapter, SessionReuseStatus } from "../src/adapters/types.js";
+import type { AgentAdapter, PromptResult, SessionReuseStatus } from "../src/adapters/types.js";
 import { runBatch, type BatchRunOptions } from "../src/batch.js";
 import { runCli } from "../src/cli.js";
-import { recordWorkerSession } from "../src/execution-state.js";
+import type { Execution } from "../src/execution.js";
+import { readExecutionState, recordWorkerSession } from "../src/execution-state.js";
 import { readJournal } from "../src/journal.js";
 import { readRuntime } from "../src/runtime.js";
 import type { Task } from "../src/task-file.js";
@@ -13,6 +14,7 @@ import { TaskStore } from "../src/task-store.js";
 import { readUsage } from "../src/usage.js";
 import { runTask, type WorkerConfig, type WorkerDeps } from "../src/worker.js";
 import { buildContinuousTask as task } from "./helpers/task-fixture.js";
+import { manualStopNow } from "./helpers/stop-fixture.js";
 import {
   doneAdapter, passAcceptance, seedTaskFile, workerConfigFixture, writeBatchConfig,
 } from "./helpers/watch-fixture.js";
@@ -273,4 +275,43 @@ describe("cross-task batch sessions", () => {
       { sessionId: "fresh-b", expected: { model: "w/two", cwd: await realpath(work) } },
     ]);
   });
+
+  it("an interrupted batch turn returns its task to open and no later batch continues its session", async () => {
+    await seed(task("a"), task("b"), task("c"));
+    const stop = manualStopNow();
+    let began!: () => void;
+    const inFlight = new Promise<void>((resolve) => { began = resolve; });
+    const base = adapter();
+    const cut: AgentAdapter = {
+      ...base,
+      start: (args): Execution<PromptResult> => {
+        // Only b's turn hangs; it is the turn that continues a's session.
+        if (!args.text.includes("当前任务：b")) {
+          // A turn that runs to its result like `legacyExecution` does: the
+          // state flips to exited when the result settles, so the turn is not
+          // judged uncertain — only b's turn is ever cancelled.
+          let state: "running" | "exited" = "running";
+          const result = base.prompt(args).finally(() => { state = "exited"; });
+          return { result, inspect: () => ({ state }), cancel: async () => false, interruptible: false };
+        }
+        began();
+        // `start` replaces the turn `prompt` (and with it this suite's turn
+        // record) would have run, so the record is written here: the cut turn
+        // shows the session it continued.
+        turns.push({ id: "b", sessionId: args.sessionId, cwd: args.cwd, env: args.env, text: args.text });
+        let state: "running" | "exited" = "running";
+        return { result: new Promise<PromptResult>(() => {}), inspect: () => ({ state, sessionId: args.sessionId ?? "fresh-b" }), cancel: async () => { state = "exited"; return true; } };
+      },
+    };
+    const running = runBatch(cfg, { ...deps(cut), stop }, ["a", "b", "c"]);
+    await inFlight;
+    stop.trigger("file");
+    expect(await running).toEqual({ done: ["a"], stoppedAt: "b", outcome: "stopped", pending: ["c"] });
+    expect(await store.get("b")).toMatchObject({ status: "open", retries: 0 });
+    expect(await readExecutionState(tasks, "b")).toMatchObject({ latestWorker: { sessionId: "ses-shared", clean: false } });
+    // The next batch does not continue what was cut.
+    const again = await runBatch(cfg, deps(), ["b", "c"]);
+    expect(again.done).toEqual(["b", "c"]);
+    expect(turns.filter((turn) => turn.id === "b").map((turn) => turn.sessionId)).toEqual(["ses-shared", undefined]);
+  }, 10_000);
 });

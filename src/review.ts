@@ -281,11 +281,16 @@ export function startReview(deps: ReviewDeps, evidence: ReviewEvidence): Executi
       result: inner.result.then(finish),
       inspect: inner.inspect,
       cancel: inner.cancel,
+      // A cooperative inner execution is raced against no stop: dropping the
+      // flag would let `controlled` cancel a turn that cannot prove it stopped.
+      ...(inner.interruptible === undefined ? {} : { interruptible: inner.interruptible }),
     };
   }
   let state: "running" | "exited" = "running";
   const result = deps.adapter.prompt(args).then(finish).finally(() => { state = "exited"; });
-  return { result, inspect: () => ({ state }), cancel: async () => false };
+  // A prompt-only adapter cannot prove cancellation: the review finishes on
+  // its own, and the stop surfaces at the next `controlled`.
+  return { result, inspect: () => ({ state }), cancel: async () => false, interruptible: false };
 }
 
 function degraded(ids: string[], reason: string): ReviewResult {

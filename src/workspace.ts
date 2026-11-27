@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, readlink, realpath, rmdir, unlink, writeFile } from "node:fs/promises";
 import { renameWithRetry } from "./replace.js";
+import { insulatedSpawnOptions } from "./execution.js";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -139,7 +140,11 @@ async function gitCommonDir(canonical: string): Promise<string | null> {
     // `--path-format=absolute` needs Git 2.31+; a 2.28 install echoes the
     // unknown flag back as a path (realpath then fails). Ask without it and
     // resolve the possibly-relative answer against the -C directory.
+    // Out of the console's Ctrl-C: a controller that handles signals waits for
+    // this child, and ending it fails the reservation and blocks the task (the
+    // diagnosis beside it only falls back to the plain path comparison).
     const { stdout } = await exec("git", ["-C", canonical, "rev-parse", "--git-common-dir"], {
+      ...insulatedSpawnOptions(),
       env: { ...process.env, LC_ALL: "C" },
     });
     const raw = stdout.replace(/\r?\n$/, "");

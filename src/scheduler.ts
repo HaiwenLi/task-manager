@@ -118,6 +118,8 @@ export type SchedulerResult = {
   pending: string[];
   refused?: string[];
   outage?: { taskId: string };
+  /** Tasks whose attempt was interrupted by the operator. Present only when there was at least one. */
+  stopped?: string[];
 };
 
 /**
@@ -155,10 +157,13 @@ export async function runScheduler(
     modelWaitHolds({ tasksDir: cfg.tasksDir, run: cfg.run ?? processRun(), modelRounds: modelRoundsOf(cfg) }, ids, now());
   const result: SchedulerResult = { done: [], blocked: [], pending: [] };
   const refused = new Set<string>();
+  let stopped: string[] | undefined;
   let ran = 0;
   let outage: { taskId: string } | undefined;
 
   for (;;) {
+    // Once a stop is pending no pass starts: nothing is claimed, nothing judged.
+    if (deps.stop !== undefined && (deps.stop.isRequested() || await deps.stop.check())) break;
     const snapshot = await deps.store.list();
     assertAcyclic(snapshot);
     await pruneGuardRefusals(cfg.tasksDir, snapshot);
@@ -175,7 +180,11 @@ export async function runScheduler(
 
     const startAvailable = async (): Promise<void> => {
       for (const [id, task] of pending) {
-        if (inflight.size >= limit || spent) return;
+        // The same stop check as the pass top, so no claim starts once the
+        // operator asked. `startAvailable` runs again each time an in-flight
+        // attempt settles, and that is where an interrupt which arrived while
+        // nothing held the poll is read.
+        if (inflight.size >= limit || spent || (deps.stop !== undefined && (deps.stop.isRequested() || await deps.stop.check()))) return;
         const workdir = taskWorkdir(cfg.workdir, task);
         const key = await resourceKey(workdir);
         if (busy.has(key)) continue;
@@ -192,6 +201,7 @@ export async function runScheduler(
             if (outcome === "done" && !result.done.includes(id)) result.done.push(id);
             if (outcome === "blocked" && !result.blocked.includes(id)) result.blocked.push(id);
             if (outcome === "refused") refused.add(id);
+            if (outcome === "stopped") (stopped ??= []).push(id);
             if (outcome === "open") {
               deferred.push(id);
               // A task that ran out of rounds ends the offering: what is in
@@ -212,6 +222,11 @@ export async function runScheduler(
       if (inflight.size === 0) break;
       await Promise.race([...inflight.values()]);
     }
+    // The attempts in flight have settled and nothing more is offered; the
+    // controller's outage decision is not taken under a stop (D13b). One look
+    // here per pass: a request that landed after the last look of the final
+    // attempt is still seen before the decision.
+    if (deps.stop !== undefined && (deps.stop.isRequested() || await deps.stop.check())) break;
 
     // The decision an attempt could not take (spec §6, step 5): nothing is in flight now.
     if (deferred.length > 0) {
@@ -236,7 +251,24 @@ export async function runScheduler(
           detail: `waiting ${formatDuration(ms)} for the next model window (round ${next[1].rounds}/${modelRoundsOf(cfg)}; next ${next[1].nextAt})`,
         });
         const before = now().getTime();
-        await sleep(ms);
+        // The wait ends at once on a stop, and a default sleep's timer is kept
+        // so it can be cleared: a stopped run must not sit out the window
+        // after it has returned (D13c). The run holds the stop source while it
+        // waits — `hold()` is otherwise attempt-scoped — so its poll sees a
+        // request written from another terminal and ends the wait at once, not
+        // at the window's edge.
+        let waitTimer: ReturnType<typeof setTimeout> | undefined;
+        const release = deps.stop?.hold();
+        try {
+          await Promise.race([
+            options.sleep === undefined ? new Promise<void>((resolve) => { waitTimer = setTimeout(resolve, ms); }) : sleep(ms),
+            ...(deps.stop === undefined ? [] : [deps.stop.observed]),
+          ]);
+        } finally {
+          if (waitTimer !== undefined) clearTimeout(waitTimer);
+          release?.();
+        }
+        if (deps.stop?.isRequested()) break; // instead of the `continue` a pass that only waited takes
         // A sleep that did not move the clock would wait for ever.
         if (now().getTime() <= before) break;
       }
@@ -257,6 +289,7 @@ export async function runScheduler(
   // Present only when something was refused, so a caller that compares the whole object sees what it always did.
   if (refused.size > 0) result.refused = [...refused];
   if (outage !== undefined) result.outage = outage;
+  if (stopped !== undefined) result.stopped = stopped;
   return result;
 }
 

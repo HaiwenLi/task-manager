@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { access, copyFile, lstat, mkdir, readdir, rename, unlink } from "node:fs/promises";
 import { extname, join } from "node:path";
 import { promisify } from "node:util";
+import { insulatedSpawnOptions } from "./execution.js";
 import { ignorePatternRegExp } from "./workspace.js";
 
 const exec = promisify(execFile);
@@ -91,10 +92,15 @@ export async function snapshotRoot(workdir: string): Promise<Set<string>> {
 async function untrackedRootNames(workdir: string): Promise<Set<string> | null> {
   let stdout: string;
   try {
+    // Out of the console's Ctrl-C: a controller that handles signals waits for
+    // this child. Ended by the keypress, it would answer null and leave the
+    // sweep inert: this turn's litter stays at the root, since only a file new
+    // since a turn's own snapshot is ever swept.
     const result = await exec(
       "git",
       ["-C", workdir, "-c", "core.quotepath=false", "status", "--porcelain", "-z", "--ignored=traditional"],
       {
+        ...insulatedSpawnOptions(),
         maxBuffer: 8 * 1024 * 1024,
         timeout: 10_000,
         env: { ...process.env, LC_ALL: "C", GIT_OPTIONAL_LOCKS: "0" },

@@ -1,8 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+import { insulatedSpawnOptions } from "./execution.js";
 
 /** How to reach an MCP server: its command line, and one deadline for the whole session. */
-export type McpServerOptions = { command: string[]; timeoutMs: number; env?: Record<string, string> };
+export type McpServerOptions = { command: string[]; timeoutMs: number; env?: Record<string, string>; /** Keep the server out of the controller's console ({@link insulatedSpawnOptions}): a hidden console of its own on Windows, a process group elsewhere. */ insulated?: boolean };
 /** One tool call: the tool's name and the arguments object it is given. */
 export type McpToolCall = { name: string; arguments: Record<string, unknown> };
 /** What one tool call came back with: the server's text, and whether the tool itself reported an error. */
@@ -66,7 +67,7 @@ export async function callTools(options: McpServerOptions, calls: readonly McpTo
   const [file, ...args] = options.command;
   let child: ChildProcessWithoutNullStreams;
   try {
-    child = spawn(file, args, { shell: false, windowsHide: true, env: { ...process.env, ...options.env } });
+    child = spawn(file, args, { shell: false, windowsHide: true, ...(options.insulated === true ? insulatedSpawnOptions() : {}), env: { ...process.env, ...options.env } });
   } catch (err) {
     throw new McpClientError(`mcp: cannot spawn ${file}: ${(err as Error).message}`, "spawn");
   }

@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { insulatedSpawnOptions } from "./execution.js";
 
 const exec = promisify(execFile);
 
@@ -37,7 +38,11 @@ function capLines(text: string, limit: number, label: string): string {
 /** Run git quietly; every failure becomes an explicit unavailable note. */
 async function git(cwd: string, args: string[]): Promise<string | null> {
   try {
+    // Out of the console's Ctrl-C: a controller that handles signals waits for
+    // this child. Ended by the keypress, it would answer null, and the review
+    // would run on an explicitly unavailable change list.
     const { stdout } = await exec("git", ["-C", cwd, "-c", "core.quotepath=false", ...args], {
+      ...insulatedSpawnOptions(),
       maxBuffer: 8 * 1024 * 1024,
       env: { ...process.env, LC_ALL: "C", GIT_OPTIONAL_LOCKS: "0" },
     });

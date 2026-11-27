@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { resolve } from "node:path";
 import type { AgentAdapter, CatalogueCost, CatalogueModel, SessionReuseStatus, SessionUsageSnapshot } from "./types.js";
-import { processExecution, type Execution } from "../execution.js";
+import { processExecution, insulatedSpawnOptions, type Execution } from "../execution.js";
 
 /** One prompt() turn — the execution-plane call and its result. */
 type PromptArgs = Parameters<AgentAdapter["prompt"]>[0];
@@ -108,15 +108,18 @@ type ModelListing = {
 export class OpenCodeAdapter implements AgentAdapter {
   private readonly bin: string;
   private readonly binArgsPrefix: string[];
+  /** Keep every child out of the controller's console (D6): a hidden console of its own on Windows, a process group elsewhere; only a controller that handles signals asks for it. */
+  private readonly insulated: boolean;
   /**
    * The model listings behind variant/context lookups and the cost catalogue,
    * one per directory the service was asked in (see `modelListing`).
    */
   private readonly modelLists = new Map<string, Promise<ModelListing>>();
 
-  constructor(opts: { bin?: string; binArgsPrefix?: string[] } = {}) {
+  constructor(opts: { bin?: string; binArgsPrefix?: string[]; insulated?: boolean } = {}) {
     this.bin = opts.bin ?? "opencode";
     this.binArgsPrefix = opts.binArgsPrefix ?? [];
+    this.insulated = opts.insulated === true;
   }
 
   /**
@@ -313,6 +316,7 @@ export class OpenCodeAdapter implements AgentAdapter {
     ];
     const child = spawn(this.bin, [...this.binArgsPrefix, ...argv], {
       cwd: args.cwd, shell: false, detached: process.platform !== "win32",
+      ...(this.insulated ? insulatedSpawnOptions() : {}),
       ...(args.env === undefined ? {} : { env: { ...process.env, ...args.env } }),
     });
 
@@ -598,7 +602,7 @@ export class OpenCodeAdapter implements AgentAdapter {
       ...params.flatMap((param) => ["--param", param]),
     ];
     // Every spawn carries an explicit working directory.
-    const child = spawn(this.bin, argv, { cwd, shell: false });
+    const child = spawn(this.bin, argv, { cwd, shell: false, ...(this.insulated ? insulatedSpawnOptions() : {}) });
 
     return new Promise<ApiEnvelope>((resolve, reject) => {
       child.stdin?.end();

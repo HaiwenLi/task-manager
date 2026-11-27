@@ -4,8 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { spawn } from "node:child_process";
-import { processExecution } from "../src/execution.js";
+import { spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import {
+  CANCEL_BUDGET_MS,
+  descendantsOf,
+  parseProcessTable,
+  platformTreeControl,
+  processExecution,
+  TREE_LIST_DEADLINE_MS,
+  TREE_SETTLE_MS,
+  type TreeControl,
+} from "../src/execution.js";
+import { CANCEL_DEADLINE_MS } from "../src/worker.js";
 import * as acceptance from "../src/acceptance.js";
 import { OpenCodeAdapter } from "../src/adapters/opencode.js";
 
@@ -22,6 +33,27 @@ async function descendant(): Promise<number> {
   throw new Error("fixture did not start");
 }
 
+const gateTree = fileURLToPath(new URL("./fixtures/gate-tree.mjs", import.meta.url));
+
+async function treePids(): Promise<{ root: number; child: number; leaf: number }> {
+  for (let i = 0; i < 100; i++) {
+    try { return JSON.parse(await readFile(join(cwd, "tree-pids.json"), "utf8")); } catch { /* not yet */ }
+    await delay(30);
+  }
+  throw new Error("the gate tree did not start");
+}
+
+/** A child whose `exit` and `close` arrive when the test says so, under a pid nobody owns. */
+function scriptedChild(timing: { exitAfterMs?: number; closeAfterMs?: number }): ChildProcess {
+  const child = new EventEmitter() as unknown as ChildProcess;
+  Object.defineProperty(child, "pid", { value: 4_000_000 });
+  if (timing.exitAfterMs !== undefined) setTimeout(() => child.emit("exit", 1, null), timing.exitAfterMs);
+  if (timing.closeAfterMs !== undefined) setTimeout(() => child.emit("close", 1), timing.closeAfterMs);
+  return child;
+}
+const never = new Promise<never>(() => {});
+const noTree: TreeControl = { descendants: async () => [], killTree: async () => true };
+
 it("acceptance exposes a PID and transitions to exited after its result", async () => {
   const execution = acceptance.startAcceptance("echo lifecycle-ok", cwd);
   expect(execution.inspect()).toMatchObject({ state: "running", pid: expect.any(Number) });
@@ -37,7 +69,8 @@ it("acceptance cancellation stops descendants and settles within a bound", async
     const pid = await descendant();
     const started = Date.now();
     await expect(execution.cancel()).resolves.toBe(true);
-    expect(Date.now() - started).toBeLessThan(4000);
+    // a real cancel now lists the process table first (PowerShell) before it kills
+    expect(Date.now() - started).toBeLessThan(7000);
     expect(() => process.kill(pid, 0)).toThrow();
     await expect(execution.result).resolves.toMatchObject({ passed: false });
     expect(execution.inspect().state).toBe("exited");
@@ -179,3 +212,130 @@ it("does not report confirmed shutdown when the parent vanished before tree canc
     await result;
   }
 }, 10000);
+
+it("the output pipes are waited for to the end of the cancel budget, not for 500 ms", async () => {
+  const execution = processExecution(scriptedChild({ exitAfterMs: 0, closeAfterMs: 1_500 }), never, false, undefined, noTree);
+  const started = Date.now();
+  await expect(execution.cancel()).resolves.toBe(true);
+  expect(Date.now() - started).toBeGreaterThanOrEqual(1_400);
+  expect(execution.inspect().state).toBe("exited");
+}, 10_000);
+
+it("a descendant the tree kill leaves alive keeps the cancellation unconfirmed", async () => {
+  const bystander = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd, stdio: "ignore" });
+  try {
+    const execution = acceptance.startAcceptance(`"${process.execPath}" "${gateTree}"`, cwd, "check", {
+      trees: { ...platformTreeControl, descendants: async () => [bystander.pid!] },
+    });
+    try {
+      await treePids();
+      // `cancel()` is memoized: the `finally` below answers with this same
+      // promise if the tree never started, so the gate is always cancelled.
+      await expect(execution.cancel()).resolves.toBe(false);
+      expect(execution.inspect().state).toBe("uncertain");
+    } finally {
+      await execution.cancel();
+    }
+  } finally {
+    bystander.kill();
+    // it is going down either way; wait so the directory can be removed
+    await Promise.race([
+      new Promise<void>((resolve) => bystander.once("exit", () => resolve())),
+      delay(500),
+    ]);
+  }
+}, 15_000);
+
+it("the kill utility's report is not needed once the tree is known to be gone", async () => {
+  const calls: string[] = [];
+  let known: number[] = [];
+  const execution = acceptance.startAcceptance(`"${process.execPath}" "${gateTree}"`, cwd, "check", {
+    trees: {
+      descendants: async () => { calls.push("list"); return known; },
+      killTree: async (root) => {
+        calls.push("kill");
+        for (const pid of [root, ...known]) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
+        return false; // the utility timed out, as far as this execution knows
+      },
+    },
+  });
+  try {
+    const tree = await treePids();
+    // the listing is of the whole live tree — a node it does not hold would
+    // still inherit the output pipes and keep the close from ever arriving
+    known = [tree.root, tree.child, tree.leaf];
+    // Memoized: the `finally`'s call is this same one when the tree started.
+    await expect(execution.cancel()).resolves.toBe(true);
+    expect(calls).toEqual(["list", "kill"]);
+    expect(execution.inspect().state).toBe("exited");
+    for (const pid of known) expect(() => process.kill(pid, 0)).toThrow();
+  } finally {
+    // When the fixture never recorded the tree, `known` stays empty and the
+    // `killTree` above ends only the root: the real tree is ended first, then
+    // the cancel settles the execution. A root that has already exited names
+    // no tree — its output pipes have closed, so no descendant that inherited
+    // them survives, and its pid may belong to another process by now.
+    if (known.length === 0 && execution.inspect().state !== "exited") await platformTreeControl.killTree(execution.inspect().pid!);
+    await execution.cancel();
+  }
+}, 15_000);
+
+it("a root whose exit was never observed is not confirmed", async () => {
+  const execution = processExecution(scriptedChild({ closeAfterMs: 0 }), never, false, undefined, noTree);
+  await expect(execution.cancel()).resolves.toBe(false);
+});
+
+it("a tree whose output pipes never close is not confirmed", async () => {
+  const execution = processExecution(scriptedChild({ exitAfterMs: 0 }), never, false, undefined, noTree);
+  const started = Date.now();
+  await expect(execution.cancel()).resolves.toBe(false);
+  expect(Date.now() - started).toBeLessThan(CANCEL_DEADLINE_MS + 2_000);
+}, 12_000);
+
+it("a platform that cannot list processes falls back to the utility's report", async () => {
+  const cannotList: TreeControl = { descendants: async () => null, killTree: async () => true };
+  const gone = processExecution(scriptedChild({ exitAfterMs: 0, closeAfterMs: 0 }), never, false, undefined, cannotList);
+  await expect(gone.cancel()).resolves.toBe(true);
+  const alive = processExecution(scriptedChild({ exitAfterMs: 0, closeAfterMs: 0 }), never, false, undefined, { ...cannotList, killTree: async () => false });
+  await expect(alive.cancel()).resolves.toBe(false);
+});
+
+it("a listing that never answers does not hang the cancel", async () => {
+  const hung: TreeControl = { descendants: () => never, killTree: async () => true };
+  const execution = processExecution(scriptedChild({ exitAfterMs: 0, closeAfterMs: 0 }), never, false, undefined, hung);
+  const started = Date.now();
+  await expect(execution.cancel()).resolves.toBe(true);
+  expect(Date.now() - started).toBeLessThan(TREE_LIST_DEADLINE_MS + 2_000);
+}, 10_000);
+
+it("the Windows listing finds the live descendants of a real tree", async () => {
+  const execution = acceptance.startAcceptance(`"${process.execPath}" "${gateTree}"`, cwd);
+  try {
+    const tree = await treePids();
+    const found = await platformTreeControl.descendants(execution.inspect().pid!);
+    if (process.platform !== "win32") { expect(found).toBeNull(); return; }
+    expect(found).toEqual(expect.arrayContaining([tree.root, tree.child, tree.leaf]));
+    expect(found).not.toContain(process.pid);
+  } finally { await execution.cancel(); }
+}, 15_000);
+
+it("lineage follows live parents only: a child created before its putative parent is not its child", () => {
+  const table = parseProcessTable([
+    "100,1,20261125090000", "200,100,20261125090001", "300,200,20261125090002",
+    "400,100,20261125080000", "500,999,20261125090005",   // 400 names pid 100, but 100 was born later: a reused pid
+  ].join("\n"));
+  expect(table).not.toBeNull();
+  expect(descendantsOf(table!, 100)).toEqual([200, 300]);
+  expect(descendantsOf(table!, 999)).toEqual([]);
+});
+
+it("a listing the platform did not answer cleanly parses to null", () => {
+  expect(parseProcessTable("")).toBeNull();
+  expect(parseProcessTable("Get-CimInstance : Access denied.")).toBeNull();
+  expect(parseProcessTable("100,1,2026112509000")).toBeNull();
+});
+
+it("the cancel budget stays inside the attempt's cancel deadline", () => {
+  expect(TREE_LIST_DEADLINE_MS + 1_500 + 2 * TREE_SETTLE_MS).toBeLessThan(CANCEL_BUDGET_MS);
+  expect(CANCEL_BUDGET_MS).toBeLessThan(CANCEL_DEADLINE_MS);
+});

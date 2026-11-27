@@ -9,8 +9,9 @@ import { assertAcyclic, taskWorkdir } from "./scheduler.js";
 import { runTask, settleExhausted, type WorkerConfig, type WorkerDeps } from "./worker.js";
 import { controlDir, acquireWatchLock, heartbeatWatchLock, releaseWatchLock } from "./watch-lock.js";
 import { pruneGuardRefusals } from "./guard-refusals.js";
+import { readStopNowRequest, stopRequestPath, stopNowRequestPath } from "./stop.js";
 
-export const stopRequestPath = (tasksDir: string): string => join(controlDir(tasksDir), "stop.requested");
+export { stopRequestPath };
 
 /**
  * How long the queue leaves a task the budget guard refused out of its
@@ -49,6 +50,17 @@ async function stopRequested(tasksDir: string): Promise<boolean> {
 }
 
 /**
+ * Which stop request sits on the board — either file, the graceful one's path
+ * when both do, since that is the path the refusal has always named. The queue
+ * still drains on the graceful file alone ({@link stopRequested}); this only
+ * decides what the start-up refusal names and what `--resume` clears.
+ */
+async function requestedStopPath(tasksDir: string): Promise<string | undefined> {
+  if (await stopRequested(tasksDir)) return stopRequestPath(tasksDir);
+  return (await readStopNowRequest(tasksDir)) !== null ? stopNowRequestPath(tasksDir) : undefined;
+}
+
+/**
  * The production watcher. A watcher error (its directory removed, a handle
  * limit) is kept off the uncaught-exception path: an `error` event with no
  * listener is thrown by the emitter, which would bypass the lock release in
@@ -66,7 +78,7 @@ export type WatchEnd = { reason: "stop" } | { reason: "outage"; taskId: string }
 /**
  * Own and drain one board until `.taskctl/stop.requested` appears. The loop is
  * sequential on purpose: new arrivals are considered only between operations,
- * and a stop never becomes a process-tree kill or an uncertain replay.
+ * and a graceful stop never becomes a process-tree kill or an uncertain replay.
  *
  * A task the budget guard refused is left out of the candidates for a while
  * and judged again after that (see {@link scheduleOnce}), so the task behind
@@ -74,6 +86,9 @@ export type WatchEnd = { reason: "stop" } | { reason: "outage"; taskId: string }
  * waiting for its next model window is left out the same way, and when the
  * controller declares an outage the queue ends at once — the caller reports
  * it; no stop request is written, so the next watch needs no `--resume`.
+ *
+ * A graceful stop never interrupts; an interrupt (`stop --now`, a signal)
+ * cancels the attempt in flight and is confirmed before anything is recorded.
  */
 export async function watchQueue(
   cfg: WorkerConfig,
@@ -112,6 +127,11 @@ export async function watchQueue(
     wakeResolver = undefined;
     resolve?.();
   };
+  // An idle watch must not sit out its fallback after an interrupt: the wake
+  // ends the wait and the loop top reads the stop. A request from the board
+  // needs no wake of its own — the control directory is watched, and `stop
+  // --now` writes into it.
+  void deps.stop?.observed.then(() => wake());
   const onFilesystem = (): void => {
     if (debounce !== undefined) clearTimeout(debounce);
     debounce = setTimeout(() => {
@@ -130,7 +150,11 @@ export async function watchQueue(
     fallback = undefined;
     wakeRequested = false;
   };
-  const stopOrLost = async (): Promise<boolean> => ownershipError !== undefined || await stopRequested(cfg.tasksDir);
+  const stopOrLost = async (): Promise<boolean> =>
+    ownershipError !== undefined
+    || deps.stop?.isRequested() === true
+    || await deps.stop?.check() === true
+    || await stopRequested(cfg.tasksDir);
   const beat = (): void => {
     heartbeatTimer = setTimeout(() => {
       renewal = (async () => {
@@ -157,19 +181,24 @@ export async function watchQueue(
   };
 
   try {
-    if (await stopRequested(cfg.tasksDir)) {
-      if (!options.resume) throw new Error(`stop is already requested at ${stopRequestPath(cfg.tasksDir)}; use watch --resume to clear it explicitly`);
+    const stopPath = await requestedStopPath(cfg.tasksDir);
+    if (stopPath !== undefined) {
+      if (!options.resume) throw new Error(`stop is already requested at ${stopPath}; use watch --resume to clear it explicitly`);
       // Lock acquisition came first: a second watcher --resume cannot clear a
       // live owner's stop request.
       await rm(stopRequestPath(cfg.tasksDir), { force: true });
+      await rm(stopNowRequestPath(cfg.tasksDir), { force: true });
     }
     watchers.push(watchFs(cfg.tasksDir, onFilesystem));
     watchers.push(watchFs(controlDir(cfg.tasksDir), onFilesystem));
     beat();
 
     for (;;) {
-      if (await stopRequested(cfg.tasksDir)) return { reason: "stop" };
+      // Ownership first: a lost lock ends the watch as a thrown error, never
+      // as a graceful stop. Then the stop — a request on the board, or this
+      // process's own interrupt source.
       if (ownershipError !== undefined) throw ownershipError;
+      if (await stopOrLost()) return { reason: "stop" };
       let scheduled: Awaited<ReturnType<typeof scheduleOnce>>;
       try {
         scheduled = await scheduleOnce(cfg, deps, runOne, runSelected, stopOrLost, refusedAt, refusedRetryMs);
@@ -280,9 +309,11 @@ async function scheduleOnce(
     `watch-${process.pid}-${candidate.id}`,
   );
   if (outcome === "refused") refusedAt.set(candidate.id, Date.now());
-  if (outcome === "open") {
+  if (outcome === "open" && !(await shouldStop())) {
     // The controller's decision, taken now that nothing is in flight: watch is
-    // strictly serial, so this attempt was the only one.
+    // strictly serial, so this attempt was the only one. Not under a stop
+    // (D13b): the stop is what ended the offering, so the evidence says
+    // nothing about the models.
     const settled = await settleExhausted(cfg, deps, board, [candidate.id]);
     if (settled.outage !== undefined) return { outage: settled.outage.taskId };
   }

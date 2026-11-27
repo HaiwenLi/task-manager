@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi, type Mock } from "vitest";
-import { callTools, McpClientError } from "../src/mcp-client.js";
+import { callTools, McpClientError, type McpServerOptions } from "../src/mcp-client.js";
 import {
   buildRecallQuery,
   createMempalaceBackend,
@@ -77,6 +77,17 @@ describe("memory layer", () => {
       { name: "mempalace_search", arguments: { query: "q", limit: 20, max_distance: 0.45, wing: "IDT" } },
     ]);
     expect(groups[0][0]).toEqual({ drawerId: "d1", wing: "w", room: "pitfall", similarity: 0.6, text: "hello", filedAt: "2026-11-11T00:00:00" });
+  });
+
+  it("a recall backend is insulated only when its caller asks for it", async () => {
+    const seen: McpServerOptions[] = [];
+    const call: typeof callTools = async (options) => { seen.push(options); return [{ text: "{\"results\":[]}", isError: false }]; };
+    // Without the third argument — what `taskctl recall` builds — today's spawn: the server options name no insulation.
+    await createMempalaceBackend(cfg, call).searchAll([{ query: "q" }], { limit: 20 });
+    expect(seen[0]?.insulated).toBeUndefined();
+    // An attempt with a stop source (Task 6) asks through the third argument.
+    await createMempalaceBackend(cfg, call, true).searchAll([{ query: "q" }], { limit: 20 });
+    expect(seen[1]?.insulated).toBe(true);
   });
 
   it("returns null and touches nothing when memory is off", async () => {

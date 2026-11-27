@@ -16,6 +16,8 @@ import { passBudget } from "../src/scheduler.js";
 import type { Task } from "../src/task-file.js";
 import type { WorkerConfig, WorkerDeps } from "../src/worker.js";
 import { buildTaskFile } from "./helpers/task-fixture.js";
+import { manualStopNow } from "./helpers/stop-fixture.js";
+import type { StopNow, StopSource } from "../src/stop.js";
 
 function eligible(id: string, overrides: Partial<Task> = {}): Task {
   return buildTaskFile({
@@ -348,6 +350,22 @@ describe("runBatch", () => {
     expect(result).toEqual({ done: ["a"], stoppedAt: "b", outcome: "stop-requested", pending: ["b", "c"] });
   });
 
+  it.each(["done", "stopped"] as const)("claims nothing after the current task was %s with a stop pending", async (outcome) => {
+    board = [eligible("a"), eligible("b"), eligible("c")];
+    const stop = manualStopNow();
+    const calls: string[] = [];
+    const run: BatchRunOptions["run"] = async (_cfg, _deps, task) => {
+      calls.push(task.id);
+      if (task.id === "a") { stop.trigger("file"); return outcome; }
+      return "done";
+    };
+    const result = await runBatch(cfg, { ...deps, stop }, ["a", "b", "c"], { run });
+    expect(calls).toEqual(["a"]);
+    expect(result).toEqual(outcome === "done"
+      ? { done: ["a"], stoppedAt: "b", outcome: "stop-requested", pending: ["b", "c"] }
+      : { done: [], stoppedAt: "a", outcome: "stopped", pending: ["b", "c"] });
+  });
+
   it("stops on a deferred current task and says when it may run again", async () => {
     board = [eligible("a"), eligible("b")];
     const calls: string[] = [];
@@ -396,5 +414,51 @@ describe("runBatch", () => {
 
     expect(calls).toEqual(["a"]);
     expect(result).toEqual({ done: [], stoppedAt: "a", outcome: "outage", pending: ["b", "c"] });
+  });
+
+  it("skips part 1's decision when only the in-process stop sees the request", async () => {
+    board = [eligible("a"), eligible("b"), eligible("c")];
+    const run = newRunContext();
+    cfg.run = run;
+    // A request on the board that only a look sees: `isRequested()` stays false
+    // until `check()` is asked, and `shouldStop` is absent, so a skip that asks
+    // `shouldStop()` alone never sees what the attempt-top guard sees.
+    let arrived = false;
+    let seen = false;
+    let settle!: (source: StopSource) => void;
+    const stop: StopNow = {
+      observed: new Promise<StopSource>((resolve) => { settle = resolve; }),
+      isRequested: () => seen,
+      source: () => (seen ? "file" : undefined),
+      check: async () => {
+        if (arrived) { seen = true; settle("file"); }
+        return seen;
+      },
+      hold: () => () => {},
+    };
+    const calls: string[] = [];
+
+    const result = await runBatch(cfg, { ...deps, stop }, ["a", "b", "c"], {
+      run: async (_cfg, _deps, task) => {
+        calls.push(task.id);
+        if (task.id === "a") {
+          const now = new Date().toISOString();
+          await mkdir(join(tasksDir, "a"), { recursive: true });
+          // a ran out of rounds and only recorded it; the request lands on the
+          // board before any look after the attempt.
+          await writeModelWait(tasksDir, "a", {
+            runId: run.id, stage: "worker", rounds: 4, firstRefusedAt: now, refusals: [], nextAt: now, updatedAt: now,
+          });
+          arrived = true;
+          return "open"; // the attempt that ran out of rounds decides nothing
+        }
+        return "done";
+      },
+    });
+
+    expect(calls).toEqual(["a"]);
+    // No outage from evidence the stop cut short: the decision is skipped, and
+    // the spent task ends the batch under its own name, the rest unclaimed.
+    expect(result).toEqual({ done: [], stoppedAt: "a", outcome: "open", pending: ["a", "b", "c"] });
   });
 });
