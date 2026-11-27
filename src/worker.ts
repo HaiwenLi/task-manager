@@ -20,7 +20,7 @@ import {
   LOG_DIR_ENV, TASK_DIR_ENV, type ArtifactsConfig, type SweepOutcome,
 } from "./artifacts.js";
 import { definitionDigest, readAttempt, readDefinitionSnapshot, readRuntime, writeDefinitionSnapshot, writeRuntime, writeRuntimeText, type AttemptRecord } from "./runtime.js";
-import { REWORK_FILE, renderRwork, reworkPathOf, type ReworkFeedback } from "./rework.js";
+import { REWORK_FILE, carriedRework, renderRwork, reworkPathOf, type ReworkFeedback } from "./rework.js";
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
 import { chainPosition, readModelRotation, resetRotation, rotateModel, reviewerChain as configuredReviewerChain, taskChain, type Handover, type ModelRole } from "./models.js";
@@ -524,6 +524,12 @@ export async function runTask(
         stage: "worker", event: "execution-state-invalid", detail: r.executionState!.diagnostic!,
       }));
     }
+    // A document left by an earlier attempt means that attempt sent the work
+    // back and no turn has answered it yet: this attempt's first turn is the
+    // rework turn. A review-only claim runs no worker, so it is not pointed
+    // at one (its automatic review resumption stands above, where
+    // `r.reviewOnly` got its final value).
+    if (!r.reviewOnly) r.rework = await carriedRework(cfg.tasksDir, task.id);
     const previous = await readAttempt(cfg.tasksDir, task.id);
     r.previousSettled = previous?.phase === "settled";
     if (r.reviewOnly) {
@@ -583,6 +589,9 @@ export async function runTask(
     releaseStop = deps.stop?.hold();
     tick(); emit(r, "running");
     const outcome = r.reviewOnly ? await resumeReviewOnly(r, reviewPending!) : await loop(r);
+    // The document is owed exactly while a rework is owed: a pass clears it,
+    // every other outcome leaves it for the next attempt.
+    await settleRework(r, outcome);
     // The entire run stays active between operations, including telemetry/handoffs.
     await checkpoint(r, "settled", "finished");
     return outcome;
@@ -1369,6 +1378,27 @@ async function writeRwork(r: Run): Promise<void> {
   await writeRuntimeText(r.cfg.tasksDir, r.task.id, REWORK_FILE, renderRwork({ task: { id: r.task.id, title: r.task.title }, tasksDir: r.cfg.tasksDir, at: new Date().toISOString(), feedback: r.rework!, ...(r.workerEscalation === undefined ? {} : { escalation: r.workerEscalation }) }));
 }
 
+/**
+ * A document exists exactly while a rework is owed. A pass (`done`, or
+ * `awaiting-human`, where a review that could not decide also leaves the task)
+ * clears it — the record on `Run` and the file on disk — so a session opened
+ * after a human `reject` is never pointed at a rejection that no longer
+ * stands. Every other outcome keeps it: `open` hands it to the next attempt, `blocked` keeps it for a `taskctl retry`, which does not archive it. A
+ * removal that throws is journaled and never propagates: a document that
+ * cannot be removed must not turn a finished task into a controller error.
+ */
+async function settleRework(r: Run, outcome: TaskOutcome): Promise<void> {
+  if (outcome !== "done" && outcome !== "awaiting-human") return;
+  r.rework = null;
+  try {
+    await rm(reworkPathOf(r.cfg.tasksDir, r.task.id), { force: true });
+  } catch (err) {
+    await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
+      stage: "worker", event: "rework-clear-failed", detail: err instanceof Error ? err.message : String(err),
+    })).catch(() => {});
+  }
+}
+
 async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
   let sessionId: string | undefined;
   let recordedSession = "", sessionsUsed = r.task.sessions.length, turns = 0;
@@ -1393,7 +1423,9 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
     // Nothing new is dispatched once a stop was observed: the attempt settles instead.
     assertNotStopped(r);
     const note = await latestNote(r.cfg.tasksDir, r.task.id);
-    if (r.rework !== null) await owned(r, () => writeRwork(r));
+    // A carried document is already on disk and keeps the time it was written:
+    // only a record this attempt produced is written out again.
+    if (r.rework !== null && r.rework.kind !== "carried") await owned(r, () => writeRwork(r));
     const protocol = buildWorkerPrompt(r.task, {
       handoff: note?.markdown, workdir: r.cfg.workdir, tasksDir: r.cfg.tasksDir,
       taskDir: taskDirOf(r.cfg.tasksDir, r.task.id), logDir: logDirOf(r.cfg.tasksDir, r.task.id),
@@ -1664,7 +1696,9 @@ async function resumeReviewOnly(r: Run, pending: ReviewPendingRecord): Promise<"
   const outcome = await reviewStage(r, preservedWindow(pending));
   if (outcome === "retry") {
     // A real fail verdict needs worker side effects, which a review-only claim
-    // deliberately cannot perform. The judge already wrote the feedback note.
+    // deliberately cannot perform. The judge already wrote the feedback note,
+    // and the document the next attempt's worker will be pointed at.
+    await owned(r, () => writeRwork(r));
     await owned(r, () => r.deps.store.setStatus(r.task.id, "open"));
     return "open";
   }

@@ -178,3 +178,13 @@ export async function readRwork(tasksDir: string, id: string): Promise<string | 
     throw err;
   }
 }
+
+/**
+ * The document an earlier attempt left behind, read back as a feedback record.
+ * Its `carried` kind renders the stored markdown from its first `## ` heading
+ * on, so the next attempt's rework turn is pointed at the same document.
+ */
+export async function carriedRework(tasksDir: string, id: string): Promise<ReworkFeedback | null> {
+  const markdown = await readRwork(tasksDir, id);
+  return markdown === null ? null : { kind: "carried", markdown };
+}

@@ -514,3 +514,125 @@ describe("the worker's own ESCALATE reason", () => {
     expect(await readRwork(tasks, "a")).toBeNull();
   });
 });
+
+describe("a rework owed beyond the turn that follows", () => {
+  const providerRefusal: ReviewResult = { verdict: "unclear", criteria: [], externalChanges: [], defects: [], summary: "provider quota refused", failure: "provider" };
+  const refusal: PromptResult = { sessionId: "", exitCode: 1, text: "weekly limit reached", failure: "provider", tokens: 0 };
+
+  it("survives a model switch: the session opened on the next model is pointed at the same document", async () => {
+    await seed();
+    const { turns, adapter } = recorder((turn, args) => (turn === 2 && args.model === "w/one" ? refusal : undefined));
+    const cfg = config({ model: "w/one", modelFallbacks: ["q/two"], quotaBackoffMs: [0] });
+
+    expect(await runTask(cfg, { store, adapter, acceptance: gate(failed, passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+
+    expect(turns.map((turn) => turn.model)).toEqual(["w/one", "w/one", "q/two"]);
+    expect(turns.map((turn) => turn.sessionId)).toEqual([undefined, "s", undefined]);
+    expect(turns[2]!.rework).toContain("断言失败： expected 2, got 1");
+    expect(turns[2]!.text).toContain(pointer());
+  });
+
+  it("survives a context wrap: the new session gets the handoff note and the pointer", async () => {
+    await seed();
+    // A model is named: `overBudget` answers false without asking when the
+    // turn ran on none.
+    let work = 0;
+    const { turns, adapter } = recorder(async (turn, args) => {
+      if (args.text === WRAP_UP_INSTRUCTION) {
+        await writeNote(tasks, { task: "a", seq: 2, status: "进行中；预算告急", done: "修了一半", found: "断言在第 3 行", next: "继续修", files: [] });
+        return { sessionId: args.sessionId!, text: "HANDOFF_READY", exitCode: 0 };
+      }
+      work += 1;
+      return work === 2 ? { sessionId: "s", text: "还在修", exitCode: 0 } : undefined;
+    }, (sessionId) => (sessionId === "s" && work >= 2 ? 900_000 : 0));
+
+    expect(await runTask(config({ model: "w/one" }), { store, adapter, acceptance: gate(failed, passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+
+    // The recorder notes every prompt, the wrap-up turn included: turn 1
+    // fails the gate, turn 2 is ordinary progress on the rejection, turn 3
+    // wraps the session up, turn 4 opens the new one.
+    expect(turns.map((turn) => turn.sessionId)).toEqual([undefined, "s", "s", undefined]);
+    expect(turns[2]!.text).toBe(WRAP_UP_INSTRUCTION);
+    // Turn 2 was ordinary progress on the rejection; the wrap that followed it
+    // did not turn it into a new one.
+    expect(turns[3]!.rework).toContain("控制器的验收命令失败了（exit 1）。");
+    expect(turns[3]!.rework).not.toContain("没有请求完成");
+    expect(turns[3]!.text).toContain(pointer());
+    expect(turns[3]!.text).toContain("修了一半");
+  });
+
+  it("is handed to a later attempt by a review-only recovery that fails", async () => {
+    await seed();
+    // Written for part 1 as its plan builds it (its Task 6): a refused review
+    // defers the task — `open`, its evidence kept — instead of parking it,
+    // and the next claim resumes the review by itself. `modelCooldownMs: 0`
+    // lets that claim through at once, and lets the refused model be asked again.
+    // 1. The worker finishes, the gate passes, the reviewer refuses: deferred.
+    const first = recorder();
+    const deferred = config({ reviewerModel: "r/two", modelCooldownMs: 0 });
+    expect(await runTask(deferred, { store, adapter: first.adapter, acceptance: gate(passed), review: async () => providerRefusal }, await store.get("a"), "w1")).toBe("open");
+    expect(await readRwork(tasks, "a")).toBeNull();
+
+    // 2. The next claim resumes the review on the preserved evidence and
+    //    reaches a real fail verdict. It runs no worker, so the rework turn
+    //    belongs to a later attempt.
+    expect(await runTask(deferred, { store, adapter: first.adapter, acceptance: gate(passed), review: judge(failVerdict) }, await store.get("a"), "w2")).toBe("open");
+    expect(await readRwork(tasks, "a")).toContain("独立复核没有通过（第 1 轮）：未达 C1");
+
+    // 3. That attempt's first turn is the rework turn.
+    const second = recorder();
+    expect(await runTask(config({ reviewerModel: "r/two" }), { store, adapter: second.adapter, acceptance: gate(passed), review: judge(passVerdict) }, await store.get("a"), "w3")).toBe("done");
+    expect(second.turns[0]!.text).toContain(pointer());
+    expect(second.turns[0]!.rework).toContain("独立复核没有通过（第 1 轮）：未达 C1");
+    expect(await readRwork(tasks, "a")).toBeNull();
+  });
+
+  it("stays on disk when the attempt is blocked, so a retry is pointed at it", async () => {
+    await seed();
+    const first = recorder();
+    expect(await runTask(config({ retryLimit: 2 }), { store, adapter: first.adapter, acceptance: gate(failed) }, await store.get("a"), "w1")).toBe("blocked");
+    expect(await readRwork(tasks, "a")).toContain("断言失败： expected 2, got 1");
+
+    expect(await retryTask(tasks, "a", { baseWorkdir: work })).toMatchObject({ ok: true });
+    const second = recorder();
+    expect(await runTask(config({ retryLimit: 2 }), { store, adapter: second.adapter, acceptance: gate(passed), review: async () => passVerdict }, await store.get("a"), "w2")).toBe("done");
+    expect(second.turns[0]!.text).toContain(pointer());
+    expect(second.turns[0]!.rework).toContain("断言失败： expected 2, got 1");
+    expect(await readRwork(tasks, "a")).toBeNull();
+  });
+
+  it("is removed when the work passes, so a session opened after a human reject is not pointed at a stale rejection", async () => {
+    await seed({ risk: "high" });
+    const first = recorder();
+    expect(await runTask(config(), { store, adapter: first.adapter, acceptance: gate(passed), review: judge(failVerdict, passVerdict) }, await store.get("a"), "w1")).toBe("awaiting-human");
+    expect(first.turns[1]!.rework).toContain("独立复核没有通过（第 1 轮）");
+    expect(await readRwork(tasks, "a")).toBeNull();
+
+    const rejected: string[] = [];
+    expect(await runCli(["reject", "--task", "a", "--reason", "按钮没对齐", "--tasks-dir", tasks], { log: (line) => rejected.push(line) })).toBe(0);
+    const second = recorder();
+    expect(await runTask(config(), { store, adapter: second.adapter, acceptance: gate(passed), review: judge(passVerdict) }, await store.get("a"), "w2")).toBe("awaiting-human");
+
+    expect(second.turns[0]!.text).not.toContain("rework.md");
+    expect(second.turns[0]!.rework).toBeNull();
+    // What the worker is told is the human's reason, through the note reject wrote.
+    expect(second.turns[0]!.text).toContain("按钮没对齐");
+  });
+
+  it("a document that cannot be removed is journaled, and the task still finishes", async () => {
+    await seed();
+    // The worker has read the document in turn 2; before the pass is settled a
+    // directory sits where the file was. Node refuses `rm` on a directory that
+    // is not removed recursively (`ERR_FS_EISDIR`), on every platform.
+    const { turns, adapter } = recorder(async (turn) => {
+      if (turn !== 2) return undefined;
+      await rm(reworkPath(), { force: true });
+      await mkdir(reworkPath());
+    });
+
+    expect(await runTask(config(), { store, adapter, acceptance: gate(failed, passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+
+    expect(turns[1]!.rework).toContain("控制器的验收命令失败了（exit 1）。");
+    expect((await readJournal(tasks, "a")).some((line) => line.event === "rework-clear-failed")).toBe(true);
+  });
+});
