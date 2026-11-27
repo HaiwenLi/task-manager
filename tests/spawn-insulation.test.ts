@@ -22,16 +22,19 @@ vi.mock("node:child_process", async (importOriginal) => {
   };
   // The `git` helpers in `src/` keep `promisify(execFile)` from module load,
   // and Node's promisify answers through the `promisify.custom` symbol, so the
-  // wrapper carries it as well; both forms record and forward to the real ones.
+  // wrapper carries it as well; both forms record and forward everything they
+  // are given, a trailing callback included.
+  type ExecFileCallback = (error: Error | null, stdout: string, stderr: string) => void;
   const realExecFile = actual.execFile as unknown as (
-    file: string, args?: readonly string[], options?: ExecFileOptions,
-    callback?: ((error: Error | null, stdout: string, stderr: string) => void) | undefined,
+    file: string, ...rest: Array<readonly string[] | ExecFileOptions | ExecFileCallback>
   ) => ChildProcess;
   const promised = promisify(actual.execFile);
   const recordedExecFile = Object.assign(
-    (file: string, args: readonly string[] = [], options: ExecFileOptions = {}) => {
-      execs.push({ file, options });
-      return realExecFile(file, args, options);
+    (file: string, ...rest: Array<readonly string[] | ExecFileOptions | ExecFileCallback>) => {
+      const options = rest.find((argument): argument is ExecFileOptions =>
+        typeof argument === "object" && argument !== null && !Array.isArray(argument));
+      if (options !== undefined) execs.push({ file, options });
+      return realExecFile(file, ...rest);
     },
     {
       [promisify.custom]: (file: string, args: readonly string[] = [], options: ExecFileOptions = {}) => {
