@@ -151,6 +151,12 @@ describe("renderRwork", () => {
     expect(doc).not.toContain("验收输出：");
   });
 
+  it("says an output of only whitespace as silent", () => {
+    const doc = renderRwork({ ...base, feedback: { kind: "acceptance", command: "npm test", exitCode: 1, output: " \r\n\t\n" } });
+    expect(doc).toContain("验收命令没有留下任何输出。");
+    expect(doc).not.toContain("验收输出：");
+  });
+
   it("keeps the tail of a long acceptance output and says where the whole of it is", () => {
     const output = `${"头".repeat(5_000)}${"尾".repeat(1_500)}`;
     const doc = renderRwork({ ...base, feedback: { kind: "acceptance", command: "npm test", exitCode: 1, output } });

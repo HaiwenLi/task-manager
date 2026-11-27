@@ -41,7 +41,7 @@ function clip(text: string): string {
  */
 function acceptanceOutputLines(output: string, tasksDir: string, id: string): string[] {
   const normalized = output.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  if (normalized === "") return ["验收命令没有留下任何输出。"];
+  if (normalized.trim() === "") return ["验收命令没有留下任何输出。"];
   const omitted = Array.from(normalized).length - REWORK_OUTPUT_CHARS;
   if (omitted > 0) {
     return [
@@ -136,6 +136,9 @@ function bodyLines(feedback: ReworkFeedback, id: string, tasksDir: string): stri
   }
   // A document an earlier attempt wrote, reproduced from its first `## ` on: it
   // is carried under this attempt's header, never with a second `# ` heading.
+  // The carried body may already hold an escalation block from the attempt
+  // that wrote it, and this attempt's own, if it gives one, follows it as a
+  // second such section.
   const whole = feedback.markdown.replace(/\n$/, "").split("\n");
   const start = whole.findIndex((line) => line.startsWith("## "));
   return whole.slice(start);
