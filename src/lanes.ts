@@ -71,7 +71,7 @@ export async function readLaneExamples(tasksDir: string): Promise<LaneExample[]>
 
 function isLaneExample(value: Partial<LaneExample>): value is LaneExample {
   return isLane(value.lane)
-    && typeof value.type === "string" && value.type in TEMPLATES
+    && typeof value.type === "string" && Object.hasOwn(TEMPLATES, value.type)
     && typeof value.id === "string" && typeof value.at === "string"
     && typeof value.title === "string" && typeof value.intent === "string"
     && typeof value.criteria === "number";

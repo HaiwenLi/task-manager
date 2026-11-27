@@ -57,7 +57,8 @@ describe("lane examples on disk", () => {
     await mkdir(join(root, ".taskctl"), { recursive: true });
     await writeFile(lanesPath(dir), [
       JSON.stringify(example()), "{ torn write",
-      JSON.stringify({ id: "x", at: "2026-11-25T02:00:00.000Z", lane: "tiny", type: "code", title: "x", intent: "x", criteria: 0 }), "",
+      JSON.stringify({ id: "x", at: "2026-11-25T02:00:00.000Z", lane: "tiny", type: "code", title: "x", intent: "x", criteria: 0 }),
+      JSON.stringify({ id: "proto", at: "2026-11-25T02:00:00.000Z", lane: "simple", type: "constructor", title: "x", intent: "x", criteria: 0 }), "",
     ].join("\n"), "utf8");
     expect((await readLaneExamples(dir)).map((record) => record.id)).toEqual(["002-typo"]);
   });
@@ -141,7 +142,7 @@ describe("taskctl add records the declared lane", () => {
 describe("renderLanes", () => {
   it("groups by lane in the fixed order, oldest first inside a group, and prints the intent when it says more than the title", () => {
     expect(renderLanes([
-      example({ id: "002-typo", intent: "修 README 错字\n不要动别的文件" }),
+      example({ id: "002-typo", intent: "修 README 错字\r\n不要动别的文件\r再检查一遍" }),
       example({ id: "001-merge", at: "2026-11-25T01:00:00.000Z", lane: "quick", type: "office", title: "合并两列", intent: "合并两列", criteria: 0 }),
       example({ id: "003-login", at: "2026-11-25T02:30:00.000Z", title: "重构登录模块", intent: "重构登录模块", criteria: 3 }),
     ])).toEqual([
@@ -149,7 +150,7 @@ describe("renderLanes", () => {
       "  2026-11-25  001-merge  office  criteria=0  合并两列",
       "lane simple (2)",
       "  2026-11-25  002-typo  code  criteria=1  修 README 错字",
-      "      修 README 错字 / 不要动别的文件",
+      "      修 README 错字 / 不要动别的文件 / 再检查一遍",
       "  2026-11-25  003-login  code  criteria=3  重构登录模块",
       "lane complex (0)",
       "  (none)",

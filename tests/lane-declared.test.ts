@@ -81,7 +81,7 @@ describe("taskctl add requires the lane", () => {
     expect(await new TaskStore(dir).get("001-a")).toMatchObject({ status: "open", complexity: "simple", execution: "continuous" });
   });
 
-  it("asks once on a terminal and takes the answer as the lane", async () => {
+  it("asks once through the terminal seam and takes the answer as the lane", async () => {
     const questions: string[] = [];
     const askLane = vi.fn(async (question: string) => { questions.push(question); return " Simple "; });
     const code = await runCli(["add", "修 README 错字", "--tasks-dir", dir, "--id", "002-b"], { askLane, ...silent, adapter: clarifier([]) });

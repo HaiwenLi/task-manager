@@ -32,7 +32,8 @@ control](../superpowers/specs/2026-11-25-model-trouble-and-operator-control-desi
 - `classification.json` records the declared lane with
   `source: "operator"`. There is no proposed lane, and nothing to count as
   an escalation.
-- Every `taskctl add` appends one line to `.taskctl/lanes.jsonl`: id, time,
+- Every `taskctl add` that declares a lane and gets a task onto the board
+  appends one line to `.taskctl/lanes.jsonl`: id, time,
   lane, task type, title, the intent (bounded) and the number of criteria.
   `taskctl lanes` prints them grouped by lane.
 - `detectComplexity` is removed.
@@ -57,3 +58,7 @@ control](../superpowers/specs/2026-11-25-model-trouble-and-operator-control-desi
 The operator can still declare the wrong lane; escalation during the run
 (ADR-0009) is what catches that, as before. Examples accumulate only where
 `add` is used: tasks written by hand or published by `split` record none.
+The file is best-effort evidence, not a census: an `add` refused for a
+missing lane or by the budget guard records nothing, a crash between the
+task write and the append or a failed append loses that one example, and
+`criteria: 0` means either the clarify session failed or extraction did.
