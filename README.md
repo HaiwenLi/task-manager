@@ -407,7 +407,7 @@ watch 用文件事件（250ms 去抖）和 30 秒兜底扫描发现新任务；�
 
 渲染检查（无头浏览器）今天不是可取消的执行：`--now` 落在它身上时会打印一行 `stop-requested`，等它自己结束（每一步有 30 秒上限），然后同样不判定、任务回到 `open`。记忆召回（`memory.backend` 为 `mempalace` 时，每个 attempt 第一个回合之前的一次查询）也不是可取消的执行：同样先打印一行 `stop-requested`，等它自己结束（上限是 `memory.timeoutMs`，默认 20 秒），然后不派发任何回合、任务回到 `open`。
 
-Windows 上，取消时会用系统自带的 Windows PowerShell 列一次进程表，核对根进程之下是否还有活着的进程，再等输出管道关闭；列不出来（PowerShell 不可用）时，`taskkill` 的报告只顶替「后代是否都已消失」这一步，输出管道仍要关闭。父进程在取消开始前就已退出的「孤儿」进程无法归属（见 ADR-0007：不按旧 PID 杀进程），仍按 `uncertain` 处理。非 Windows 平台按进程组终止，不做进程表核对。为了让 Ctrl-C 只到达控制器，`run` / `watch` 把 `opencode run`、验收命令的 shell、`opencode api` 调用（护栏读取模型目录、遥测、取消时的 `session.interrupt`）以及记忆召回的 MCP 服务器都启动在控制器的按键到不了的地方：Windows 上各自开一个隐藏的控制台，其它平台各自一个进程组；Windows 上没有改用不带控制台的独立进程，是因为它们启动的程序会因此拿不回输出。
+Windows 上，取消时会用系统自带的 Windows PowerShell 列一次进程表，核对根进程之下是否还有活着的进程，再等输出管道关闭；列不出来（PowerShell 不可用）时，`taskkill` 的报告只顶替「后代是否都已消失」这一步，输出管道仍要关闭。父进程在取消开始前就已退出的「孤儿」进程无法归属（见 ADR-0007：不按旧 PID 杀进程），仍按 `uncertain` 处理。非 Windows 平台按进程组终止，不做进程表核对。为了让 Ctrl-C 只到达控制器，`run` / `watch` 把 `opencode run`、验收命令的 shell、`opencode api` 调用（护栏读取模型目录、遥测、取消时的 `session.interrupt`）、记忆召回的 MCP 服务器，以及控制器等待的每一个 `git` 子进程（回合后清扫读未跟踪文件、复核读改动清单、领取时读工作区的 Git 公共目录），都启动在控制器的按键到不了的地方：Windows 上各自开一个隐藏的控制台，其它平台各自一个进程组；Windows 上没有改用不带控制台的独立进程，是因为它们启动的程序会因此拿不回输出。
 
 watch 严格串行，不读 `parallel`。调度边界出错——某个已注册任务文件写坏、依赖成环、选中的任务被别的控制器先领走——不会让 watch 退出：它报出原因并等下一次事件，看板修好后自动恢复，期间 `stop` 仍然有效。
 
@@ -556,8 +556,6 @@ taskctl retry --task <id>       # 归档旧证据后重开；仅在 attempt 已 
 **worker 崩溃 / 不确定执行** —— 先核实原控制器、子进程树与后端会话均已停止，再检查产物。保留证据后，人工归档旧 `attempt.json` 和对应工作目录预留，再按需重开任务。不能仅按旧 PID 杀进程、删任务锁或改 `status` 后自动重跑。互斥目录 `.mutation.lock` 若因崩溃遗留也必须先确认原操作已停止，不能按时间强抢。
 
 **stop --now 之后任务仍是 blocked** —— 看 `attempt.json`：`phase` 是 `uncertain` 说明取消没能在 8 秒内确认（服务不应答、进程树里有够不着的进程），按上面的「worker 崩溃 / 不确定执行」处理；`phase` 是 `settled` 且 `reason` 是 `stopped by operator` 才是干净的中断，此时任务已是 `open`，不需要 `retry`（例外：干净中断的若是 `retry --review-only` 的恢复，任务回到 `blocked`，`review-pending.json` 原样保留，仍可再用 `retry --review-only` 恢复）。
-
-**Ctrl-C 恰好落在 git 子进程上时任务会是 blocked** —— 读摘要、读改动清单的 git 子进程（每次不到一秒）与控制器共用控制台：按键恰好落在它身上时它随按键结束，控制器把这一步的失败读作控制器错误——任务停在 `blocked`，journal 里有一条 `controller-error`；`taskctl retry` 即可。`stop --now` 写的是文件，不结束任何子进程，没有这一种。
 
 **在 PowerShell 里按 Ctrl-C 之前，别把控制器的输出接进管道或重定向** —— 用 `| Tee-Object`、`> log`、`*> file` 接住 `run` / `watch` 的输出时，按键被处理（控制器照常打出 `SIGINT received`）之后，PowerShell 随即把这条原生命令当作自己管道的一员杀掉（2026-11-27 实测，pwsh 7.6.10 与 Windows PowerShell 5.1）：pwsh 7.6.10 上真 taskctl 的提示符 0.37 秒就回来、`$LASTEXITCODE` 是 `-1`（同一格换上替身入口是 0.38 秒，Windows PowerShell 5.1 上的替身入口是 0.47 秒，退出码同样是 `-1`），停止请求文件没写，`attempt.json` 停在 `active`，任务停在 `running`，`watch.lock` 残留，回合的 worker 进程也留在那里。同一个假入口被杀得一模一样，所以这是 PowerShell 的行为，不是 taskctl 的；但它留下的是一个未结算的尝试——按上文「worker 崩溃 / 不确定执行」处理，`retry` 会拒绝，不会被当成干净的停止。要留输出，就别把命令接进管道或重定向：`run` 有 `--log <file>`；`watch` 和 `retry --review-only` 没有这个选项（`watch --log` 被当作未知选项拒绝、退出 2），它们每个任务的事件行照旧写进 `tasks/<id>/logs/run-<时间>.log`，而控制器自己的行——例如 `[watch] stopped by the operator: a; run again to continue`——只打到控制台、不在任何文件里。
 

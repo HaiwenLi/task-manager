@@ -4,22 +4,49 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import type { SpawnOptions } from "node:child_process";
+import { execFile, type ChildProcess, type ExecFileOptions, type SpawnOptions } from "node:child_process";
+import { promisify } from "node:util";
 
 /** Every spawn, recorded and then made for real. */
 const spawns = vi.hoisted(() => [] as Array<{ file: string; options: SpawnOptions }>);
+/** Every execFile, recorded and then made for real; the options carry what the caller spread in (`detached` among them). */
+const execs = vi.hoisted(() => [] as Array<{ file: string; options: ExecFileOptions & { detached?: boolean } }>);
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
+  // The factory runs above the imports: `node:util` comes in here, not from the file.
+  const { promisify } = await import("node:util");
   const recorded = (file: string, args: readonly string[] = [], options: SpawnOptions = {}) => {
     spawns.push({ file, options });
     return actual.spawn(file, args, options);
   };
-  return { ...actual, spawn: recorded };
+  // The `git` helpers in `src/` keep `promisify(execFile)` from module load,
+  // and Node's promisify answers through the `promisify.custom` symbol, so the
+  // wrapper carries it as well; both forms record and forward to the real ones.
+  const realExecFile = actual.execFile as unknown as (
+    file: string, args?: readonly string[], options?: ExecFileOptions,
+    callback?: ((error: Error | null, stdout: string, stderr: string) => void) | undefined,
+  ) => ChildProcess;
+  const promised = promisify(actual.execFile);
+  const recordedExecFile = Object.assign(
+    (file: string, args: readonly string[] = [], options: ExecFileOptions = {}) => {
+      execs.push({ file, options });
+      return realExecFile(file, args, options);
+    },
+    {
+      [promisify.custom]: (file: string, args: readonly string[] = [], options: ExecFileOptions = {}) => {
+        execs.push({ file, options });
+        return promised(file, args, options);
+      },
+    },
+  );
+  return { ...actual, spawn: recorded, execFile: recordedExecFile };
 });
 
 import * as acceptance from "../src/acceptance.js";
 import { insulatedSpawnOptions } from "../src/execution.js";
+import { sweepRoot } from "../src/artifacts.js";
+import { collectChangeEvidence } from "../src/changes.js";
 import { OpenCodeAdapter } from "../src/adapters/opencode.js";
 import type { MemorySettings } from "../src/memory.js";
 import { callTools } from "../src/mcp-client.js";
@@ -27,6 +54,7 @@ import type { StopNow } from "../src/stop.js";
 import type { Task } from "../src/task-file.js";
 import { TaskStore } from "../src/task-store.js";
 import { runTask, type WorkerConfig } from "../src/worker.js";
+import { reserveWorkspace, type WorkspaceReservation } from "../src/workspace.js";
 import { runCli } from "../src/cli.js";
 import { writeRuntime } from "../src/runtime.js";
 import { buildTaskFile } from "./helpers/task-fixture.js";
@@ -51,6 +79,7 @@ beforeEach(async () => {
   store = new TaskStore(tasks);
   cfg = workerConfigFixture({ tasksDir: tasks, workdir: work, lockTtlMs: 5_000, heartbeatMs: 1_000 });
   spawns.length = 0;
+  execs.length = 0;
 });
 afterEach(async () => { await rm(cwd, { recursive: true, force: true }); });
 
@@ -91,6 +120,38 @@ it("the gate and the agent CLI are insulated only when the controller asks", asy
   await new OpenCodeAdapter({ bin: process.execPath, binArgsPrefix: [fake], insulated: true }).modelCatalog!();
   expect(spawns.at(-1)?.options).toMatchObject(INSULATED);
   if (process.platform === "win32") expect(spawns.at(-1)?.options.detached).not.toBe(true);
+});
+
+it("the git children a controller waits for are insulated", async () => {
+  // A real repository: the three reads answer from Git itself, not from a failure path.
+  await promisify(execFile)("git", ["init", work]);
+
+  // The review's changes read (status, then the diffstat — both `git` children).
+  const evidence = await collectChangeEvidence(work);
+  expect(evidence.status).not.toContain("不可用");
+  expect(execs.at(-1)?.file).toBe("git");
+  expect(execs.at(-1)?.options).toMatchObject(INSULATED);
+  if (process.platform === "win32") expect(execs.at(-1)?.options.detached).not.toBe(true);
+
+  // The workspace reservation's common-dir read.
+  let reservation: WorkspaceReservation | null = null;
+  try {
+    reservation = await reserveWorkspace(work, "insulation", join(cwd, "registry"));
+    expect(reservation).not.toBeNull();
+    expect(execs.at(-1)?.file).toBe("git");
+    expect(execs.at(-1)?.options).toMatchObject(INSULATED);
+    if (process.platform === "win32") expect(execs.at(-1)?.options.detached).not.toBe(true);
+  } finally {
+    await reservation?.release();
+  }
+
+  // The sweep's untracked read: a new root log file gives it a candidate.
+  await writeFile(join(work, "run.log"), "litter\n");
+  const sweep = await sweepRoot({ workdir: work, scratchDir: join(cwd, "scratch"), before: new Set(), patterns: ["*.log"], keepAtRoot: [] });
+  expect(sweep.moved).toEqual([{ from: join(work, "run.log"), to: join(cwd, "scratch", "run.log") }]);
+  expect(execs.at(-1)?.file).toBe("git");
+  expect(execs.at(-1)?.options).toMatchObject(INSULATED);
+  if (process.platform === "win32") expect(execs.at(-1)?.options.detached).not.toBe(true);
 });
 
 it("an insulated gate's output comes back through the pipes", async () => {
