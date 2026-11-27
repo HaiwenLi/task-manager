@@ -386,3 +386,38 @@ describe("a failed review", () => {
     expect(await readRwork(tasks, "a")).toBeNull();
   });
 });
+
+describe("a failed render check", () => {
+  const view = (viewport: string, problems: string[]) => ({
+    target: join(work, "index.html"), viewport, ok: problems.length === 0, problems,
+    screenshot: join(tasks, "a", "evidence", `index-${viewport}.png`),
+    measurements: { scrollWidth: 900, clientWidth: 390, textLength: 20, images: 0, brokenImages: 0 },
+  });
+
+  it("is written to rework.md — the only feedback a render failure has ever left — and the turn is pointed at it", async () => {
+    await writeFile(join(tasks, "a.md"), serializeTaskFile(buildTaskFile({ id: "a", title: "任务 A", status: "open", verify: "render", renderTargets: ["index.html"] })), "utf8");
+    vi.mocked(checkRender).mockReset()
+      .mockResolvedValueOnce({ ok: false, browser: "fake", at: "2026-11-25T10:00:00.000Z", views: [view("390x844", ["overflow"]), view("1440x900", ["script-error"])] })
+      .mockResolvedValue({ ok: true, browser: "fake", at: "2026-11-25T10:00:01.000Z", views: [view("1440x900", [])] });
+    const { turns, adapter } = recorder();
+
+    expect(await runTask(config(), { store, adapter }, await store.get("a"), "w1")).toBe("done");
+
+    expect(turns[1]!.rework).toContain("渲染验收失败");
+    expect(turns[1]!.rework).toContain(`${join(work, "index.html")} @ 390x844: ${PROBLEM_TEXT.overflow}`);
+    expect(turns[1]!.rework).toContain(`${join(work, "index.html")} @ 1440x900: ${PROBLEM_TEXT["script-error"]}`);
+    expect(turns[1]!.rework).toContain(join(tasks, "a", "evidence"));
+    expect(turns[1]!.text).toContain(pointer());
+    expect(await latestNote(tasks, "a")).toBeNull();
+  });
+
+  it("writes nothing when the retry budget, not the worker, ends the attempt", async () => {
+    // The document is tied to the rework turn that follows, not to the verdict.
+    await writeFile(join(tasks, "a.md"), serializeTaskFile(buildTaskFile({ id: "a", title: "任务 A", status: "open", verify: "render", renderTargets: ["index.html"] })), "utf8");
+    vi.mocked(checkRender).mockReset().mockResolvedValue({ ok: false, browser: "fake", at: "2026-11-25T10:00:00.000Z", views: [view("390x844", ["overflow"])] });
+    const { turns, adapter } = recorder();
+    expect(await runTask(config({ retryLimit: 1 }), { store, adapter }, await store.get("a"), "w1")).toBe("blocked");
+    expect(turns).toHaveLength(1);
+    expect(await readRwork(tasks, "a")).toBeNull();
+  });
+});

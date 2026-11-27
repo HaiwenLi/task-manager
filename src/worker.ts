@@ -1885,6 +1885,7 @@ async function acceptRender(
   // record above and this retry spends nothing.
   if (r.deps.stop?.isRequested()) throw new OperatorStoppedError("render check", false);
   if (await fail(r)) return "blocked";
+  r.rework = { kind: "render", failures };
   return "retry";
 }
 
