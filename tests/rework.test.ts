@@ -421,3 +421,96 @@ describe("a failed render check", () => {
     expect(await readRwork(tasks, "a")).toBeNull();
   });
 });
+
+describe("a turn that ends without a completion request", () => {
+  const noCompletion = { sessionId: "s", text: "还在做", exitCode: 0 };
+
+  it("a continuous task's first turn that does not request completion is told why before the next turn", async () => {
+    await seed({ complexity: "simple", execution: "continuous" });
+    const { turns, adapter } = recorder((turn) => (turn === 1 ? noCompletion : undefined));
+
+    expect(await runTask(config(), { store, adapter, acceptance: gate(passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+
+    expect(turns).toHaveLength(2);
+    expect(turns[0]!.rework).toBeNull();
+    expect(turns[1]!.rework).toContain("没有请求完成（没有运行 taskctl done）");
+    expect(turns[1]!.rework).toContain("升级为迭代执行（iterative）");
+    expect(turns[1]!.text).toContain(pointer());
+    expect((await readJournal(tasks, "a")).some((line) => line.event === "escalated")).toBe(true);
+  });
+
+  it("an iterative task working turn by turn is not told it did not pass", async () => {
+    await seed();
+    const { turns, adapter } = recorder((turn) => (turn === 1 ? noCompletion : undefined));
+
+    expect(await runTask(config(), { store, adapter, acceptance: gate(passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+
+    expect(turns).toHaveLength(2);
+    expect(turns[1]!.rework).toBeNull();
+    expect(turns[1]!.text).not.toContain("rework.md");
+    expect(turns[1]!.text).not.toContain("上一回合没有通过");
+  });
+
+  it("a session whose turn budget runs out is told so in the session that replaces it", async () => {
+    await seed();
+    const { turns, adapter } = recorder((turn) => (turn <= 2 ? noCompletion : undefined));
+
+    expect(await runTask(config({ maxTurnsPerSession: 2 }), { store, adapter, acceptance: gate(passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+
+    expect(turns.map((turn) => turn.sessionId)).toEqual([undefined, "s", undefined]);
+    expect(turns[1]!.rework).toBeNull();
+    expect(turns[2]!.rework).toContain("本会话的 2 个回合已用完，仍没有请求完成（没有运行 taskctl done）");
+    expect(turns[2]!.text).toContain(pointer());
+  });
+
+  it("keeps the reasons of a rejection the session was already working on", async () => {
+    await seed();
+    const { turns, adapter } = recorder((turn) => (turn === 2 || turn === 3 ? noCompletion : undefined));
+
+    expect(await runTask(config({ maxTurnsPerSession: 2 }), { store, adapter, acceptance: gate(failed, passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+
+    // Turn 1 fails the gate (a document); turn 2 exhausts the budget on top of it.
+    expect(turns[2]!.rework).toContain("本会话的 2 个回合已用完");
+    expect(turns[2]!.rework).toContain("## 仍然适用的上一轮否决");
+    expect(turns[2]!.rework).toContain("断言失败： expected 2, got 1");
+    // Turn 3 is ordinary progress again: the same document, not a third layer.
+    expect(turns[3]!.rework!.match(/## 仍然适用的上一轮否决/g)).toHaveLength(1);
+    expect(turns[3]!.rework).toContain("本会话的 2 个回合已用完");
+  });
+});
+
+describe("the worker's own ESCALATE reason", () => {
+  it("is written into the document when the worker escalates in a turn that does not request completion", async () => {
+    await seed();
+    const { turns, adapter } = recorder((turn) => (turn === 1 ? { sessionId: "s", text: "范围比预想大\nESCALATE: 产物从一张表变成了三张", exitCode: 0 } : undefined));
+
+    expect(await runTask(config(), { store, adapter, acceptance: gate(passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+
+    expect(turns[1]!.rework).toContain("没有请求完成（没有运行 taskctl done）；你在这一回合里把任务升级了");
+    expect(turns[1]!.rework).toContain("## 你在上一回合提出的升级");
+    expect(turns[1]!.rework).toContain("ESCALATE: 产物从一张表变成了三张");
+    expect(turns[1]!.rework).toContain("此后必须经过独立复核");
+    expect(turns[1]!.text).toContain(pointer());
+  });
+
+  it("travels with a later rejection in the same attempt", async () => {
+    // Turn 1 escalates and asks to be judged; the gate fails. The document
+    // says why the gate failed and repeats the worker's own reason.
+    await seed();
+    const { turns, adapter } = recorder(undefined, undefined, "ESCALATE: 产物从一张表变成了三张");
+
+    expect(await runTask(config(), { store, adapter, acceptance: gate(failed, passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+
+    expect(turns[1]!.rework).toContain("验收命令：npm test");
+    expect(turns[1]!.rework).toContain("## 你在上一回合提出的升级");
+    expect(turns[1]!.rework).toContain("ESCALATE: 产物从一张表变成了三张");
+  });
+
+  it("writes nothing by itself when the worker escalates and passes", async () => {
+    await seed({ complexity: "simple", execution: "continuous" });
+    const { turns, adapter } = recorder(undefined, undefined, "ESCALATE: 产物从一张表变成了三张");
+    expect(await runTask(config(), { store, adapter, acceptance: gate(passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+    expect(turns).toHaveLength(1);
+    expect(await readRwork(tasks, "a")).toBeNull();
+  });
+});
