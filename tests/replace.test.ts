@@ -209,7 +209,7 @@ describe("a file replace the OS refused", () => {
 
     expect(await runTask({ ...config(), retryLimit: 2 }, { store, adapter: reworking, acceptance, review }, await store.get("a"), "a-run")).toBe("done");
     expect(state.refusals.get("rework.md")).toEqual([]);
-    expect(state.attempts.get("rework.md")).toBeGreaterThanOrEqual(2);
+    expect(state.attempts.get("rework.md")).toBe(2);
     expect(prompts).toHaveLength(2);
     expect(prompts[1]).toContain(`先读 \`${join(tasks, "a", "rework.md")}\``);
   });
