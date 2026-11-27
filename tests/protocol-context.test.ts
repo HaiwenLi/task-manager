@@ -156,3 +156,41 @@ describe("buildWorkerPrompt — context sections", () => {
     expect(buildWorkerPrompt(task(), { ...sections, fixedSources: "" })).toBe(buildWorkerPrompt(task(), sections));
   });
 });
+
+describe("buildWorkerPrompt — the rework line", () => {
+  const reworkPath = resolve(ctx.taskDir, "rework.md");
+  /** The line as the worker reads it on a rework turn, ending in its own line break. */
+  const line = `- 上一回合没有通过。开始之前先读 \`${reworkPath}\`：里面写了原因，以及必须改什么。\n`;
+
+  it("points a rework turn at rework.md with exactly one line, and puts nothing of the document into the prompt", () => {
+    const plain = buildWorkerPrompt(task(), base);
+    const prompt = buildWorkerPrompt(task(), { ...base, rework: reworkPath });
+
+    // The only difference from the prompt without it is that one line.
+    expect(prompt).toBe(plain.replace("## 工作规则\n", `## 工作规则\n${line}`));
+    // The first bullet of the work rules: `- 工作目录` stays the second.
+    expect(prompt).toContain(`## 工作规则\n${line}- 工作目录：${ctx.workdir}；只在此目录内改动`);
+    // One line more than the prompt without it, and still three taskctl
+    // invocations and no brace: the pointer is a path, not a command and not
+    // the document.
+    expect(prompt.split("\n")).toHaveLength(plain.split("\n").length + 1);
+    expect(prompt.match(/--tasks-dir/g)).toHaveLength(3);
+    expect(prompt).not.toMatch(/[{}]/);
+  });
+
+  it("leaves the prompt byte-identical when the path is absent or empty", () => {
+    expect(buildWorkerPrompt(task(), { ...base, rework: undefined })).toBe(buildWorkerPrompt(task(), base));
+    expect(buildWorkerPrompt(task(), { ...base, rework: "" })).toBe(buildWorkerPrompt(task(), base));
+    // With every other section supplied as well: nothing is left where the line would stand.
+    const sections = { ...base, spec: "S", profile: "P", feedback: "F", memory: "M", fixedSources: "X" };
+    expect(buildWorkerPrompt(task(), { ...sections, rework: "" })).toBe(buildWorkerPrompt(task(), sections));
+  });
+
+  it("carries no pointer when no rework is pending, whatever the handoff says", () => {
+    for (const handoff of [undefined, "上一段完成了协议模板的中文标点校验。"]) {
+      const prompt = buildWorkerPrompt(task(), { ...base, handoff });
+      expect(prompt).not.toContain("rework.md");
+      expect(prompt).not.toContain("上一回合没有通过");
+    }
+  });
+});

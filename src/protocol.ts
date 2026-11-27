@@ -36,6 +36,12 @@ export type WorkerPromptContext = {
   feedback?: string;
   /** What memory recall found, verbatim. Absent or empty: no memory section. */
   memory?: string;
+  /**
+   * Absolute path of `tasks/<id>/rework.md` on a rework turn: the document
+   * that says why the previous turn was sent back and what has to change.
+   * The prompt carries the path, never the content. Absent or empty: no line.
+   */
+  rework?: string;
 };
 
 /** Shown instead of a handoff note when the task is on its first session. */
@@ -85,6 +91,11 @@ const memoryBody = (memory: string | undefined): string | undefined =>
  * this project, relevant corrections and recalled memory. In that order the
  * 70/30 clip keeps the task, the spec and the handoff, and gives up the
  * middle first.
+ *
+ * One optional line sits in the work rules themselves. On a rework turn
+ * the first bullet points the worker at `rework.md` (`ctx.rework`, the
+ * file's absolute path); the document itself is never put into the prompt.
+ * Absent or empty, it leaves nothing, not even a line break.
  */
 export function buildWorkerPrompt(task: Task, ctx: WorkerPromptContext): string {
   const handoff = ctx.handoff ?? FIRST_SESSION_PLACEHOLDER;
@@ -93,7 +104,7 @@ export function buildWorkerPrompt(task: Task, ctx: WorkerPromptContext): string 
 ${task.description}
 ${section("## 已批准的规格", specBody(ctx.spec))}
 ## 工作规则
-- 工作目录：${ctx.workdir}；只在此目录内改动
+${ctx.rework === undefined || ctx.rework === "" ? "" : `- 上一回合没有通过。开始之前先读 \`${ctx.rework}\`：里面写了原因，以及必须改什么。\n`}- 工作目录：${ctx.workdir}；只在此目录内改动
 - 临时文件与日志一律写 ${ctx.logDir}（环境变量 $TASKCTL_LOG_DIR）；工作目录根目录只放交付物
 - 完成全部要求后，运行：taskctl done --task ${task.id} --tasks-dir "${ctx.tasksDir}"
 - 阶段性发现请随时运行：taskctl note --task ${task.id} --tasks-dir "${ctx.tasksDir}" --status <一句话状态> --done <已完成> --found <关键发现> --next <下一步> --files <逗号分隔文件>
