@@ -557,6 +557,8 @@ taskctl retry --task <id>       # 归档旧证据后重开；仅在 attempt 已 
 
 **stop --now 之后任务仍是 blocked** —— 看 `attempt.json`：`phase` 是 `uncertain` 说明取消没能在 8 秒内确认（服务不应答、进程树里有够不着的进程），按上面的「worker 崩溃 / 不确定执行」处理；`phase` 是 `settled` 且 `reason` 是 `stopped by operator` 才是干净的中断，此时任务已是 `open`，不需要 `retry`（例外：干净中断的若是 `retry --review-only` 的恢复，任务回到 `blocked`，`review-pending.json` 原样保留，仍可再用 `retry --review-only` 恢复）。
 
+**Ctrl-C 恰好落在 git 子进程上时任务会是 blocked** —— 读摘要、读改动清单的 git 子进程（每次不到一秒）与控制器共用控制台：按键恰好落在它身上时它随按键结束，控制器把这一步的失败读作控制器错误——任务停在 `blocked`，journal 里有一条 `controller-error`；`taskctl retry` 即可。`stop --now` 写的是文件，不结束任何子进程，没有这一种。
+
 **在 PowerShell 里按 Ctrl-C 之前，别把控制器的输出接进管道或重定向** —— 用 `| Tee-Object`、`> log`、`*> file` 接住 `run` / `watch` 的输出时，按键被处理（控制器照常打出 `SIGINT received`）之后，PowerShell 随即把这条原生命令当作自己管道的一员杀掉（2026-11-27 实测，pwsh 7.6.10 与 Windows PowerShell 5.1）：pwsh 7.6.10 上真 taskctl 的提示符 0.37 秒就回来、`$LASTEXITCODE` 是 `-1`（同一格换上替身入口是 0.38 秒，Windows PowerShell 5.1 上的替身入口是 0.47 秒，退出码同样是 `-1`），停止请求文件没写，`attempt.json` 停在 `active`，任务停在 `running`，`watch.lock` 残留，回合的 worker 进程也留在那里。同一个假入口被杀得一模一样，所以这是 PowerShell 的行为，不是 taskctl 的；但它留下的是一个未结算的尝试——按上文「worker 崩溃 / 不确定执行」处理，`retry` 会拒绝，不会被当成干净的停止。要留输出，就别把命令接进管道或重定向：`run` 有 `--log <file>`；`watch` 和 `retry --review-only` 没有这个选项（`watch --log` 被当作未知选项拒绝、退出 2），它们每个任务的事件行照旧写进 `tasks/<id>/logs/run-<时间>.log`，而控制器自己的行——例如 `[watch] stopped by the operator: a; run again to continue`——只打到控制台、不在任何文件里。
 
 人工修改共享预留注册表之前，先停止所有使用该注册表的 taskctl 控制器；仅处理已核对身份的那条预留及其本地标记，不清空其他任务的记录。当前没有自动“强制恢复”命令。缺少验收造成的普通待审则补上验收并重开任务即可，不需要清理已正常释放的预留。
