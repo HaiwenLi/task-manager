@@ -845,4 +845,42 @@ No live run belongs to this plan. The clarify prompt changed, and the first real
 
 ## Evidence
 
-Implementation evidence goes here as tasks land, in the form the 2026-11-24 plans use: test counts per file, the full-suite count, and which mutations were killed by which test.
+**Evidence (2026-11-27):** branch `feat/lane-declared-by-operator`, cut from `main`'s `eaee031`; six commits, code tip `539d726` (the five task commits plus one final fix wave). Each task was implemented and reviewed by one fresh subagent (`deepseek/deepseek-flash`, the owner's approval of 2026-11-27), one at a time; the controller re-ran every task's checks and every mutation row from the implementer's machine-readable spec.
+
+| Task | What it left | Its own run |
+| --- | --- | --- |
+| 1 | `src/intake.ts`, `src/cli.ts`, new `tests/lane-declared.test.ts`, eight edited test files | 10 files, **145/145** |
+| 2 | `src/intake.ts`, `src/cli.ts`, `tests/intake.test.ts`, `tests/cli-add.test.ts` | 5 files, **41/41** |
+| 3 | new `src/lanes.ts`, `src/cli.ts`, new `tests/lane-examples.test.ts` | 4 files, **60/60** (the new file 11) |
+| 4 | `src/lanes.ts`, `src/cli.ts`, `tests/lane-examples.test.ts` | 2 files, **34/34** (the lane file 15) |
+| 5 | `docs/adr/0010-lane-declared-by-operator.md`, `README.md`, the dated note on §16.1 | docs only; typecheck/tsc/diff clean; both offline scripts exit 0 |
+
+**Whole suite at the tip: 1174 passed / 13 failed / 1 skipped (1188 tests, 92 files).** The 13 are the process-cancellation tests (`execution` 7, `stop-worker` 3, `self-check` 1, `worker` 1, `spawn-insulation` 1). They fail on `EBUSY: rmdir …\work` and on `cancel()` returning false, because the Windows process listing takes **3.2–3.5 s** against the code's fixed 3000 ms `TREE_LIST_DEADLINE_MS` on this machine (1171 processes, 695 of them the owner's browser). The same single test fails at `eaee031` on `main` checked out in the same shell, and no commit of this plan touches `src/execution.ts`, `src/self-check.ts` or the stop code. At `eaee031` the suite is 1148 passed / 1 skipped; this plan adds 39 tests. **This is the one closing gate that is not green; it is environmental, not the branch, and it is reported to the owner.** Everything else is clean: `npm run typecheck`, `npx tsc --noEmit`, `git diff --check` exit 0; `scripts/smoke.ps1` and `scripts/live-phase2.ps1` in their offline modes exit 0; no process left by those scripts.
+
+**Mutations at the tip** (the four copied specs, every row by machine): 35 rows — Task 1: 14, Task 2: 6, Task 3: 10, Task 4: 5 — **35 applied, 35 killed, 0 survived**, every named killer failed, every control run green before and after its table, every mutated file back at its bytes. Two process artifacts needed re-anchoring after the fix wave (Task 3's M6 `from`, and three `mustFail` titles naming the renamed terminal-seam test); the run above is the final one.
+
+## Found while carrying out (2026-11-27)
+
+- **Task 1 — the call-site count is stale.** The brief says "28 call sites in 6 files at c8e604f"; `tests/direct-model.test.ts` also calls `add` and is not in its file list. The implementer added the lane flags there (test-only, no assertion changed), which the controller accepted.
+- **Task 1 — the record's `model` field.** The brief's literal `cfg.model ?? "(backend-default)"` would regress §16 (parts 1–3 make `add` run on the head of `modelChain`); the committed form keeps `directModel(cfg)`, pinned by `tests/direct-model.test.ts`. Accepted.
+- **Task 2 — two brief defects.** The rule-numbering test's code misses a closing paren; it was implemented in its intended form. M5 does not kill the numbering test as predicted (restoring the template lines adds no numbered rule) — M6 does, and the spec records the observed set rather than the predicted one.
+- **Task 4 — an insertion point read literally.** The brief says "add `lanesCommand` … before the doc comment of `reconcileCommand`"; the implementer inserted it *inside* that comment, so `lanesCommand` carried reconcile's documentation and the text was duplicated. The task review caught it as Important; one fix round removed the three stray lines.
+- **Task 5 — the grep cannot be empty.** `grep -rn detectComplexity src tests` finds Task 1's own comment in `tests/lane-declared.test.ts`; there is no code occurrence, and the brief did not anticipate its own earlier text. The implementer also edited README line 154, where the helper-file list still described the removed `classification.json` fields — an omission from the brief's list, accepted.
+- **The mutation artifacts.** Task 3's `mustFail` were strings (one with a parenthetical annotation), and the fix wave's test rename staled three titles and one `from` anchor. The controller normalised and re-anchored them; the final 35/35 run is the evidence, and the artifacts live in the plan's git-ignored workspace.
+- **The baseline is three plans old.** "Reading this plan" (865 tests at `c8e604f`) predates plans 1–3; the tree at `eaee031` has 1148 tests, and the count before Task 1 was the one from the run, not the line.
+- **The whole-suite gate.** See Evidence: 13 environmental process-cancellation failures, reproduced on `main`, caused by the WMI listing exceeding its 3000 ms deadline on a 1171-process machine. Not papered over; reported.
+
+Parked findings (task and whole-branch reviews; none Critical or Important remains; the owner can overrule any):
+
+1. Task 1: the quoted-reply suffix `("<reply>" is not a lane)` is not asserted — message text only.
+2. Task 1: the `deps.askLane ?? askOnTerminal` join is not exercised through `add` (both halves are tested separately).
+3. Task 1: no test asserts that the quick lane writes no `classification.json` (behaviour unchanged by this plan).
+4. Task 2: a present-but-empty `## 信息充分性` section reads `clear` (presence is text-based; pre-existing).
+5. Task 2: one assertion in the ignore test is vacuous for its line's claim (M1 is still killed by the next line).
+6. Task 2: the rule-numbering regex scans the whole prompt, not the `## 硬规则` block.
+7. Task 3: `readLaneExamples` keeps its own two-line lane predicate rather than importing `isLane`; the plan makes `isLane` private to `intake.ts` on purpose.
+8. Task 3: `task-3-mutations.json` encodes `mustFail` as strings (process artifact, not shipped; the controller's normalised re-run is the evidence).
+9. Task 5: the `分类升级` row's "new records no longer counted" overstates — only the numerator is frozen; the denominator still counts every `classification.json`, so a new board prints `0 / N` with N growing.
+10. Whole-branch re-review: the ADR Limits' `criteria: 0` sentence omits the quick lane (no clarify, no criteria) and an empty-spec clarify — both produce 0 without a failure. Suggested: "…means the quick lane, a failed or empty clarify session, or failed extraction".
+11. Whole-branch re-review: the skip test's name still says "names no lane" though it now also covers an unknown type.
+12. The lane file is best-effort evidence, not a census: a crash between the task write and the append, or a failed append, loses one example (now stated in the ADR Limits, with the hand-written/`split` sentence).
