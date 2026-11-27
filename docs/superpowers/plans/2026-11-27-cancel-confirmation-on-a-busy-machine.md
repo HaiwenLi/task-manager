@@ -1,10 +1,10 @@
 # Cancel Confirmation on a Busy Machine
 
-**Goal:** `cancel()` confirms a killed process tree on this machine (~1 170 processes) and the five cancellation test files stop cascading failures, without weakening ADR-0007's rule that a listed pid the kill left alive is reported, never killed.
+**Goal:** `cancel()` confirms a killed process tree on this machine (~1 260 processes at the time of the diagnosis) and the five cancellation test files stop failing, without weakening ADR-0007's rule that a listed pid the kill left alive is reported, never killed.
 
-**Status:** opened 2026-11-27 at the owner's request after plan 4's closing gate. **Task 1 (diagnosis) is done**; the A/B/C decision is with the owner. No product code was changed — every measurement below patched `src/execution.ts` and restored it (`git status` clean after each run).
+**Status:** opened 2026-11-27 at the owner's request after plan 4's closing gate; Task 1 (diagnosis) done the same night; **ruling A** taken by the owner; Task 2 implemented; Task 3's gates run and green. Product code changed in `src/execution.ts` and `src/worker.ts`; the only test changes are the bounds the measurement showed were below the new worst case (two files) and the two new regressions.
 
-## Evidence (measured 2026-11-27, `main` at `9c03397`)
+## Evidence (measured 2026-11-27, `main` at `9c03397`, then `f89bc71`–`70cfaca` for Task 1)
 
 - `tests/execution.test.ts -t "acceptance cancellation stops descendants and settles within a bound"` with the shipped constants **fails** (7.8 s).
 - The same single test with only the kill utility's internal timer raised (`src/execution.ts`, `stopTree`'s `1500` → `4000`) **passes** (6.05 s).
@@ -14,6 +14,7 @@
 - The five files together — `execution`, `stop-worker`, `self-check`, `worker`, `spawn-insulation` — fail **13 tests** with the shipped constants. The first runs of the day also failed with the kill timer at 4 000, with both the listing deadline (4 500) and the kill timer (4 000) raised, and with `--maxWorkers=1`; that was **contaminated**: every failed run leaves fixture processes (`tests/fixtures/process-tree.mjs`, `gate-tree.mjs`) behind, and by 22:47 there were 57 of them. After clearing them the picture is the table in “Task 1 findings”, and raising the two sub-deadlines turns the five files green.
 - The listing is not the only cost: **`taskkill` itself takes ~1.7 s on this machine** (see Task 1 findings), so the kill utility's own 1 500 ms timer expires before it can finish. That is why `utilityOk` is `false` and the root survives — not only a listing problem.
 - Cost of one listing at this moment (1 171 processes, 695 of them the owner's browser): CIM through Windows PowerShell 3.2–3.5 s; `wmic` 2.4 s; `tasklist /FO CSV` 3.1 s (no parent column); PowerShell `Get-Process` 2.0 s (no parent column).
+- After the fix (working tree on `70cfaca`): the five files **99/99** in 77 s with no leaked fixtures; the whole suite **1189 passed / 1 skipped / 0 failed** in 92 s, **0 processes of the repo left**; a stop with a real tree here spends ~3.2 s listing and ~1.9 s in the utility.
 
 ## Constraints
 
@@ -66,6 +67,17 @@ Left unmeasured: whether A leaves the 7 500/8 000 budget pair honest. The invari
 
 **Recommendation: A**, because it keeps ADR-0007's evidence rule intact in the environment the owner actually uses, and the price is a stop that is already waiting ~2 s for `taskkill` taking ~3.5 s longer. B is the fallback if stop latency matters more than the pid-level evidence; it is the smaller change (no budget/invariant work).
 
+**Ruling (owner, 2026-11-27 night): A.** What was built:
+
+| Constant | Was | Now |
+|---|---|---|
+| `TREE_LIST_DEADLINE_MS` | 3 000 | 4 500 |
+| `TREE_KILL_DEADLINE_MS` (new) | — (a literal 1 500 inside `stopTree`) | 3 500 |
+| `CANCEL_BUDGET_MS` | 7 500 | 9 500 |
+| `CANCEL_DEADLINE_MS` (`src/worker.ts`) | 8 000 | 10 000 |
+
+One deliberate deviation from the sketch: the kill is **not** clamped to what remains of the budget. With 4 500 ms for the listing and two 500 ms settles, a 7 500 ms budget leaves 2 000 ms for a kill measured at 1.7–2.0 s — no margin. The pair was raised instead, and the invariant test now states the real sum (`4 500 + 3 500 + 3 × 500 = 9 500 ≤ 9 500 < 10 000`). The kill deadline became a parameter of `stopTree` with an exported `KillRunner` seam, so the deadline can be tested without depending on this machine's speed.
+
 ## Tasks
 
 ### Task 1: Diagnose the first survivor in each file — **done**
@@ -74,21 +86,39 @@ Left unmeasured: whether A leaves the 7 500/8 000 budget pair honest. The invari
 
 - [x] Ran each of the five files alone with the shipped constants, from a cleaned machine; recorded the first failing test and the four fields the code actually has (`knownNull`, `utilityOk`, `rootGone`, `pipesClosed`); `lineageGone` is `undefined` whenever `known` is null.
 - [x] Found no single survivor to describe: **the kill never happens at all** with the shipped constants (`taskkill` needs ~1.7 s and its timer is 1 500 ms), so the whole tree survives and holds the pipes. Recorded the mechanism in “Task 1 findings”.
-- [ ] Decide A, B or C and write the ruling here. *(Owner's call; recommendation A.)*
+- [x] Decide A, B or C and write the ruling here. **A** (owner, 2026-11-27 night).
 
-### Task 2: Fix, with a failing regression first
+### Task 2: Fix, with a failing regression first — **done**
 
-**Files:** `src/execution.ts`, `tests/execution.test.ts`, `tests/stop-worker.test.ts` (the widened bounds), `src/worker.ts` only if the budget moves.
+**Files:** `src/execution.ts`, `src/worker.ts`, `tests/execution.test.ts`, `tests/stop-worker.test.ts`.
 
-- [ ] Write a regression that fails on the shipped code and passes after: inject a `TreeControl` whose `killTree` resolves `true` after a delay longer than the old timer (the `processExecution` seam already accepts `trees`), and assert the cancel confirms within the new budget. Also pin the real constant, not a literal, in the invariant at `tests/execution.test.ts:339` — today it adds a hard-coded `1_500` that a raised timer would silently invalidate.
-- [ ] Implement the chosen decision: the two sub-deadlines, the kill bounded by the remaining budget (so `CANCEL_BUDGET_MS < CANCEL_DEADLINE_MS` stays true by construction), and only the test bounds that the measurements show are too tight.
-- [ ] Directed mutations: shorten the kill timer back to 1 500 ms, drop the listing deadline back to 3 000 ms, remove the remaining-budget clamp, invert the success condition; each must be killed by the named test.
+- [x] Regression written and seen failing on the shipped code: `platformTreeControl.killTree` against a real node process resolves **false** here (the utility needs ~1.7 s, the cap was 1 500 ms). The plan's suggested shape — a `TreeControl` whose `killTree` resolves late — was wrong: that seam replaces the whole utility, so it cannot fail on the shipped code (recorded below).
+- [x] Implemented: the two sub-deadlines, the kill deadline as a parameter of `stopTree` behind an exported `KillRunner` seam, the budget/deadline pair, and the exact test bounds the measurements showed were too tight (`settles()` 4 000 → 10 000 ms; the four-cancel test 15 000 → 30 000 ms; the invariant at `tests/execution.test.ts` now sums the real constants).
+- [x] Directed mutations, all killed at the tip:
 
-### Task 3: Gates and the record
+| # | Mutation | Killed by |
+|---|---|---|
+| M1 | kill deadline back to 1 500 ms | the real-utility test (and the OpenCode-cancellation tests) |
+| M2 | listing deadline back to 3 000 ms | “the Windows listing finds the live descendants of a real tree” |
+| M3 | budget back to 7 500 ms | “the cancel budget stays inside the attempt's cancel deadline” |
+| M4 | the utility abandoned at the deadline is not killed | “the kill deadline believes a 2 s utility…” |
+| M5 | attempt deadline back to 8 000 ms | “the cancel budget stays inside the attempt's cancel deadline” |
 
-- [ ] The five files alone and together green on this machine; whole suite count recorded (the 13 should disappear).
-- [ ] `npm run typecheck`, `npx tsc --noEmit`, `git diff --check`, the two offline scripts.
-- [ ] One note on ADR-0007's Consequences if the budget or the evidence rule changes; no README change is expected.
+### Task 3: Gates and the record — **done**
+
+- [x] `tests/execution.test.ts` alone: **24/24** (74 s). The five files together: **99/99** (77 s), **0 fixture processes left**.
+- [x] Whole suite: **1189 passed / 1 skipped / 0 failed** (92 s), **0 processes of the repo left**; before the fix it was 1174 passed / 13 failed / 1 skipped. Measured with the fix applied on top of `70cfaca`.
+- [x] `npm run typecheck` 0, `npx tsc --noEmit` 0, `git diff --check` 0; `live-stop.ps1`, `smoke.ps1`, `live-phase2.ps1` all exit 0.
+- [x] ADR note: **none was needed**. ADR-0007 has a *Limits* section and no Consequences, and neither it, nor the design document, nor the README states the cancel budget (`grep` for `7500`/`8000` finds nothing but the historical retro). The numbers live in the constants' comments, which were updated; `README` needs no change, as the plan expected.
+
+## Found while carrying out
+
+- **The diagnosis in the first draft of this plan was wrong about the mechanism.** It said a first survivor "cascades". In fact, with a 1 500 ms cap the kill never runs at all: the utility needs ~1.7 s on this machine. Evidence from a machine still dirty with a previous run's fixtures (57 processes) pointed the wrong way; the numbers only made sense after clearing them and re-running.
+- **Task 1's third premise — "find the first survivor in each file" — had no object.** There is no first survivor; the survivor is the whole tree. The task was still worth doing: it produced the fields and the timing table that selected A.
+- **The regression this plan proposed could not fail on the shipped code.** A `TreeControl` whose `killTree` resolves late replaces the entire utility, timer included, so `processExecution` never consults the 1 500 ms. The real regression is (a) the real utility against a real process on this machine and (b) a `KillRunner` seam with fake timers that pins the deadline's behaviour.
+- **Task 3's "ADR-0007's Consequences" does not exist**; the ADR's sections are Decision, Limits, Recovery, and none carries timings. Nothing was invented to satisfy the checkbox.
+- **A mutation that shortens the kill timer necessarily leaks trees.** The 6 fixture processes counted after the first green suite came from M1's run, not from the suite; the clean rerun left 0. Leftovers must be counted after the last mutation is restored, or cleared before measuring.
+- **The kill's cost is the machine's, not `taskkill`'s startup:** `taskkill /?` answers in 70 ms while killing a live node takes 1.7 s. The raised deadline is sized to the measured cost, and the tests that pin it say so in their comments.
 
 ## Closing gates
 

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,8 +12,11 @@ import {
   parseProcessTable,
   platformTreeControl,
   processExecution,
+  stopTree,
+  TREE_KILL_DEADLINE_MS,
   TREE_LIST_DEADLINE_MS,
   TREE_SETTLE_MS,
+  type KillRunner,
   type TreeControl,
 } from "../src/execution.js";
 import { CANCEL_DEADLINE_MS } from "../src/worker.js";
@@ -154,7 +157,7 @@ it("a backend stop that confirms keeps a cancel out of uncertain; one that fails
     await expect(execution.cancel()).resolves.toBe(false);
     expect(execution.inspect().state).toBe("uncertain");
   }
-}, 15000);
+}, 30000);
 
 it("a client that exits by itself once the service stops the session counts as stopped", async () => {
   // The real shape of a cancelled turn: the service's interrupt ends the run,
@@ -335,7 +338,50 @@ it("a listing the platform did not answer cleanly parses to null", () => {
   expect(parseProcessTable("100,1,2026112509000")).toBeNull();
 });
 
+it("a kill the utility answers after the old 1 500 ms cap is still confirmed", async () => {
+  // The reproduction of the 2026-11-27 failures: on a machine with ~1 260
+  // processes taskkill needs ~1.7 s to do its own enumeration, so a 1 500 ms
+  // cap kills the utility mid-flight and reports an unconfirmed stop.
+  if (process.platform !== "win32") return;
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
+  try {
+    await delay(500); // let the process be created before it is killed
+    await expect(platformTreeControl.killTree(child.pid!)).resolves.toBe(true);
+  } finally {
+    try { child.kill(); } catch { /* already gone */ }
+  }
+}, 20_000);
+
+it("the kill deadline believes a 2 s utility and abandons one that never answers", async () => {
+  // 2 s is what taskkill costs on the machine this plan was opened for; the
+  // default deadline (not one the test chooses) must outlast it. Pinned with
+  // fake timers on purpose: the point is the deadline, not this host's speed.
+  if (process.platform !== "win32") return;
+  const late: KillRunner = (_pid, done) => {
+    const timer = setTimeout(() => done(true), 2_000);
+    return { kill: () => clearTimeout(timer) };
+  };
+  let abandoned = false;
+  const silent: KillRunner = () => ({ kill: () => { abandoned = true; } });
+  vi.useFakeTimers();
+  try {
+    const believed = stopTree(4_000_001, undefined, late);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(believed).resolves.toBe(true);
+
+    const hung = stopTree(4_000_002, undefined, silent);
+    await vi.advanceTimersByTimeAsync(TREE_KILL_DEADLINE_MS - 1);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(hung).resolves.toBe(false);
+    expect(abandoned).toBe(true);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("the cancel budget stays inside the attempt's cancel deadline", () => {
-  expect(TREE_LIST_DEADLINE_MS + 1_500 + 2 * TREE_SETTLE_MS).toBeLessThan(CANCEL_BUDGET_MS);
+  // Listing, kill, the two settle waits, and the pipe wait's own floor: the
+  // worst case a cancel can reach before it answers, which the budget must hold.
+  expect(TREE_LIST_DEADLINE_MS + TREE_KILL_DEADLINE_MS + 3 * TREE_SETTLE_MS).toBeLessThanOrEqual(CANCEL_BUDGET_MS);
   expect(CANCEL_BUDGET_MS).toBeLessThan(CANCEL_DEADLINE_MS);
 });

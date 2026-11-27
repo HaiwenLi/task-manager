@@ -24,9 +24,10 @@ export type TreeControl = {
   killTree(pid: number): Promise<boolean>;
 };
 
-export const TREE_LIST_DEADLINE_MS = 3_000; // the listing
+export const TREE_LIST_DEADLINE_MS = 4_500; // the listing; a busy machine needs 3.2-3.5 s for ~1 260 processes
+export const TREE_KILL_DEADLINE_MS = 3_500; // the kill utility; it answers in ~1.7-2.0 s on the same machine
 export const TREE_SETTLE_MS = 500;          // the root's exit and the descendants' exit after the kill
-export const CANCEL_BUDGET_MS = 7_500;      // the whole cancel; must stay under CANCEL_DEADLINE_MS (8_000, src/worker.ts)
+export const CANCEL_BUDGET_MS = 9_500;      // the whole cancel; must stay under CANCEL_DEADLINE_MS (10_000, src/worker.ts)
 
 export type ProcessEntry = { pid: number; parentPid: number; created: string }; // created: "yyyymmddHHMMSS"
 export type ProcessTable = ReadonlyMap<number, ProcessEntry>;
@@ -196,21 +197,51 @@ function settle(stop: (() => Promise<boolean>) | undefined): Promise<boolean> {
   return stop === undefined ? Promise.resolve(false) : stop().catch(() => false);
 }
 
-/** Both the kill utility and exit confirmation have finite deadlines. */
-async function stopTree(pid: number): Promise<boolean> {
+/** The kill utility's handle: `kill()` abandons it, `done` reports the utility's own verdict. */
+export type KillHandle = { kill(): void };
+/** Runs the platform's kill utility. A seam, so the timer can be tested without a slow machine. */
+export type KillRunner = (pid: number, done: (ok: boolean) => void) => KillHandle;
+
+/** `taskkill /T /F`: starting is cheap, but its own enumeration takes ~1.7 s on a busy machine. */
+export const spawnTaskkill: KillRunner = (pid, done) => {
+  const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+    shell: false,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  killer.once("error", () => done(false));
+  killer.once("close", (code) => done(code === 0));
+  return { kill: () => { try { killer.kill(); } catch { /* already gone */ } } };
+};
+
+/**
+ * Both the kill utility and exit confirmation have finite deadlines. The
+ * deadline is a parameter rather than a literal because it is also a promise
+ * the cancel budget is checked against, and because the utility's cost is the
+ * machine's, not ours.
+ */
+export async function stopTree(
+  pid: number,
+  budgetMs = TREE_KILL_DEADLINE_MS,
+  run: KillRunner = spawnTaskkill,
+): Promise<boolean> {
   if (process.platform === "win32") {
     return new Promise<boolean>((resolve) => {
-      const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
-        shell: false,
-        stdio: "ignore",
-        windowsHide: true,
-      });
-      const timer = setTimeout(() => {
-        killer.kill();
-        resolve(false);
-      }, 1500);
-      killer.once("error", () => { clearTimeout(timer); resolve(false); });
-      killer.once("close", (code) => { clearTimeout(timer); resolve(code === 0); });
+      let settled = false;
+      let timer: NodeJS.Timeout | undefined;
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) clearTimeout(timer);
+        resolve(ok);
+      };
+      const handle = run(pid, finish);
+      if (!settled) {
+        timer = setTimeout(() => {
+          handle.kill();
+          finish(false);
+        }, budgetMs);
+      }
     });
   }
 
@@ -219,7 +250,7 @@ async function stopTree(pid: number): Promise<boolean> {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "ESRCH";
   }
-  const deadline = Date.now() + 1500;
+  const deadline = Date.now() + budgetMs;
   do {
     try { process.kill(-pid, 0); } catch (error) {
       return (error as NodeJS.ErrnoException).code === "ESRCH";
