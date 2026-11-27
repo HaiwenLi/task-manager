@@ -1,5 +1,6 @@
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import * as readline from "node:readline/promises";
 import { LOCK_TTL_MS_DEFAULT } from "./claim.js";
 import { latestNote, writeNote } from "./handoff.js";
 import { TaskStore } from "./task-store.js";
@@ -9,7 +10,7 @@ import { OpenCodeAdapter } from "./adapters/opencode.js";
 import type { AgentAdapter } from "./adapters/types.js";
 import { serializeTaskFile, type Task, type TaskExecution, type TaskVerify, TASK_SCHEMA } from "./task-file.js";
 import { buildFinding } from "./findings.js";
-import { buildClarifyPrompt, detectComplexity, detectType, nextTaskId, parseIntakeAssessment, TEMPLATES, type TaskType } from "./intake.js";
+import { LANES, buildClarifyPrompt, detectType, nextTaskId, parseLane, parseIntakeAssessment, TEMPLATES, type ManagementLane, type TaskType } from "./intake.js";
 import { appendObservation, readProfile } from "./profile.js";
 import { extractCriteria, readSpec, SpecError, writeSpec } from "./spec.js";
 import { appendJournal } from "./journal.js";
@@ -52,6 +53,8 @@ export type CliDeps = {
   stop?: StopNow;
   /** Test seam for SIGINT/SIGTERM; production listens on the process. Never emit a real signal in a test. */
   signals?: SignalSource;
+  /** Test seam for the one lane question `add` asks a terminal; production asks on the terminal. */
+  askLane?: (question: string) => Promise<string | null>;
   /** Test seam for watch filesystem events and timing; production leaves it absent. */
   watch?: WatchOptions;
   /** Test seam for observing watch scheduling; production leaves it absent. */
@@ -255,7 +258,7 @@ export const SIGNAL_EXIT_CODES: Readonly<Record<StopSignal, number>> = { SIGINT:
 
 const USAGE = [
   "usage:",
-  "  taskctl add \"<意图>\" [--type code|office|research|design] [--simple] [--quick] [--verify human|mechanical|render] [--execution continuous|iterative] [--target <a.html,b.html>] [--id <id>] [--config taskctl.json]",
+  "  taskctl add \"<意图>\" (--quick|--simple|--complex) [--type code|office|research|design] [--verify human|mechanical|render] [--execution continuous|iterative] [--target <a.html,b.html>] [--id <id>] [--config taskctl.json]",
   "  taskctl spec --task <id> [--tasks-dir <dir>]",
   "  taskctl split --task <id> [--apply] [--tasks-dir <dir>] [--config taskctl.json]",
   "  taskctl approve --task <id> [--tasks-dir <dir>]",
@@ -307,6 +310,54 @@ async function tasksDirFor(flags: Map<string, string>): Promise<string> {
 async function configFor(flags: Map<string, string>): Promise<ResolvedConfig> {
   const path = flags.get("config") ?? "taskctl.json";
   return { ...resolveConfig(await readConfig(path), path), configPath: path };
+}
+
+/** The one question `add` asks a terminal when the operator gave no lane flag. */
+export const LANE_QUESTION = [
+  "taskctl add needs the lane of this task:",
+  "  quick    no spec and no signature: the intent is the whole definition",
+  "  simple   a spec, no signature: worker, then one review",
+  "  complex  a spec that waits for your signature",
+  "lane (quick/simple/complex):",
+].join("\n");
+
+/** The usage error when the operator declared no lane. */
+const LANE_MISSING = "add requires a lane: pass --quick, --simple or --complex";
+
+/**
+ * Ask the lane on the terminal. Not attached to one, nothing is asked and the
+ * answer is `null` at once; end of input on a terminal is no lane either.
+ */
+export async function askOnTerminal(
+  question: string,
+  input: NodeJS.ReadableStream = process.stdin,
+  output: NodeJS.WritableStream = process.stderr,
+): Promise<string | null> {
+  if ((input as NodeJS.ReadStream).isTTY !== true) return null;
+  const rl = readline.createInterface({ input, output });
+  // End of input is no lane: the question must not wait for ever.
+  const answer = await Promise.race([
+    rl.question(`${question}\n`),
+    new Promise<null>((resolve) => rl.once("close", () => resolve(null))),
+  ]);
+  rl.close();
+  return answer;
+}
+
+/** The lane the operator declared: one flag, else one question; never the wording of the intent. */
+async function declaredLane(flags: Map<string, string>, deps: CliDeps): Promise<ManagementLane> {
+  const given = LANES.filter((lane) => flags.has(lane));
+  if (given.length > 1) {
+    throw new UsageError("--quick, --simple and --complex are mutually exclusive: declare exactly one lane");
+  }
+  if (given.length > 0) return given[0]!;
+  const reply = await (deps.askLane ?? askOnTerminal)(LANE_QUESTION);
+  if (reply === null) throw new UsageError(LANE_MISSING);
+  const lane = parseLane(reply);
+  if (lane === null) {
+    throw new UsageError(`${LANE_MISSING} ("${reply}" is not a lane)`);
+  }
+  return lane;
 }
 
 /**
@@ -378,7 +429,7 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
   }
   switch (command) {
     case "add":
-      checkFlags(command, flags, ["type", "simple", "quick", "verify", "execution", "target", "id", "config", "risk", "workdir", "tasks-dir", "acceptance"], []);
+      checkFlags(command, flags, ["type", "simple", "quick", "complex", "verify", "execution", "target", "id", "config", "risk", "workdir", "tasks-dir", "acceptance"], []);
       return addCommand(positionals, flags, deps, log, err);
     case "spec":
       checkFlags(command, flags, ["task", "tasks-dir", "config"], ["task"]);
@@ -859,6 +910,7 @@ async function addCommand(
   if (intent.length === 0) {
     throw new UsageError("add requires the intent as an argument");
   }
+  const lane = await declaredLane(flags, deps);
   const configPath = flags.get("config") ?? "taskctl.json";
   const cfg = resolveConfig(await readConfig(configPath), configPath);
   const tasksDir = flags.get("tasks-dir") ? resolve(flags.get("tasks-dir")!) : cfg.tasksDir;
@@ -867,7 +919,7 @@ async function addCommand(
   const id = flags.get("id") ?? (await nextTaskId(tasksDir, intent));
   const type = parseType(flags.get("type") ?? detectType(intent));
   const acceptance = flags.get("acceptance");
-  const quick = flags.has("quick");
+  const quick = lane === "quick";
   const verify = parseVerify(flags.get("verify") ?? "human");
   const risk: "normal" | "high" = flags.get("risk") === "high" ? "high" : "normal";
   const renderTargets = (flags.get("target") ?? "")
@@ -885,10 +937,7 @@ async function addCommand(
   if (verify === "render" && renderTargets.length === 0) {
     throw new UsageError("--verify render needs at least one --target <file>");
   }
-  // Quick means "do not wait for a signature", which is what `simple` already
-  // encodes; keeping them in one field avoids a task that claims to be complex
-  // while sitting in `open`.
-  const complexity = quick || flags.has("simple") ? "simple" : detectComplexity(intent);
+  const complexity = lane === "complex" ? "complex" : "simple";
   const execution = flags.has("execution")
     ? parseExecution(flags.get("execution")!)
     : complexity === "simple" ? "continuous" : "iterative";
@@ -978,14 +1027,9 @@ async function addCommand(
     return 1;
   }
   const assessment = parseIntakeAssessment(specText, complexity);
-  const lane = quick ? "quick" : flags.has("simple") ? "simple" : assessment.lane;
-  const selectedComplexity = lane === "complex" ? "complex" : "simple";
-  const selectedExecution = flags.has("execution")
-    ? execution
-    : selectedComplexity === "simple" ? "continuous" : "iterative";
-  await store.updateFields(id, { criteria, complexity: selectedComplexity, execution: selectedExecution });
+  await store.updateFields(id, { criteria });
   await writeRuntime(tasksDir, id, "classification.json", {
-    lane, proposedLane: assessment.laneEscalated ? null : assessment.lane, laneEscalated: assessment.laneEscalated,
+    lane, source: "operator",
     sufficiency: assessment.sufficiency,
     reason: assessment.reason, model: directModel(cfg) ?? "(backend-default)", type, at: new Date().toISOString(),
   });
@@ -1002,7 +1046,7 @@ async function addCommand(
     log(`${id}  draft  needs-information=${questions.length}  ${path}`);
     return 0;
   }
-  if (selectedComplexity === "simple") {
+  if (complexity === "simple") {
     await store.setStatus(id, "open");
   }
   await appendJournal(tasksDir, id, {
@@ -1010,7 +1054,7 @@ async function addCommand(
     event: "spec-drafted",
     detail: `criteria=${criteria.length} lane=${lane} sufficiency=${assessment.sufficiency}`,
   });
-  log(`${id}  ${selectedComplexity === "simple" ? "open" : "draft"}  lane=${lane} criteria=${criteria.length}`);
+  log(`${id}  ${complexity === "simple" ? "open" : "draft"}  lane=${lane} criteria=${criteria.length}`);
   return 0;
 }
 
@@ -1357,7 +1401,7 @@ async function statusCommand(flags: Map<string, string>, log: (line: string) => 
 // `resume` was missing here until 2026-11-24: the usage text and the stop
 // refusal both send the operator to `watch --resume`, but the parser read it
 // as a value flag and exited 2, so a stopped queue could not be restarted.
-const BOOLEAN_FLAGS = new Set(["simple", "quick", "all", "apply", "json", "review-only", "resume", "stuck", "now"]);
+const BOOLEAN_FLAGS = new Set(["simple", "quick", "complex", "all", "apply", "json", "review-only", "resume", "stuck", "now"]);
 
 /** `taskctl board` — rewrite `.taskctl/board.md` and print the same content as a table. */
 async function boardCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {

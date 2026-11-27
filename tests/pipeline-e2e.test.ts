@@ -93,7 +93,7 @@ describe("pipeline end to end through the CLI", () => {
     const agent = scriptedAgent("pass");
 
     const added = await runCli(
-      ["add", "复杂任务：改登录页", "--acceptance", "check", "--config", cfgPath, "--id", "001-login"],
+      ["add", "复杂任务：改登录页", "--acceptance", "check", "--config", cfgPath, "--id", "001-login", "--complex"],
       { ...silent, adapter: agent },
     );
     expect(added).toBe(0);
@@ -125,7 +125,7 @@ describe("pipeline end to end through the CLI", () => {
     // until maxReviewRounds, then blocks. The stall check must not fire here.
     const agent = scriptedAgent("alternating-fail");
     await runCli(
-      ["add", "复杂任务：改登录页", "--acceptance", "check", "--config", cfgPath, "--id", "001-login"],
+      ["add", "复杂任务：改登录页", "--acceptance", "check", "--config", cfgPath, "--id", "001-login", "--complex"],
       { ...silent, adapter: agent },
     );
     await runCli(["approve", "--task", "001-login", "--tasks-dir", tasksDir], silent);

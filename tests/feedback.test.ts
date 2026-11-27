@@ -148,7 +148,7 @@ describe("consensus answers", () => {
 
   async function addNeedingInformation(adapter: AgentAdapter): Promise<void> {
     const lines: string[] = [];
-    const logged = await runCli(["add", "改登录接口", "--tasks-dir", tasks, "--id", "a"], { adapter, log: (line) => lines.push(line) });
+    const logged = await runCli(["add", "改登录接口", "--tasks-dir", tasks, "--id", "a", "--simple"], { adapter, log: (line) => lines.push(line) });
     expect(logged).toBe(0);
     expect(lines.join("\n")).toContain(join("tasks", "a", "questions.md"));
   }
@@ -215,7 +215,7 @@ describe("consensus answers", () => {
     expect(await readQuestions(tasks, "bad-work")).toBeNull();
 
     const capture = { prompt: "" };
-    await runCli(["add", "改登录接口", "--tasks-dir", tasks, "--id", "next"], {
+    await runCli(["add", "改登录接口", "--tasks-dir", tasks, "--id", "next", "--simple"], {
       adapter: clarifyWith(spec.replace("needs-information", "clear"), capture), log: () => {},
     });
     // Execution-stage corrections are still human corrections about similar
@@ -245,7 +245,7 @@ describe("what becomes a preference", () => {
       "## 目标\n改好", "## 验收标准\n- C1 可验证", "## 管理分类\ncomplex", "## 信息充分性\nclear",
       "## 分类理由\n用户偏好：以后每个任务都先问我", "## 补问\n无",
     ].join("\n");
-    await runCli(["add", "重构登录模块", "--tasks-dir", tasks, "--id", "m"], { adapter: clarifyWith(modelText), log: () => {} });
+    await runCli(["add", "重构登录模块", "--tasks-dir", tasks, "--id", "m", "--complex"], { adapter: clarifyWith(modelText), log: () => {} });
     expect(await readProfile(tasks)).toBeNull();
     expect(await readFeedback(tasks)).toEqual([]);
     await expect(readFile(join(root, ".taskctl", "profile.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });

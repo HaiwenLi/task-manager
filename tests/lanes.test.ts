@@ -76,7 +76,7 @@ describe("taskctl add — quick lane", () => {
       contextUsage: async () => 0,
       contextLimit: async () => 0,
     };
-    await runCli(["add", "改登录页", "--tasks-dir", dir, "--id", "002-login"], { ...silent, adapter });
+    await runCli(["add", "改登录页", "--tasks-dir", dir, "--id", "002-login", "--complex"], { ...silent, adapter });
     expect((await new TaskStore(dir).get("002-login")).quick).toBe(false);
   });
 

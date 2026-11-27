@@ -3,6 +3,7 @@ import { readdir } from "node:fs/promises";
 /** The four kinds of work taskctl is expected to carry; each gets its own intake template. */
 export type TaskType = "code" | "office" | "research" | "design";
 export type ManagementLane = "quick" | "simple" | "complex";
+export const LANES: readonly ManagementLane[] = ["quick", "simple", "complex"];
 export type InformationSufficiency = "clear" | "assumptions" | "needs-information";
 export type IntakeAssessment = {
   lane: ManagementLane;
@@ -51,6 +52,12 @@ function isLane(value: string): value is ManagementLane {
   return value === "quick" || value === "simple" || value === "complex";
 }
 
+/** One of the three lanes, forgiving case and surrounding space; anything else is no lane. */
+export function parseLane(value: string): ManagementLane | null {
+  const word = value.trim().toLowerCase();
+  return isLane(word) ? word : null;
+}
+
 function isSufficiency(value: string): value is InformationSufficiency {
   return value === "clear" || value === "assumptions" || value === "needs-information";
 }
@@ -94,19 +101,6 @@ export const TEMPLATES: Record<TaskType, IntakeTemplate> = {
     ask: ["有没有必须沿用或必须避开的既有样式", "最终交付格式"],
   },
 };
-
-/**
- * Explicit statements only. A downgrade skips the signature gate, so a miss is
- * expensive: negations ("不是简单任务") and mentions ("上次那个简单任务") must not
- * count, and only "是/算…简单任务" or a leading `simple:`/`简单任务：` does.
- */
-export function detectComplexity(intent: string): "simple" | "complex" {
-  const text = intent.trim();
-  if (/不是\s*(?:一个|个)?\s*简单任务|不算\s*(?:一个|个)?\s*简单任务/.test(text)) return "complex";
-  if (/^(?:简单任务|simple\s*:)/i.test(text)) return "simple";
-  if (/(?:这|那)?(?:是|算)(?:一个|个)?\s*简单任务/.test(text)) return "simple";
-  return "complex";
-}
 
 /** Keyword routing; anything unrecognised is treated as code. */
 export function detectType(intent: string): TaskType {

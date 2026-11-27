@@ -45,7 +45,7 @@ describe("taskctl add uses the profile", () => {
     await runCli(["learn", "--note", "交付物先给结论再给证据", "--tasks-dir", tasksDir], silent);
     const seen: string[] = [];
     const adapter = capturingAdapter("## 目标\n好\n## 验收标准\n- C1 好\n", seen);
-    await runCli(["add", "改登录页", "--tasks-dir", tasksDir, "--id", "001-login"], { ...silent, adapter });
+    await runCli(["add", "改登录页", "--tasks-dir", tasksDir, "--id", "001-login", "--complex"], { ...silent, adapter });
     expect(seen[0]).toContain("交付物先给结论再给证据");
     expect(seen[0]).toContain("用户偏好档案");
   });

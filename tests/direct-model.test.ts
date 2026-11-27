@@ -62,7 +62,7 @@ describe("the clarify session of add and the planner of split", () => {
     await writeFile(configPath, JSON.stringify({ tasksDir: tasks, workdir: work, modelChain: ["plan/a"] }), "utf8");
     const { adapter, asked } = answering(CLARIFIED);
 
-    expect(await runCli(["add", "整理登录模块并补测试", "--config", configPath, "--id", "001-big"], { log: () => {}, adapter })).toBe(0);
+    expect(await runCli(["add", "整理登录模块并补测试", "--config", configPath, "--id", "001-big", "--complex"], { log: () => {}, adapter })).toBe(0);
     expect(await new TaskStore(tasks).get("001-big")).toMatchObject({ status: "draft" });
     // The answer is not a plan, so `split` rejects it — after asking the planner.
     expect(await runCli(["split", "--task", "001-big", "--config", configPath], { log: () => {}, adapter })).toBe(1);
@@ -91,7 +91,7 @@ describe("the clarify session of add and the planner of split", () => {
       contextUsage: async () => 0, contextLimit: async () => 0,
     };
 
-    expect(await runCli(["add", "整理表格", "--config", configPath, "--id", "003-paid"], { log: () => {}, err: (line) => { errors.push(line); }, adapter: guarded })).toBe(1);
+    expect(await runCli(["add", "整理表格", "--config", configPath, "--id", "003-paid", "--complex"], { log: () => {}, err: (line) => { errors.push(line); }, adapter: guarded })).toBe(1);
 
     expect(errors.join("\n")).toContain(PAID);
     expect(asked).toEqual([]);
@@ -107,7 +107,7 @@ describe("the clarify session of add and the planner of split", () => {
       contextUsage: async () => 0, contextLimit: async () => 0,
     };
 
-    expect(await runCli(["add", "整理表格", "--config", configPath, "--id", "004-allowed"], { log: () => {}, adapter: guarded })).toBe(0);
+    expect(await runCli(["add", "整理表格", "--config", configPath, "--id", "004-allowed", "--complex"], { log: () => {}, adapter: guarded })).toBe(0);
 
     expect(asked).toEqual(["zen/p"]);
     expect(await readRuntime<{ model: string }>(tasks, "004-allowed", "classification.json")).toMatchObject({ model: "zen/p" });

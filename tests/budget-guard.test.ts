@@ -817,7 +817,7 @@ describe("run, add and split through the CLI", () => {
   });
 
   it("add refuses before it writes anything", async () => {
-    expect(await runCli(["add", "整理表格", "--config", config], cli())).toBe(1);
+    expect(await runCli(["add", "整理表格", "--config", config, "--complex"], cli())).toBe(1);
     expect(promptCalls).toBe(0);
     expect(errors.join("\n")).toContain("budget guard refused:");
     expect(errors.join("\n")).toContain("zen/p");
@@ -837,7 +837,7 @@ describe("run, add and split through the CLI", () => {
   it("add with an allowed model goes on to clarify", async () => {
     // config with allowedModels: ["zen/p"]
     config = await writeConfig({ tasksDir: tasks, workdir: work, model: "zen/p", allowedModels: ["zen/p"] });
-    expect(await runCli(["add", "整理表格", "--config", config], cli())).toBe(0);
+    expect(await runCli(["add", "整理表格", "--config", config, "--complex"], cli())).toBe(0);
     expect(promptCalls).toBe(1);
     expect(errors).toEqual([]);
   });
