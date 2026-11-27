@@ -18,7 +18,7 @@ import type { AcceptanceResult } from "./acceptance.js";
 import { createCoalescedRefresh, renderBoardMarkdown, renderBoardTable, writeBoard } from "./board.js";
 import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
-import { appendLaneExample } from "./lanes.js";
+import { appendLaneExample, readLaneExamples, renderLanes } from "./lanes.js";
 import { readRelevantFeedback, recordTaskFeedback, type FeedbackEvent } from "./feedback.js";
 import { readFixedSources, sourcesDetail } from "./context.js";
 import { ADJUDICATED, humanTouches, modelFirstPass, readFlowInput, SIGN_OFF, summarizeFlow, type HumanTouch, type ModelFirstPass } from "./metrics.js";
@@ -278,6 +278,7 @@ const USAGE = [
   "  taskctl reject --task <id> --reason \"…\" [--stage clarify|worker|reviewer] [--tasks-dir <dir>]",
   "  taskctl audit --task <id> --verdict pass|fail [--stage …] [--note \"…\"] [--tasks-dir <dir>]",
   "  taskctl metrics [--tasks-dir <dir>]",
+  "  taskctl lanes [--tasks-dir <dir>]",
   "  taskctl recall (--task <id> | --query <text>) [--config taskctl.json]",
   "  taskctl models [--config taskctl.json]",
   "  taskctl reconcile --task <id> [--tasks-dir <dir>]",
@@ -492,6 +493,9 @@ async function dispatch(argv: string[], deps: CliDeps, log: (line: string) => vo
     case "metrics":
       checkFlags(command, flags, ["tasks-dir", "config"], []);
       return metricsCommand(flags, log);
+    case "lanes":
+      checkFlags(command, flags, ["tasks-dir", "config"], []);
+      return lanesCommand(flags, log);
     case "recall":
       checkFlags(command, flags, ["config", "task", "query"], []);
       return recallCommand(flags, deps, log, err);
@@ -1778,6 +1782,14 @@ async function templateCommand(flags: Map<string, string>, log: (line: string) =
     ...template.ask.map((item) => `- ${item}`),
   ];
   for (const line of lines) log(line);
+  return 0;
+}
+
+/** `taskctl lanes` — every declared lane, grouped. */
+async function lanesCommand(flags: Map<string, string>, log: (line: string) => void): Promise<number> {
+  for (const line of renderLanes(await readLaneExamples(await tasksDirFor(flags)))) {
+    log(line);
+  }
   return 0;
 }
 

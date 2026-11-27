@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendLaneExample, lanesPath, readLaneExamples, type LaneExample } from "../src/lanes.js";
+import { appendLaneExample, lanesPath, readLaneExamples, renderLanes, type LaneExample } from "../src/lanes.js";
 import { runCli } from "../src/cli.js";
 import { TaskStore } from "../src/task-store.js";
 import type { AgentAdapter } from "../src/adapters/types.js";
@@ -135,5 +135,53 @@ describe("taskctl add records the declared lane", () => {
     expect(said.join("\n")).toMatch(/006-q\s+open\s+quick/);
     expect(said.join("\n")).toMatch(/006-q\s+lane example not recorded/);
     expect((await new TaskStore(dir).get("006-q")).status).toBe("open");
+  });
+});
+
+describe("renderLanes", () => {
+  it("groups by lane in the fixed order, oldest first inside a group, and prints the intent when it says more than the title", () => {
+    expect(renderLanes([
+      example({ id: "002-typo", intent: "修 README 错字\n不要动别的文件" }),
+      example({ id: "001-merge", at: "2026-11-25T01:00:00.000Z", lane: "quick", type: "office", title: "合并两列", intent: "合并两列", criteria: 0 }),
+      example({ id: "003-login", at: "2026-11-25T02:30:00.000Z", title: "重构登录模块", intent: "重构登录模块", criteria: 3 }),
+    ])).toEqual([
+      "lane quick (1)",
+      "  2026-11-25  001-merge  office  criteria=0  合并两列",
+      "lane simple (2)",
+      "  2026-11-25  002-typo  code  criteria=1  修 README 错字",
+      "      修 README 错字 / 不要动别的文件",
+      "  2026-11-25  003-login  code  criteria=3  重构登录模块",
+      "lane complex (0)",
+      "  (none)",
+    ]);
+  });
+});
+
+describe("taskctl lanes", () => {
+  it("prints what was declared, through the real command", async () => {
+    await appendLaneExample(dir, example());
+    await appendLaneExample(dir, example({ id: "001-merge", lane: "quick", type: "office", title: "合并两列", intent: "合并两列", criteria: 0 }));
+    const printed: string[] = [];
+    expect(await runCli(["lanes", "--tasks-dir", dir], { log: (line) => printed.push(line) })).toBe(0);
+    expect(printed).toEqual([
+      "lane quick (1)",
+      "  2026-11-25  001-merge  office  criteria=0  合并两列",
+      "lane simple (1)",
+      "  2026-11-25  002-typo  code  criteria=1  修 README 错字",
+      "lane complex (0)",
+      "  (none)",
+    ]);
+  });
+
+  it("prints three empty groups when nothing was ever declared", async () => {
+    const printed: string[] = [];
+    expect(await runCli(["lanes", "--tasks-dir", dir], { log: (line) => printed.push(line) })).toBe(0);
+    expect(printed).toEqual(["lane quick (0)", "  (none)", "lane simple (0)", "  (none)", "lane complex (0)", "  (none)"]);
+  });
+
+  it("is listed in the usage text", async () => {
+    const errors: string[] = [];
+    await runCli([], { log: () => {}, err: (line) => errors.push(line) });
+    expect(errors.join("\n")).toContain("taskctl lanes [--tasks-dir <dir>]");
   });
 });

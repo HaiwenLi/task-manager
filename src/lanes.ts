@@ -80,3 +80,29 @@ function isLaneExample(value: Partial<LaneExample>): value is LaneExample {
 function isLane(value: unknown): value is ManagementLane {
   return typeof value === "string" && (LANES as readonly string[]).includes(value);
 }
+
+/**
+ * The examples grouped by lane, in the fixed order of `LANES`: a header with the
+ * count, one line per example in file order, then — only when the intent says
+ * more than the title — the whole intent on one indented line, its line breaks
+ * turned into `" / "`. An empty group prints `  (none)`: that no examples exist
+ * for a lane is what its reader most needs to see.
+ */
+export function renderLanes(examples: LaneExample[]): string[] {
+  const lines: string[] = [];
+  for (const lane of LANES) {
+    const group = examples.filter((example) => example.lane === lane);
+    lines.push(`lane ${lane} (${group.length})`);
+    if (group.length === 0) {
+      lines.push("  (none)");
+      continue;
+    }
+    for (const example of group) {
+      lines.push(`  ${example.at.slice(0, 10)}  ${example.id}  ${example.type}  criteria=${example.criteria}  ${example.title}`);
+      if (example.intent !== example.title) {
+        lines.push(`      ${example.intent.replace(/\r\n|\r|\n/g, " / ")}`);
+      }
+    }
+  }
+  return lines;
+}
