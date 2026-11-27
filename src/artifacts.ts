@@ -93,7 +93,9 @@ async function untrackedRootNames(workdir: string): Promise<Set<string> | null> 
   let stdout: string;
   try {
     // Out of the console's Ctrl-C: a controller that handles signals waits for
-    // this child, and ending it fails the sweep's step and blocks the task.
+    // this child. Ended by the keypress, it would answer null and leave the
+    // sweep inert: this turn's litter stays at the root, since only a file new
+    // since a turn's own snapshot is ever swept.
     const result = await exec(
       "git",
       ["-C", workdir, "-c", "core.quotepath=false", "status", "--porcelain", "-z", "--ignored=traditional"],

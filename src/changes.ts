@@ -39,7 +39,8 @@ function capLines(text: string, limit: number, label: string): string {
 async function git(cwd: string, args: string[]): Promise<string | null> {
   try {
     // Out of the console's Ctrl-C: a controller that handles signals waits for
-    // this child, and ending it fails the review's step and blocks the task.
+    // this child. Ended by the keypress, it would answer null, and the review
+    // would run on an explicitly unavailable change list.
     const { stdout } = await exec("git", ["-C", cwd, "-c", "core.quotepath=false", ...args], {
       ...insulatedSpawnOptions(),
       maxBuffer: 8 * 1024 * 1024,

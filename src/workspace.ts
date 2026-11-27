@@ -141,7 +141,8 @@ async function gitCommonDir(canonical: string): Promise<string | null> {
     // unknown flag back as a path (realpath then fails). Ask without it and
     // resolve the possibly-relative answer against the -C directory.
     // Out of the console's Ctrl-C: a controller that handles signals waits for
-    // this child, and ending it fails the reservation and blocks the task.
+    // this child, and ending it fails the reservation and blocks the task (the
+    // diagnosis beside it only falls back to the plain path comparison).
     const { stdout } = await exec("git", ["-C", canonical, "rev-parse", "--git-common-dir"], {
       ...insulatedSpawnOptions(),
       env: { ...process.env, LC_ALL: "C" },
