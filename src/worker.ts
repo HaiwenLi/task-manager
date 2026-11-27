@@ -19,7 +19,8 @@ import {
   artifactsOrDefault, logDirOf, scratchDirOf, snapshotRoot, sweepRoot, taskDirOf,
   LOG_DIR_ENV, TASK_DIR_ENV, type ArtifactsConfig, type SweepOutcome,
 } from "./artifacts.js";
-import { definitionDigest, readAttempt, readDefinitionSnapshot, readRuntime, writeDefinitionSnapshot, writeRuntime, type AttemptRecord } from "./runtime.js";
+import { definitionDigest, readAttempt, readDefinitionSnapshot, readRuntime, writeDefinitionSnapshot, writeRuntime, writeRuntimeText, type AttemptRecord } from "./runtime.js";
+import { REWORK_FILE, renderRwork, reworkPathOf, type ReworkFeedback } from "./rework.js";
 import { readSpec } from "./spec.js";
 import { appendJournal, journalTail } from "./journal.js";
 import { chainPosition, readModelRotation, resetRotation, rotateModel, reviewerChain as configuredReviewerChain, taskChain, type Handover, type ModelRole } from "./models.js";
@@ -291,6 +292,8 @@ type Run = {
   budgetUnavailableNoted: boolean;
   /** The lock heartbeat's first write failure was already journaled for this attempt. */
   heartbeatWriteFailureNoted: boolean;
+  /** Why the worker was sent back; null until something does. */
+  rework: ReworkFeedback | null;
 };
 const emit = (r: Run, type: WorkerEventType, detail?: string) => r.deps.onEvent?.({ type, taskId: r.task.id, detail });
 const owned = <T>(r: Run, fn: () => Promise<T>) => withOwnership(r.cfg.tasksDir, r.task.id, r.owner, fn);
@@ -454,7 +457,7 @@ export async function runTask(
   let notifyLost!: () => void;
   const loss = new Promise<void>(resolve => { notifyLost = resolve; });
   const now = new Date().toISOString();
-  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, batch: options.batch, previousSettled: false, sweepSkipNoted: false, budgetUnavailableNoted: false, heartbeatWriteFailureNoted: false,
+  const r: Run = { cfg, deps, task, owner, definition: definitionDigest(task), lost: false, notifyLost, loss, escalated: false, reviewOnly: options.reviewOnly === true, batch: options.batch, previousSettled: false, sweepSkipNoted: false, budgetUnavailableNoted: false, heartbeatWriteFailureNoted: false, rework: null,
     run: cfg.run ?? processRun(),
     record: { attemptId: owner, backend: cfg.agent, workspace: cfg.workdir, startedAt: now, updatedAt: now, phase: "active", operation: "preparing", turnTimeoutMs: cfg.turnTimeoutMs ?? TURN_TIMEOUT_MS_DEFAULT } };
   let reservation: WorkspaceReservation | null = null;
@@ -1346,6 +1349,14 @@ async function noteContext(r: Run, event: string, detail: string): Promise<void>
     });
 }
 
+/**
+ * Write `rework.md` from the rejection the attempt still owes its worker.
+ * The caller holds the task lock and has checked `r.rework !== null`.
+ */
+async function writeRwork(r: Run): Promise<void> {
+  await writeRuntimeText(r.cfg.tasksDir, r.task.id, REWORK_FILE, renderRwork({ task: { id: r.task.id, title: r.task.title }, tasksDir: r.cfg.tasksDir, at: new Date().toISOString(), feedback: r.rework! }));
+}
+
 async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-human"> {
   let sessionId: string | undefined;
   let recordedSession = "", sessionsUsed = r.task.sessions.length, turns = 0;
@@ -1370,6 +1381,7 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
     // Nothing new is dispatched once a stop was observed: the attempt settles instead.
     assertNotStopped(r);
     const note = await latestNote(r.cfg.tasksDir, r.task.id);
+    if (r.rework !== null) await owned(r, () => writeRwork(r));
     const protocol = buildWorkerPrompt(r.task, {
       handoff: note?.markdown, workdir: r.cfg.workdir, tasksDir: r.cfg.tasksDir,
       taskDir: taskDirOf(r.cfg.tasksDir, r.task.id), logDir: logDirOf(r.cfg.tasksDir, r.task.id),
@@ -1379,6 +1391,7 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       ...(context.feedback === undefined ? {} : { feedback: context.feedback }),
       ...(context.fixedSources === undefined ? {} : { fixedSources: context.fixedSources }),
       ...(context.memory === undefined ? {} : { memory: context.memory }),
+      ...(r.rework === null ? {} : { rework: reworkPathOf(r.cfg.tasksDir, r.task.id) }),
     });
     const prompt = r.batch === undefined ? protocol : `${r.batch.preamble}${protocol}`;
     let model: string | undefined;
@@ -1475,8 +1488,8 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
       if (effectiveExecution(r) === "continuous") {
         await escalate(r, "continuous verification failed; iterative rework is required");
       }
-      // The controller just wrote concrete failure feedback. Resume this
-      // same-model session instead of opening a fresh session that cannot see it.
+      // The controller wrote rework.md and the next turn is pointed at it. Resume this
+      // same-model session, which also sees the handoff note.
     } else if (effectiveExecution(r) === "continuous") {
       // One agent turn may contain many tool calls, but a continuous task does
       // not spend dozens of turns discovering whether it needs iteration.
@@ -1766,6 +1779,7 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
       event: "rework",
       detail: `acceptance failed (exit ${result.exitCode ?? "null"}); the worker resumes with the failure output`,
     });
+    r.rework = { kind: "acceptance", command, exitCode: result.exitCode, output: result.output ?? "" };
     return "retry";
   });
   if (outcome === "review") {

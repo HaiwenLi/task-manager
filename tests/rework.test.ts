@@ -1,14 +1,35 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+vi.mock("../src/render.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/render.js")>();
+  return { ...actual, checkRender: vi.fn() };
+});
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { TaskStore } from "../src/task-store.js";
+import { runTask, WRAP_UP_INSTRUCTION, type WorkerConfig } from "../src/worker.js"; // WRAP_UP_INSTRUCTION: T7
+import type { AgentAdapter } from "../src/adapters/types.js";
+import type { AcceptanceResult } from "../src/acceptance.js";
+import type { ReviewResult } from "../src/review.js";
+import { latestNote, writeNote } from "../src/handoff.js"; // writeNote: T7
+import { readJournal } from "../src/journal.js";
+import { serializeTaskFile } from "../src/task-file.js";
+import type { Task } from "../src/task-file.js";
+import { buildTaskFile } from "./helpers/task-fixture.js";
+import { PROBLEM_TEXT, checkRender } from "../src/render.js"; // T5
+import {
+  REWORK_FILE, REWORK_OUTPUT_CHARS, readRwork, renderRwork, reworkPathOf, type ReworkFeedback,
+} from "../src/rework.js";
 import { artifactDigest } from "../src/workspace.js";
 import { writeRuntime, writeRuntimeText } from "../src/runtime.js";
-import { REWORK_FILE, REWORK_OUTPUT_CHARS, readRwork, renderRwork, reworkPathOf, type ReworkFeedback } from "../src/rework.js";
+import { runCli } from "../src/cli.js"; // T7
+import { retryTask } from "../src/reconcile.js"; // T7
 
 let root: string;
 let tasks: string;
 let work: string;
+let store: TaskStore;
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "taskctl-rework-"));
@@ -16,11 +37,78 @@ beforeEach(async () => {
   work = join(root, "work");
   await mkdir(tasks);
   await mkdir(work);
+  store = new TaskStore(tasks);
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await rm(root, { recursive: true, force: true });
 });
+
+const reworkPath = (): string => reworkPathOf(tasks, "a");
+/** How the rework line names the file: 先读, then the absolute path in backticks. */
+const pointer = (): string => `先读 \`${reworkPath()}\``;
+
+function config(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
+  return { tasksDir: tasks, workdir: work, agent: "fixture", contextThreshold: 0.8, retryLimit: 3, lockTtlMs: 5_000, heartbeatMs: 50, ...overrides };
+}
+
+async function seed(overrides: Partial<Task> = {}): Promise<void> {
+  await writeFile(join(tasks, "a.md"), serializeTaskFile(buildTaskFile({
+    id: "a", title: "任务 A", status: "open", acceptance: "npm test", criteria: ["C1 ok", "C2 fine"], ...overrides,
+  })), "utf8");
+}
+
+const failed: AcceptanceResult = { passed: false, exitCode: 1, output: "断言失败： expected 2, got 1", skipped: false };
+const passed: AcceptanceResult = { passed: true, exitCode: 0, output: "ok", skipped: false };
+const passVerdict: ReviewResult = {
+  verdict: "pass", criteria: [{ id: "C1", pass: true, evidence: "ok" }, { id: "C2", pass: true, evidence: "ok" }],
+  externalChanges: [], defects: [], summary: "ok",
+};
+const failVerdict: ReviewResult = {
+  verdict: "fail", criteria: [{ id: "C1", pass: false, evidence: "读了 src/a.ts，看到宽度写死" }, { id: "C2", pass: true, evidence: "ok" }],
+  externalChanges: [], defects: ["🔴 宽度改为自适应"], summary: "未达 C1",
+};
+
+/** An acceptance gate: the first run answers `results[0]`, the second `results[1]`, every later one the last. */
+function gate(...results: AcceptanceResult[]): (command: string, cwd: string) => Promise<AcceptanceResult> {
+  let runs = 0;
+  return async () => results[Math.min(runs++, results.length - 1)]!;
+}
+
+type PromptArgs = Parameters<AgentAdapter["prompt"]>[0];
+type PromptResult = Awaited<ReturnType<AgentAdapter["prompt"]>>;
+type Turn = { text: string; sessionId: string | undefined; model: string | undefined; rework: string | null };
+
+/**
+ * A worker that records, at the start of every turn, what it was given — the
+ * prompt, the session, the model, and whether `rework.md` was on disk — and
+ * then requests completion. `script` may answer a turn differently, `usage`
+ * is what the context probe reports for a session, `text` is the default reply.
+ */
+function recorder(
+  script: (turn: number, args: PromptArgs) => PromptResult | undefined | Promise<PromptResult | undefined> = () => undefined,
+  usage: (sessionId: string) => number = () => 0,
+  text = "done",
+): { turns: Turn[]; adapter: AgentAdapter } {
+  const turns: Turn[] = [];
+  const adapter: AgentAdapter = {
+    prompt: async (args) => {
+      const turn = turns.push({
+        text: args.text, sessionId: args.sessionId, model: args.model,
+        rework: await readFile(reworkPath(), "utf8").catch(() => null),
+      });
+      const answer = await script(turn, args);
+      if (answer !== undefined) return answer;
+      await mkdir(join(tasks, "a"), { recursive: true });
+      await writeFile(join(tasks, "a", "done.requested"), "done");
+      return { sessionId: "s", text, exitCode: 0 };
+    },
+    contextUsage: async (sessionId) => usage(sessionId),
+    contextLimit: async () => 100,
+  };
+  return { turns, adapter };
+}
 
 describe("renderRwork", () => {
   const base = { task: { id: "a", title: "任务 A" }, tasksDir: "T", at: "2026-11-25T10:00:00.000Z" };
@@ -208,5 +296,60 @@ describe("rework.md on disk", () => {
     expect(await artifactDigest(work, [inside])).toBe(before);
     // Control: the file is real, and would count from anywhere else in the tree.
     expect(await artifactDigest(work)).not.toBe(before);
+  });
+});
+
+describe("an acceptance failure", () => {
+  it("is written to rework.md before the rework turn, and that turn — not the first — is pointed at it", async () => {
+    await seed();
+    const { turns, adapter } = recorder();
+
+    expect(await runTask(config(), { store, adapter, acceptance: gate(failed, passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+
+    expect(turns.map((turn) => turn.sessionId)).toEqual([undefined, "s"]);
+    expect(turns[0]!.rework).toBeNull();
+    expect(turns[0]!.text).not.toContain("rework.md");
+    expect(turns[1]!.text).toContain(pointer());
+    // One line pointing at the file: the document itself is not in the prompt.
+    expect(turns[1]!.text).not.toContain("返工说明");
+    expect(turns[1]!.text).not.toContain("## 需要改变什么");
+    expect(turns[1]!.rework).toContain("# 返工说明：任务 A（a）");
+    expect(turns[1]!.rework).toContain("控制器的验收命令失败了（exit 1）。");
+    expect(turns[1]!.rework).toContain("验收命令：npm test");
+    expect(turns[1]!.rework).toContain("断言失败： expected 2, got 1");
+    expect(turns[1]!.rework).toContain(`taskctl done --task a --tasks-dir "${tasks}"`);
+  });
+
+  it("still writes the acceptance-failed handoff note it wrote before", async () => {
+    await seed();
+    const { adapter } = recorder();
+    await runTask(config(), { store, adapter, acceptance: gate(failed, passed), review: async () => passVerdict }, await store.get("a"), "w1");
+    const note = await latestNote(tasks, "a");
+    expect(note?.markdown).toContain("## Status\nacceptance-failed");
+    expect(note?.markdown).toContain("断言失败： expected 2, got 1");
+  });
+
+  it("is written for a continuous task as well, after its escalation", async () => {
+    await seed({ complexity: "simple", execution: "continuous" });
+    const { turns, adapter } = recorder();
+    expect(await runTask(config(), { store, adapter, acceptance: gate(failed, passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+    expect(turns[1]!.rework).toContain("验收命令：npm test");
+    expect(turns[1]!.text).toContain(pointer());
+    expect((await readJournal(tasks, "a")).some((line) => line.event === "escalated")).toBe(true);
+  });
+
+  it("is written again before a turn that follows a crashed rework turn", async () => {
+    // The rework turn dies (exit 1) and the document is lost with it. Nothing
+    // new was rejected, so the turn after it is pointed at the same document.
+    await seed();
+    const { turns, adapter } = recorder(async (turn) => {
+      if (turn !== 2) return undefined;
+      await rm(reworkPath(), { force: true });
+      return { sessionId: "s", text: "进程崩了", exitCode: 1 };
+    });
+    expect(await runTask(config(), { store, adapter, acceptance: gate(failed, passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+    expect(turns).toHaveLength(3);
+    expect(turns[2]!.rework).toContain("控制器的验收命令失败了（exit 1）。");
+    expect(turns[2]!.text).toContain(pointer());
   });
 });

@@ -188,6 +188,31 @@ describe("a file replace the OS refused", () => {
     await expect(renameWithRetry(plan, join(root, "fresh.json"))).resolves.toBeUndefined();
     expect(await readFile(join(root, "fresh.json"), "utf8")).toBe("{}");
   });
+
+  it("is retried while writing the rework document, and the rework turn still happens", async () => {
+    // rework.md is what a rework turn is told to read. A rename of it that
+    // Windows refuses must not cost the turn it was written for.
+    refuse("rework.md", "EPERM");
+    const prompts: string[] = [];
+    const reworking: AgentAdapter = {
+      prompt: async (args) => {
+        prompts.push(args.text);
+        await writeFile(join(tasks, "a", "done.requested"), "done");
+        return { sessionId: "ses-a", exitCode: 0, text: "done" };
+      },
+      contextUsage: async () => 0, contextLimit: async () => 100,
+    };
+    const acceptance = vi.fn()
+      .mockResolvedValueOnce({ passed: false, exitCode: 1, output: "boom", skipped: false })
+      .mockResolvedValueOnce(accepted());
+    const review = async () => ({ verdict: "pass" as const, criteria: [{ id: "C1", pass: true, evidence: "ok" }], externalChanges: [], defects: [], summary: "ok" });
+
+    expect(await runTask({ ...config(), retryLimit: 2 }, { store, adapter: reworking, acceptance, review }, await store.get("a"), "a-run")).toBe("done");
+    expect(state.refusals.get("rework.md")).toEqual([]);
+    expect(state.attempts.get("rework.md")).toBeGreaterThanOrEqual(2);
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain(`先读 \`${join(tasks, "a", "rework.md")}\``);
+  });
 });
 
 describe("the lock heartbeat", () => {
