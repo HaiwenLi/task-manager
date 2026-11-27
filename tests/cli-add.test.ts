@@ -18,6 +18,7 @@ function fakeAdapter(text: string): AgentAdapter {
 
 const silent = { log: () => {} };
 
+/** A spec as a model may still write it: the 管理分类 section is ignored since 2026-11-25 — the lane is the operator's — and is kept here to prove it. */
 function assessedSpec(lane: string, sufficiency = "clear", questions = ""): string {
   return [
     "## 目标\n改好", "## 验收标准\n- C1 可验证",

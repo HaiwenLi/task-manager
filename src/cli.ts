@@ -1026,7 +1026,7 @@ async function addCommand(
     log(`${id}  draft  spec-invalid`);
     return 1;
   }
-  const assessment = parseIntakeAssessment(specText, complexity);
+  const assessment = parseIntakeAssessment(specText);
   await store.updateFields(id, { criteria });
   await writeRuntime(tasksDir, id, "classification.json", {
     lane, source: "operator",
