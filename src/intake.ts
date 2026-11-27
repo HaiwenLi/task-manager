@@ -3,28 +3,19 @@ import { readdir } from "node:fs/promises";
 /** The four kinds of work taskctl is expected to carry; each gets its own intake template. */
 export type TaskType = "code" | "office" | "research" | "design";
 export type ManagementLane = "quick" | "simple" | "complex";
+export const LANES: readonly ManagementLane[] = ["quick", "simple", "complex"];
 export type InformationSufficiency = "clear" | "assumptions" | "needs-information";
 export type IntakeAssessment = {
-  lane: ManagementLane;
-  /** True when `lane` is taskctl's conservative fallback, not the model's own classification. */
-  laneEscalated: boolean;
   sufficiency: InformationSufficiency;
   reason: string;
   questions: string[];
 };
 
-/** Parse the small management header carried beside the spec, conservatively. */
-export function parseIntakeAssessment(
-  markdown: string,
-  fallback: "simple" | "complex",
-): IntakeAssessment {
-  const laneText = firstWord(section(markdown, "管理分类"));
+/** Parse the information-sufficiency header carried beside the spec, conservatively. */
+export function parseIntakeAssessment(markdown: string): IntakeAssessment {
   const sufficiencyText = firstWord(section(markdown, "信息充分性"));
-  // A spec written before these sections existed is not a failed assessment:
-  // it keeps the lane the task was added with.
-  const assessed = laneText !== "" || sufficiencyText !== "";
-  const proposed = isLane(laneText) ? laneText : null;
-  const lane: ManagementLane = proposed ?? (assessed ? "complex" : fallback);
+  // A spec written before the section existed was never judged: it reads as clear.
+  const assessed = sufficiencyText !== "";
   const sufficiency: InformationSufficiency = isSufficiency(sufficiencyText)
     ? sufficiencyText
     : assessed ? "needs-information" : "clear";
@@ -33,11 +24,7 @@ export function parseIntakeAssessment(
     .filter((line) => line.length > 0 && line !== "无" && line !== "（无）")
     .slice(0, 3);
   return {
-    lane,
     sufficiency,
-    // The model gave no usable lane, so taskctl chose the conservative one
-    // itself. That is a classification escalation and is measured as one.
-    laneEscalated: assessed && proposed === null,
     reason: section(markdown, "分类理由").trim().slice(0, 1_000),
     questions,
   };
@@ -49,6 +36,12 @@ function firstWord(text: string): string {
 
 function isLane(value: string): value is ManagementLane {
   return value === "quick" || value === "simple" || value === "complex";
+}
+
+/** One of the three lanes, forgiving case and surrounding space; anything else is no lane. */
+export function parseLane(value: string): ManagementLane | null {
+  const word = value.trim().toLowerCase();
+  return isLane(word) ? word : null;
 }
 
 function isSufficiency(value: string): value is InformationSufficiency {
@@ -94,19 +87,6 @@ export const TEMPLATES: Record<TaskType, IntakeTemplate> = {
     ask: ["有没有必须沿用或必须避开的既有样式", "最终交付格式"],
   },
 };
-
-/**
- * Explicit statements only. A downgrade skips the signature gate, so a miss is
- * expensive: negations ("不是简单任务") and mentions ("上次那个简单任务") must not
- * count, and only "是/算…简单任务" or a leading `simple:`/`简单任务：` does.
- */
-export function detectComplexity(intent: string): "simple" | "complex" {
-  const text = intent.trim();
-  if (/不是\s*(?:一个|个)?\s*简单任务|不算\s*(?:一个|个)?\s*简单任务/.test(text)) return "complex";
-  if (/^(?:简单任务|simple\s*:)/i.test(text)) return "simple";
-  if (/(?:这|那)?(?:是|算)(?:一个|个)?\s*简单任务/.test(text)) return "simple";
-  return "complex";
-}
 
 /** Keyword routing; anything unrecognised is treated as code. */
 export function detectType(intent: string): TaskType {
@@ -169,9 +149,8 @@ export function buildClarifyPrompt(args: { task: { title: string; description: s
     "3. 不许把无法判定的东西写成可判定：每条验收标准必须能落到命令退出码、可观察产物或可引用事实。",
     "4. 验收标准以 C1、C2 编号，一条一行。",
     "5. 不要输出讨论过程、客套话或多个方案对比；只输出下面这份 spec。",
-    "6. 管理分类只能是 quick、simple、complex：quick 是极轻量单步工作；simple 是一次 Worker 后最终 Review；complex 需要拆子任务和/或 Worker→Review→Worker 迭代。分类只决定管理强度，绝不降低 risk、human_check 或验收标准。",
-    "7. 信息充分性只能是 clear、assumptions、needs-information。缺的信息会改变交付物、验收、禁区或风险时才允许 needs-information，并在补问中一次列出最多 3 条。",
-    "8. 历史人工反馈里已有同类问题的回答或纠正时，直接采用并写进「假设」或对应章节，不要再问一遍、不要再犯；只有本次意图与之冲突时才提出来。",
+    "6. 信息充分性只能是 clear、assumptions、needs-information。缺的信息会改变交付物、验收、禁区或风险时才允许 needs-information，并在补问中一次列出最多 3 条。",
+    "7. 历史人工反馈里已有同类问题的回答或纠正时，直接采用并写进「假设」或对应章节，不要再问一遍、不要再犯；只有本次意图与之冲突时才提出来。",
     "",
     "## 模糊表述",
     "把意图里含糊的词（差不多、尽量、大概、尽快、好看）摘出来，给出你的解释和影响面。判断标准：能落成命令或可观察现象才算消歧完成。",
@@ -184,8 +163,6 @@ export function buildClarifyPrompt(args: { task: { title: string; description: s
     "## 边界",
     "## 假设",
     "## 模糊表述",
-    "## 管理分类",
-    "quick、simple、complex 三选一",
     "## 信息充分性",
     "clear、assumptions、needs-information 三选一",
     "## 分类理由",

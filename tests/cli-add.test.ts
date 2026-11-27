@@ -18,6 +18,7 @@ function fakeAdapter(text: string): AgentAdapter {
 
 const silent = { log: () => {} };
 
+/** A spec as a model may still write it: the 管理分类 section is ignored since 2026-11-25 — the lane is the operator's — and is kept here to prove it. */
 function assessedSpec(lane: string, sufficiency = "clear", questions = ""): string {
   return [
     "## 目标\n改好", "## 验收标准\n- C1 可验证",
@@ -30,7 +31,7 @@ describe("taskctl add", () => {
   it("puts a complex intent in draft with spec and criteria", async () => {
     const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
     const adapter = fakeAdapter("## 目标\n改好\n## 验收标准\n- C1 npm test 全绿\n- C2 文案正确\n");
-    const code = await runCli(["add", "重构登录模块", "--tasks-dir", dir, "--id", "001-login"], { ...silent, adapter });
+    const code = await runCli(["add", "重构登录模块", "--tasks-dir", dir, "--id", "001-login", "--complex"], { ...silent, adapter });
 
     expect(code).toBe(0);
     const task = await new TaskStore(dir).get("001-login");
@@ -41,10 +42,10 @@ describe("taskctl add", () => {
     expect(await readSpec(dir, "001-login")).toContain("## 目标");
   });
 
-  it("sends an explicitly simple intent straight to open but still keeps a spec", async () => {
+  it("sends an explicitly simple lane straight to open but still keeps a spec", async () => {
     const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
     const adapter = fakeAdapter("## 目标\n修好\n## 验收标准\n- C1 错字为零\n");
-    const code = await runCli(["add", "这是个简单任务：修 README 错字", "--tasks-dir", dir, "--id", "002-typo"], { ...silent, adapter });
+    const code = await runCli(["add", "这是个简单任务：修 README 错字", "--tasks-dir", dir, "--id", "002-typo", "--simple"], { ...silent, adapter });
 
     expect(code).toBe(0);
     const task = await new TaskStore(dir).get("002-typo");
@@ -56,7 +57,7 @@ describe("taskctl add", () => {
   it("a spec without numbered criteria keeps the task in draft and logs the failure", async () => {
     const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
     const adapter = fakeAdapter("## 目标\n改好\n## 验收标准\n差不多就行\n");
-    const code = await runCli(["add", "重构登录模块", "--tasks-dir", dir, "--id", "003-x"], { ...silent, adapter });
+    const code = await runCli(["add", "重构登录模块", "--tasks-dir", dir, "--id", "003-x", "--complex"], { ...silent, adapter });
 
     expect(code).toBe(1);
     expect((await new TaskStore(dir).get("003-x")).status).toBe("draft");
@@ -70,7 +71,7 @@ describe("taskctl add", () => {
       contextUsage: async () => 0,
       contextLimit: async () => 0,
     };
-    const code = await runCli(["add", "重构登录模块", "--tasks-dir", dir, "--id", "004-y"], { ...silent, adapter });
+    const code = await runCli(["add", "重构登录模块", "--tasks-dir", dir, "--id", "004-y", "--complex"], { ...silent, adapter });
 
     expect(code).toBe(1);
     expect((await new TaskStore(dir).get("004-y")).status).toBe("draft");
@@ -91,25 +92,28 @@ describe("taskctl add", () => {
   it("records an acceptance command given on the command line", async () => {
     const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
     const adapter = fakeAdapter("## 目标\n好\n## 验收标准\n- C1 好\n");
-    await runCli(["add", "改登录页", "--acceptance", "npm test", "--tasks-dir", dir, "--id", "006-login"], { ...silent, adapter });
+    await runCli(["add", "改登录页", "--acceptance", "npm test", "--tasks-dir", dir, "--id", "006-login", "--complex"], { ...silent, adapter });
     expect((await new TaskStore(dir).get("006-login")).acceptance).toBe("npm test");
   });
 
-  it("uses model classification to select a simple continuous lane", async () => {
+  it("the declared simple lane selects a continuous lane; the spec's own claim of a lane changes nothing", async () => {
     const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
-    const adapter = fakeAdapter(assessedSpec("simple"));
-    const code = await runCli(["add", "重构登录模块", "--tasks-dir", dir, "--id", "classified-simple"], { ...silent, adapter });
+    const adapter = fakeAdapter(assessedSpec("complex"));
+    const code = await runCli(["add", "重构登录模块", "--tasks-dir", dir, "--id", "classified-simple", "--simple"], { ...silent, adapter });
 
     expect(code).toBe(0);
     const task = await new TaskStore(dir).get("classified-simple");
     expect(task).toMatchObject({ status: "open", complexity: "simple", execution: "continuous", verify: "human", quick: false });
-    expect(JSON.parse(await readFile(join(dir, "classified-simple", "classification.json"), "utf8"))).toMatchObject({ lane: "simple", proposedLane: "simple", sufficiency: "clear" });
+    const record = JSON.parse(await readFile(join(dir, "classified-simple", "classification.json"), "utf8"));
+    expect(record).toMatchObject({ lane: "simple", source: "operator", sufficiency: "clear" });
+    expect(record).not.toHaveProperty("proposedLane");
+    expect(record).not.toHaveProperty("laneEscalated");
   });
 
   it("keeps needs-information in draft and writes bounded questions", async () => {
     const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
     const adapter = fakeAdapter(assessedSpec("simple", "needs-information", "- Q1\n- Q2\n- Q3\n- Q4"));
-    const code = await runCli(["add", "改登录页", "--tasks-dir", dir, "--id", "needs-info"], { ...silent, adapter });
+    const code = await runCli(["add", "改登录页", "--tasks-dir", dir, "--id", "needs-info", "--simple"], { ...silent, adapter });
 
     expect(code).toBe(0);
     const task = await new TaskStore(dir).get("needs-info");
@@ -119,15 +123,17 @@ describe("taskctl add", () => {
     expect(questions).not.toContain("Q4");
   });
 
-  it("records an unusable model lane as taskctl's own escalation", async () => {
+  it("a lane the spec claims, usable or not, changes nothing: the declared lane stands", async () => {
     const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
     const adapter = fakeAdapter(assessedSpec("tiny"));
-    const code = await runCli(["add", "修 README 错字", "--tasks-dir", dir, "--id", "bad-lane"], { ...silent, adapter });
+    const code = await runCli(["add", "修 README 错字", "--tasks-dir", dir, "--id", "bad-lane", "--complex"], { ...silent, adapter });
 
     expect(code).toBe(0);
     expect(await new TaskStore(dir).get("bad-lane")).toMatchObject({ status: "draft", complexity: "complex", execution: "iterative" });
-    expect(JSON.parse(await readFile(join(dir, "bad-lane", "classification.json"), "utf8")))
-      .toMatchObject({ lane: "complex", proposedLane: null, laneEscalated: true });
+    const record = JSON.parse(await readFile(join(dir, "bad-lane", "classification.json"), "utf8"));
+    expect(record).toMatchObject({ lane: "complex", source: "operator" });
+    expect(record).not.toHaveProperty("proposedLane");
+    expect(record).not.toHaveProperty("laneEscalated");
   });
 
   it("lets an explicit operator lane override model classification", async () => {
@@ -138,7 +144,9 @@ describe("taskctl add", () => {
     expect(code).toBe(0);
     const task = await new TaskStore(dir).get("operator-simple");
     expect(task).toMatchObject({ status: "open", complexity: "simple", execution: "continuous" });
-    expect(JSON.parse(await readFile(join(dir, "operator-simple", "classification.json"), "utf8"))).toMatchObject({ lane: "simple", proposedLane: "complex" });
+    const record = JSON.parse(await readFile(join(dir, "operator-simple", "classification.json"), "utf8"));
+    expect(record).toMatchObject({ lane: "simple", source: "operator" });
+    expect(record).not.toHaveProperty("proposedLane");
   });
 
   it("records an explicit execution policy independent of complexity", async () => {
@@ -158,8 +166,8 @@ describe("taskctl add", () => {
   it("assigns the next numeric id when none is given", async () => {
     const dir = await mkdtemp(join(tmpdir(), "taskctl-add-"));
     const adapter = fakeAdapter("## 目标\n好\n## 验收标准\n- C1 好\n");
-    await runCli(["add", "第一件事", "--tasks-dir", dir], { ...silent, adapter });
-    await runCli(["add", "第二件事", "--tasks-dir", dir], { ...silent, adapter });
+    await runCli(["add", "第一件事", "--tasks-dir", dir, "--complex"], { ...silent, adapter });
+    await runCli(["add", "第二件事", "--tasks-dir", dir, "--complex"], { ...silent, adapter });
     const ids = (await new TaskStore(dir).list()).map((task) => task.id).sort();
     expect(ids).toEqual(["001-task", "002-task"]);
   });

@@ -1,22 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildClarifyPrompt, detectComplexity, detectType, parseIntakeAssessment, TEMPLATES } from "../src/intake.js";
+import { buildClarifyPrompt, detectType, parseIntakeAssessment, TEMPLATES } from "../src/intake.js";
 import { parseTaskFile } from "../src/task-file.js";
-
-describe("detectComplexity", () => {
-  it("only an explicit statement downgrades to simple", () => {
-    expect(detectComplexity("这是个简单任务：修一下 README 的错字")).toBe("simple");
-    expect(detectComplexity("这是一个简单任务")).toBe("simple");
-    expect(detectComplexity("simple: fix typo")).toBe("simple");
-    expect(detectComplexity("简单任务：改个错字")).toBe("simple");
-    expect(detectComplexity("重构登录模块")).toBe("complex");
-    expect(detectComplexity("不太复杂，改个文案")).toBe("complex");
-  });
-
-  it("does not downgrade on a negation or a mere mention", () => {
-    expect(detectComplexity("这不是简单任务，要重构登录模块")).toBe("complex");
-    expect(detectComplexity("上次那个简单任务又出问题了")).toBe("complex");
-  });
-});
 
 describe("detectType", () => {
   it("routes by obvious keywords", () => {
@@ -38,32 +22,33 @@ describe("TEMPLATES", () => {
 });
 
 describe("parseIntakeAssessment", () => {
-  const spec = (lane: string, sufficiency: string, questions = "") => [
+  const spec = (claimedLane: string | null, sufficiency: string, questions = "") => [
     "## 目标", "交付", "## 验收标准", "- C1 可验证",
-    "## 管理分类", lane, "## 信息充分性", sufficiency,
+    ...(claimedLane === null ? [] : ["## 管理分类", claimedLane]),
+    "## 信息充分性", sufficiency,
     "## 分类理由", "依据明确", "## 补问", questions,
   ].join("\n");
 
-  it("parses the management lane and information outcome independently", () => {
-    expect(parseIntakeAssessment(spec("quick", "clear"), "complex")).toMatchObject({ lane: "quick", sufficiency: "clear", reason: "依据明确" });
-    expect(parseIntakeAssessment(spec("simple", "assumptions"), "complex")).toMatchObject({ lane: "simple", sufficiency: "assumptions" });
-    expect(parseIntakeAssessment(spec("complex", "needs-information"), "simple")).toMatchObject({ lane: "complex", sufficiency: "needs-information" });
+  it("keeps the information verdict and the reason, and has no lane to give", () => {
+    expect(parseIntakeAssessment(spec("quick", "clear"))).toEqual({ sufficiency: "clear", reason: "依据明确", questions: [] });
+    expect(parseIntakeAssessment(spec("simple", "assumptions"))).toMatchObject({ sufficiency: "assumptions" });
+    expect(parseIntakeAssessment(spec("complex", "needs-information"))).toMatchObject({ sufficiency: "needs-information" });
   });
 
-  it("falls back conservatively on missing or contradictory assessments", () => {
-    // A spec from before these sections existed keeps the lane it was added
-    // with: nothing was escalated, so nothing is reported as one.
-    expect(parseIntakeAssessment("## 目标\n旧格式", "complex")).toMatchObject({ lane: "complex", sufficiency: "clear", laneEscalated: false });
-    expect(parseIntakeAssessment("## 目标\n旧格式", "simple")).toMatchObject({ lane: "simple", laneEscalated: false });
-    // An unusable lane becomes complex whatever the fallback was, and is
-    // recorded as taskctl's own decision rather than the model's.
-    expect(parseIntakeAssessment(spec("tiny", "clear"), "simple")).toMatchObject({ lane: "complex", laneEscalated: true });
-    expect(parseIntakeAssessment(spec("simple", "perhaps"), "complex")).toMatchObject({ lane: "simple", sufficiency: "needs-information", laneEscalated: false });
+  it("ignores a 管理分类 section, whatever it says, and does not count it as an assessment", () => {
+    expect(parseIntakeAssessment(spec("tiny", "clear")).sufficiency).toBe("clear");
+    // A spec from before the sufficiency section existed was never judged: it reads as clear.
+    expect(parseIntakeAssessment("## 目标\n旧格式")).toEqual({ sufficiency: "clear", reason: "", questions: [] });
+    expect(parseIntakeAssessment("## 目标\n交付\n## 管理分类\nsimple")).toEqual({ sufficiency: "clear", reason: "", questions: [] });
+  });
+
+  it("treats a verdict it cannot read as missing information", () => {
+    expect(parseIntakeAssessment(spec("simple", "perhaps")).sufficiency).toBe("needs-information");
+    expect(parseIntakeAssessment(spec(null, "perhaps")).sufficiency).toBe("needs-information");
   });
 
   it("keeps only three outcome-changing questions", () => {
-    const parsed = parseIntakeAssessment(spec("simple", "needs-information", "- Q1\n- Q2\n- Q3\n- Q4"), "complex");
-    expect(parsed.questions).toEqual(["Q1", "Q2", "Q3"]);
+    expect(parseIntakeAssessment(spec("simple", "needs-information", "- Q1\n- Q2\n- Q3\n- Q4")).questions).toEqual(["Q1", "Q2", "Q3"]);
   });
 });
 
@@ -80,9 +65,17 @@ describe("buildClarifyPrompt", () => {
     expect(prompt).toContain("## 目标");
     expect(prompt).toContain("## 验收标准");
     expect(prompt).toContain("改登录页");
-    expect(prompt).toContain("## 管理分类");
+    expect(prompt).toContain("clear、assumptions、needs-information");
+    expect(prompt).not.toContain("## 管理分类");
+    expect(prompt).not.toContain("管理分类只能是");
+    expect(prompt).not.toContain("quick、simple、complex");
     expect(prompt).toContain("## 信息充分性");
-    expect(prompt).toContain("quick、simple、complex");
+  });
+
+  it("numbers its rules without a gap", () => {
+    const task = parseTaskFile("---\ntitle: x\nstatus: draft\nsessions: []\nretries: 0\n---\n正文", "001-a");
+    const prompt = buildClarifyPrompt({ task, type: "code", profile: null });
+    expect([...prompt.matchAll(/^(\d+)\. /gm)].map((match) => Number(match[1]))).toEqual([1, 2, 3, 4, 5, 6, 7]);
   });
 
   it("injects the profile and bounded human feedback when present", () => {

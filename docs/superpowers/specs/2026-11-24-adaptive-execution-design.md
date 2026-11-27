@@ -554,6 +554,8 @@ offline green must not be presented as live-provider proof.
 
 ### 16.1 Three management lanes
 
+> **2026-11-25 更新**：本节的模型分类已被 [Model trouble and operator control](2026-11-25-model-trouble-and-operator-control-design.md) §12 取代，决策记录见 [ADR-0010](../../adr/0010-lane-declared-by-operator.md)。车道由所有者声明（`--quick` / `--simple` / `--complex`，未给时在终端上问一次）；澄清会话只回答信息充分性与补问，`classification.json` 记 `source: "operator"`。下文保留为当时的决策记录；表格中「Approval」「Execution and finish」两列仍然有效。
+
 The normal `taskctl add` intake produces the spec and the management classification in the same model
 interaction; it does not spend a separate classifier turn. The result is stored in
 `tasks/<id>/classification.json` with the model, lane, short rationale and information-sufficiency
