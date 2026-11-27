@@ -688,4 +688,21 @@ describe("a rework owed beyond the turn that follows", () => {
     expect(turns[1]!.rework).toContain("控制器的验收命令失败了（exit 1）。");
     expect((await readJournal(tasks, "a")).some((line) => line.event === "rework-clear-failed")).toBe(true);
   });
+
+  it("a carried document is pointed at as it was written, and not rewritten", async () => {
+    await seed();
+    // An earlier attempt left this document; its time is its own.
+    const earlier = renderRwork({ task: { id: "a", title: "任务 A" }, tasksDir: tasks, at: "2026-11-25T09:00:00.000Z", feedback: { kind: "acceptance", command: "npm test", exitCode: 1, output: "断言失败： expected 2, got 1" } });
+    await mkdir(join(tasks, "a"), { recursive: true });
+    await writeRuntimeText(tasks, "a", REWORK_FILE, earlier);
+    const { turns, adapter } = recorder((turn) => (turn === 1 ? { sessionId: "s", text: "还在修", exitCode: 0 } : undefined));
+
+    expect(await runTask(config(), { store, adapter, acceptance: gate(passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+
+    expect(turns).toHaveLength(2);
+    expect(turns[0]!.rework).toBe(earlier);
+    expect(turns[1]!.rework).toBe(turns[0]!.rework);
+    expect(turns[1]!.text).toContain(pointer());
+    expect(await readRwork(tasks, "a")).toBeNull();
+  });
 });
