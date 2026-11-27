@@ -48,11 +48,12 @@ export const MAX_SESSIONS_PER_TASK_DEFAULT = 20;
 export const MAX_TURNS_PER_SESSION_DEFAULT = 40;
 /**
  * How long a cancellation may take before the turn counts as "shutdown
- * unconfirmed". A real cancellation is bounded well inside it: the stop of
- * the backend session (4s cap) runs beside the process-tree kill (1.5s cap),
- * then the exit confirmation (0.5s cap).
+ * unconfirmed". A real cancellation is bounded well inside it: the listing of
+ * the tree (4.5s cap) comes first, the backend session's stop (4s cap) runs
+ * beside the process-tree kill (3.5s cap), then the exit confirmations (0.5s
+ * caps). The cancel's own budget (9.5s, src/execution.ts) stays inside it.
  */
-export const CANCEL_DEADLINE_MS = 8_000;
+export const CANCEL_DEADLINE_MS = 10_000;
 export const MAX_REVIEW_ROUNDS_DEFAULT = 2;
 /** Consecutive identical acceptance failures before the task waits for a human. */
 export const FAILURE_FINGERPRINT_LIMIT_DEFAULT = 3;

@@ -121,7 +121,9 @@ const deps = (agent: AgentAdapter, stop: StopNow, overrides: Partial<WorkerDeps>
   ({ store, adapter: agent, acceptance: passAcceptance, stop, onEvent: (event) => { events.push(event); }, ...overrides });
 /** The attempt must end on its own once the stop is observed; a hang is reported, not waited out. */
 function settles<T>(promise: Promise<T>): Promise<T> {
-  return Promise.race([promise, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("the attempt did not settle after the stop")), 4_000))]);
+  // Above the worst case a cancel can take on a busy machine (listing 4.5 s +
+  // kill 3.5 s + settles), so a slow host is not reported as a hang.
+  return Promise.race([promise, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("the attempt did not settle after the stop")), 10_000))]);
 }
 const lockHeld = async (id: string): Promise<boolean> => { try { await readFile(join(tasks, id, "lock.json"), "utf8"); return true; } catch { return false; } };
 /** The workspace is free again exactly when a fresh reservation succeeds. */
