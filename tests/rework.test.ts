@@ -513,6 +513,53 @@ describe("the worker's own ESCALATE reason", () => {
     expect(turns).toHaveLength(1);
     expect(await readRwork(tasks, "a")).toBeNull();
   });
+
+  it("is told to the session that replaces one the worker escalated and overfilled", async () => {
+    await seed();
+    // Turn 1 escalates, does not request completion, and leaves the session over
+    // budget: the wrap-up follows, and the new session needs both the handoff
+    // note and the document.
+    let work = 0;
+    const { turns, adapter } = recorder(async (turn, args) => {
+      if (args.text === WRAP_UP_INSTRUCTION) {
+        await writeNote(tasks, { task: "a", seq: 2, status: "进行中；预算告急", done: "范围比预想大", found: "产物从一张表变成了三张", next: "继续做", files: [] });
+        return { sessionId: args.sessionId!, text: "HANDOFF_READY", exitCode: 0 };
+      }
+      work += 1;
+      return work === 1 ? { sessionId: "s", text: "范围比预想大\nESCALATE: 产物从一张表变成了三张", exitCode: 0 } : undefined;
+    }, (sessionId) => (sessionId === "s" && work >= 1 ? 900_000 : 0));
+
+    expect(await runTask(config({ model: "w/one" }), { store, adapter, acceptance: gate(passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+
+    expect(turns.map((turn) => turn.sessionId)).toEqual([undefined, "s", undefined]);
+    expect(turns[1]!.text).toBe(WRAP_UP_INSTRUCTION);
+    expect(turns[2]!.rework).toContain("你在这一回合里把任务升级了");
+    expect(turns[2]!.rework).toContain("## 你在上一回合提出的升级");
+    expect(turns[2]!.rework).toContain("ESCALATE: 产物从一张表变成了三张");
+    expect(turns[2]!.text).toContain(pointer());
+    expect(turns[2]!.text).toContain("范围比预想大");
+  });
+
+  it("is not told to the next session when an ordinary turn overfills it", async () => {
+    await seed();
+    // The control: no escalation, so the wrap-up leaves nothing for the worker to be told.
+    let work = 0;
+    const { turns, adapter } = recorder(async (turn, args) => {
+      if (args.text === WRAP_UP_INSTRUCTION) {
+        await writeNote(tasks, { task: "a", seq: 1, status: "进行中", done: "做了一半", found: "无", next: "继续做", files: [] });
+        return { sessionId: args.sessionId!, text: "HANDOFF_READY", exitCode: 0 };
+      }
+      work += 1;
+      return work === 1 ? { sessionId: "s", text: "还在做", exitCode: 0 } : undefined;
+    }, (sessionId) => (sessionId === "s" && work >= 1 ? 900_000 : 0));
+
+    expect(await runTask(config({ model: "w/one" }), { store, adapter, acceptance: gate(passed), review: async () => passVerdict }, await store.get("a"), "w1")).toBe("done");
+
+    expect(turns.map((turn) => turn.sessionId)).toEqual([undefined, "s", undefined]);
+    expect(turns[2]!.rework).toBeNull();
+    expect(turns[2]!.text).not.toContain("rework.md");
+    expect(turns[2]!.text).toContain("做了一半");
+  });
 });
 
 describe("a rework owed beyond the turn that follows", () => {

@@ -744,6 +744,13 @@ function unanswered(previous: ReworkFeedback | null, why: string): ReworkFeedbac
   return { kind: "no-completion", why, previous: previous?.kind === "no-completion" ? previous.previous : previous };
 }
 
+/**
+ * What the worker is told when it escalated and did not ask to be judged: the
+ * branch that wraps a session up and the branch that only records the
+ * escalation tell it the same thing, so they share these words.
+ */
+const WORKER_ESCALATED_WHY = "上一回合正常结束，但没有请求完成（没有运行 taskctl done）；你在这一回合里把任务升级了（见下文）。控制器没有可以验收的成果。";
+
 /** A cooperative legacy adapter can complete normally, but cannot prove cancellation. */
 function legacyExecution<T>(fn: () => Promise<T>): Execution<T> {
   let state: "running" | "exited" = "running";
@@ -1383,7 +1390,8 @@ async function writeRwork(r: Run): Promise<void> {
  * `awaiting-human`, where a review that could not decide also leaves the task)
  * clears it — the record on `Run` and the file on disk — so a session opened
  * after a human `reject` is never pointed at a rejection that no longer
- * stands. Every other outcome keeps it: `open` hands it to the next attempt, `blocked` keeps it for a `taskctl retry`, which does not archive it. A
+ * stands. Every other outcome keeps it: `open` hands it to the next attempt,
+ * `blocked` keeps it for a `taskctl retry`, which does not archive it. A
  * removal that throws is journaled and never propagates: a document that
  * cannot be removed must not turn a finished task into a controller error.
  */
@@ -1559,6 +1567,9 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
         if (await fail(r)) return "blocked";
         fresh = true;
       } else if (await overBudget(r, sessionId, model)) {
+        // The worker escalated and did not finish, and this session must wrap
+        // up: the session that replaces it is told both, through the document.
+        if (workerEscalatedThisTurn) r.rework = unanswered(r.rework, WORKER_ESCALATED_WHY);
         await escalate(r, "context budget exhausted; a session handoff was needed");
         const wrap = await workedTurn(r, WRAP_UP_INSTRUCTION, model, sessionId);
         const after = await latestNote(r.cfg.tasksDir, r.task.id);
@@ -1579,7 +1590,7 @@ async function loop(r: Run): Promise<"done" | "blocked" | "open" | "awaiting-hum
         } else emit(r, "handoff", sessionId);
         fresh = true;
       } else if (workerEscalatedThisTurn) {
-        r.rework = unanswered(r.rework, "上一回合正常结束，但没有请求完成（没有运行 taskctl done）；你在这一回合里把任务升级了（见下文）。控制器没有可以验收的成果。");
+        r.rework = unanswered(r.rework, WORKER_ESCALATED_WHY);
       }
     }
     if (fresh) {
