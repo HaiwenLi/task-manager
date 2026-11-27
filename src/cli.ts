@@ -18,6 +18,7 @@ import type { AcceptanceResult } from "./acceptance.js";
 import { createCoalescedRefresh, renderBoardMarkdown, renderBoardTable, writeBoard } from "./board.js";
 import { buildReport } from "./report.js";
 import { readAudits, summarizeAudits, appendAudit, type AuditStage } from "./audit.js";
+import { appendLaneExample } from "./lanes.js";
 import { readRelevantFeedback, recordTaskFeedback, type FeedbackEvent } from "./feedback.js";
 import { readFixedSources, sourcesDetail } from "./context.js";
 import { ADJUDICATED, humanTouches, modelFirstPass, readFlowInput, SIGN_OFF, summarizeFlow, type HumanTouch, type ModelFirstPass } from "./metrics.js";
@@ -976,86 +977,96 @@ async function addCommand(
     }
   }
   await writeFile(join(tasksDir, `${id}.md`), serializeTaskFile(task), { encoding: "utf8", flag: "wx" });
-
-  if (quick) {
-    // No clarify session and no spec: the intent is the whole definition. This is
-    // the only lane cheap enough for a twenty-second task, and the price is that
-    // nothing was written down to check the work against — which is why the worker
-    // will not let a quick task finish on its own evidence.
-    await store.setStatus(id, "open");
-    await appendJournal(tasksDir, id, {
-      stage: "clarify",
-      event: "quick-lane",
-      detail: "no spec; the intent is the definition",
-    });
-    log(`${id}  open  quick${verify === "human" ? "" : ` verify=${verify}`}`);
-    return 0;
-  }
-
-  const profile = await readProfile(tasksDir);
-  const feedback = await relevantFeedback(tasksDir, { type, intent }, log);
-  const prompt = buildClarifyPrompt({ task, type, profile, ...(feedback === null ? {} : { feedback }) });
-  const result = await adapter.prompt({
-    text: prompt,
-    cwd: cfg.workdir,
-    model: directModel(cfg),
-    effort: cfg.effort,
-    title: task.title,
-  });
-  if (result.exitCode !== 0) {
-    await appendJournal(tasksDir, id, { stage: "clarify", event: "clarify-failed", detail: `exit ${result.exitCode}` });
-    log(`${id}  draft  clarify-failed`);
-    return 1;
-  }
-  const specText = stripFence(result.text).trim();
-  if (specText.length === 0) {
-    await appendJournal(tasksDir, id, { stage: "clarify", event: "clarify-failed", detail: "empty spec" });
-    log(`${id}  draft  clarify-failed`);
-    return 1;
-  }
-  await writeSpec(tasksDir, id, specText);
-  let criteria: string[];
+  // The task file is the boundary: an `add` that ends before that write leaves
+  // nothing on the board, so the lane example below is appended on every path
+  // past it — including a clarify session that fails and the quick lane.
+  let criteriaCount = 0;
   try {
-    criteria = extractCriteria(specText);
-  } catch (err) {
+    if (quick) {
+      // No clarify session and no spec: the intent is the whole definition. This is
+      // the only lane cheap enough for a twenty-second task, and the price is that
+      // nothing was written down to check the work against — which is why the worker
+      // will not let a quick task finish on its own evidence.
+      await store.setStatus(id, "open");
+      await appendJournal(tasksDir, id, {
+        stage: "clarify",
+        event: "quick-lane",
+        detail: "no spec; the intent is the definition",
+      });
+      log(`${id}  open  quick${verify === "human" ? "" : ` verify=${verify}`}`);
+      return 0;
+    }
+
+    const profile = await readProfile(tasksDir);
+    const feedback = await relevantFeedback(tasksDir, { type, intent }, log);
+    const prompt = buildClarifyPrompt({ task, type, profile, ...(feedback === null ? {} : { feedback }) });
+    const result = await adapter.prompt({
+      text: prompt,
+      cwd: cfg.workdir,
+      model: directModel(cfg),
+      effort: cfg.effort,
+      title: task.title,
+    });
+    if (result.exitCode !== 0) {
+      await appendJournal(tasksDir, id, { stage: "clarify", event: "clarify-failed", detail: `exit ${result.exitCode}` });
+      log(`${id}  draft  clarify-failed`);
+      return 1;
+    }
+    const specText = stripFence(result.text).trim();
+    if (specText.length === 0) {
+      await appendJournal(tasksDir, id, { stage: "clarify", event: "clarify-failed", detail: "empty spec" });
+      log(`${id}  draft  clarify-failed`);
+      return 1;
+    }
+    await writeSpec(tasksDir, id, specText);
+    let criteria: string[];
+    try {
+      criteria = extractCriteria(specText);
+      criteriaCount = criteria.length;
+    } catch (err) {
+      await appendJournal(tasksDir, id, {
+        stage: "clarify",
+        event: "spec-invalid",
+        detail: err instanceof Error ? err.message : String(err),
+      });
+      log(`${id}  draft  spec-invalid`);
+      return 1;
+    }
+    const assessment = parseIntakeAssessment(specText);
+    await store.updateFields(id, { criteria });
+    await writeRuntime(tasksDir, id, "classification.json", {
+      lane, source: "operator",
+      sufficiency: assessment.sufficiency,
+      reason: assessment.reason, model: directModel(cfg) ?? "(backend-default)", type, at: new Date().toISOString(),
+    });
+    if (assessment.sufficiency === "needs-information") {
+      // "Insufficient" with nothing to ask is a model that broke the format, not
+      // a reason to wave the draft through: the person is told exactly that.
+      const questions = assessment.questions.length > 0
+        ? assessment.questions
+        : ["澄清会话判定信息不足，但没有列出具体问题：请补充会改变交付物、验收、边界或风险的信息"];
+      const path = await writeQuestions(tasksDir, id, questions, "intake");
+      await appendJournal(tasksDir, id, {
+        stage: "clarify", event: "needs-information", detail: `questions=${questions.length}`,
+      });
+      log(`${id}  draft  needs-information=${questions.length}  ${path}`);
+      return 0;
+    }
+    if (complexity === "simple") {
+      await store.setStatus(id, "open");
+    }
     await appendJournal(tasksDir, id, {
       stage: "clarify",
-      event: "spec-invalid",
-      detail: err instanceof Error ? err.message : String(err),
+      event: "spec-drafted",
+      detail: `criteria=${criteria.length} lane=${lane} sufficiency=${assessment.sufficiency}`,
     });
-    log(`${id}  draft  spec-invalid`);
-    return 1;
-  }
-  const assessment = parseIntakeAssessment(specText);
-  await store.updateFields(id, { criteria });
-  await writeRuntime(tasksDir, id, "classification.json", {
-    lane, source: "operator",
-    sufficiency: assessment.sufficiency,
-    reason: assessment.reason, model: directModel(cfg) ?? "(backend-default)", type, at: new Date().toISOString(),
-  });
-  if (assessment.sufficiency === "needs-information") {
-    // "Insufficient" with nothing to ask is a model that broke the format, not
-    // a reason to wave the draft through: the person is told exactly that.
-    const questions = assessment.questions.length > 0
-      ? assessment.questions
-      : ["澄清会话判定信息不足，但没有列出具体问题：请补充会改变交付物、验收、边界或风险的信息"];
-    const path = await writeQuestions(tasksDir, id, questions, "intake");
-    await appendJournal(tasksDir, id, {
-      stage: "clarify", event: "needs-information", detail: `questions=${questions.length}`,
-    });
-    log(`${id}  draft  needs-information=${questions.length}  ${path}`);
+    log(`${id}  ${complexity === "simple" ? "open" : "draft"}  lane=${lane} criteria=${criteria.length}`);
     return 0;
+  } finally {
+    await appendLaneExample(tasksDir, {
+      id, at: new Date().toISOString(), lane, type, title: task.title, intent, criteria: criteriaCount,
+    }).catch((error: unknown) => log(`${id}  lane example not recorded: ${error instanceof Error ? error.message : String(error)}`));
   }
-  if (complexity === "simple") {
-    await store.setStatus(id, "open");
-  }
-  await appendJournal(tasksDir, id, {
-    stage: "clarify",
-    event: "spec-drafted",
-    detail: `criteria=${criteria.length} lane=${lane} sufficiency=${assessment.sufficiency}`,
-  });
-  log(`${id}  ${complexity === "simple" ? "open" : "draft"}  lane=${lane} criteria=${criteria.length}`);
-  return 0;
 }
 
 /** `taskctl spec --task <id>` — print the draft spec a human is signing off. */
