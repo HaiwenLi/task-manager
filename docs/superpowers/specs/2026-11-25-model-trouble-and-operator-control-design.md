@@ -290,6 +290,12 @@ the answer is this command's output.
   retry is spent, the journal says so, and `run` or `watch` exits. If the kill cannot be confirmed
   within the existing cancel deadline, the attempt is recorded `uncertain` and needs reconciliation,
   as today — it is never presented as clean.
+  - *(2026-11-27, the owner's decision on what carrying out the plan found.)* "No retry is spent" is
+    the common case, not a rule: in a few narrow windows — a step's work finished, the stop landing
+    while its result is recorded — that step is recorded by its outcome before the attempt settles as
+    stopped, so a retry or a review round may be counted, and after a render acceptance that has just
+    passed the attempt completes as `done`. What holds in every case is that nothing interrupted is
+    judged, and that is what the journal and the stop line say. Nothing else of this bullet changes.
 - *New.* `SIGINT` and `SIGTERM` on `run` and `watch` do what `stop --now` does. Ctrl-C is how the
   owner will use it.
 - A batch turn (several tasks in one session) is interrupted the same way.
