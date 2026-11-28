@@ -112,7 +112,9 @@
 ## 6. 恢复入口
 
 1. `docs/superpowers/plans/2026-11-24-handoff.md` — 项目总交接页（第 0 节起读；顶部有到本报告这次合并为止的更新行）。
-2. `.superpowers/sdd/2026-11-27-cancel-confirmation-on-a-busy-machine/progress.md` — 第五份计划的完整账本（诊断、裁定、变异、合并与推送）。
-3. `.superpowers/sdd/2026-11-25-lane-declared-by-operator/progress.md` — 第四份计划的账本（含 12 条缓期小项的上下文）。
-4. `.superpowers/sdd/2026-11-25-rework-feedback-file/progress.md` — 第三份计划的账本（含两个设计问题）。
+2. `.superpowers/sdd/2026-11-28-verdict-on-disk/progress.md` — 第 5.1 节四条裁定的实现账本（阻塞/停止时落盘否决的说明，变异 6/6，门槛与推送）。
+3. `.superpowers/sdd/2026-11-27-cancel-confirmation-on-a-busy-machine/progress.md` — 第五份计划的完整账本（诊断、裁定、变异、合并与推送）。
+4. `.superpowers/sdd/2026-11-25-lane-declared-by-operator/progress.md` — 第四份计划的账本（含 12 条缓期小项的上下文）。
+5. `.superpowers/sdd/2026-11-25-rework-feedback-file/progress.md` — 第三份计划的账本（含两个设计问题）。
+6. 四、五两份计划文件末尾分别有「Found while carrying out」与「Task 1 findings」，是当时的一手数字。
 5. 四、五两份计划文件末尾分别有「Found while carrying out」与「Task 1 findings」，是当时的一手数字。
