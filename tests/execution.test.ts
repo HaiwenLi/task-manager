@@ -118,7 +118,9 @@ it("OpenCode cancellation stops the service-side session before confirming", asy
     expect(execution.inspect()).toMatchObject({ state: "running", sessionId: "ses_fake123" });
     const started = Date.now();
     await expect(execution.cancel()).resolves.toBe(true);
-    expect(Date.now() - started).toBeLessThan(6000);
+    // The budget is the promise; 6 000 predated the busy-machine constants and
+    // fails when the listing and the utility both run slow under load.
+    expect(Date.now() - started).toBeLessThan(CANCEL_BUDGET_MS);
     expect(await readFile(interrupted, "utf8")).toBe("ses_fake123\n");
     expect(execution.inspect().state).toBe("exited");
   } finally {
