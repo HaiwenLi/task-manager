@@ -55,6 +55,8 @@
 
 ## 5. 没做完的事
 
+> **2026-11-28 下午已关掉 7 条**（合并提交 `629f801`），见 5.4；下面的清单里已把它们划掉或改写。只动了注释、文档与测试覆盖，没有改任何行为。
+
 ### 5.1 等你定（设计取舍，都需要你一句话）
 
 1. **阻塞之后的重试要不要被告知上次否决**（第三份计划）：重试预算用尽、任务 `blocked` 之后，`taskctl retry` 的第一个回合现在**不被告知**上一次的验收否决。
@@ -68,21 +70,20 @@
 
 - `tests/execution.test.ts` 的 7000 毫秒断言：简报自己定下的数字。
 - 只在失败时留下临时目录的 stop-worker 与 watch 测试：绿跑不留，失败时留。
-- `scripts/live-phase2.ps1` 里不可达的 `exit 2`。
+- `scripts/live-phase2.ps1` 里不可达的 `exit 2`：**看起来是死代码，其实不是**——脚本开头把 `Write-Error` 设成终止错误后，删掉这行会让退出码从 2 变成 1，属行为改动，因此保留。
 - `ControllerStop.report` 只有两个标签，恢复的报告因此打在 `[scheduler]` 下：仅是面貌问题。
 - 三秒的夹具等待靠同族测试的先例和正常的绿跑，不靠探针本身。
 - 无法删除的探针会话：opencode 2.4.2 没有 `session.delete`，它留在所有者的存储里。
 - `scripts/live-stop.ps1` 每跑一次会在临时目录留下它自己建的替身项目（约 2 KB）。
 
-**第三份计划（3 条）**
+**第三份计划（2 条）**
 
 - `carried` 遇到没有 `## ` 行的文档只保留最后一行（只可能出现在手改的文件上）。
 - 没有测试覆盖连续两次渲染失败。
-- `acceptanceOutputLines` 的注释仍说「空输出」，而代码现在把只有空白的输出也算静默（`src/rework.ts:37–44`）。
 
-**第四份计划（12 条）**
+**第四份计划（7 条）**
 
-- 全在计划末尾「Found while carrying out」：quick 车道的 `criteria: 0` 说明、跳过测试的名字没提未知 type、`分类升级` 只冻结分子、`isLane` 在 `lanes.ts` 重复一份、`mustFail` 工件是字符串等。
+- 全在计划末尾「Found while carrying out」：quick 车道的 `criteria: 0` 说明（已关）、跳过测试的名字没提未知 type（已关）、`分类升级` 只冻结分子（已关）、`isLane` 在 `lanes.ts` 重复一份、`mustFail` 工件是字符串、两条测试覆盖缺口（已关）等。
 
 **第五份计划**：没有代码遗留；唯一代价见 5.1 第 4 条。
 
@@ -91,7 +92,20 @@
 - `scripts/smoke.ps1 -Live` 不指定模型，后端默认模型不可用的那天就失败。
 - `scripts/live-phase2.ps1 -Live` 还没有在 opencode 2.4.2 上重跑。
 - `errorWords` 遇到按语言分开的 `data.message` 只取第一种语言。
-- `src/metrics.ts` 里 `providerFailedFollows` 附近的两处注释描述的是旧形状（指标留着，注释没改）。
+
+### 5.4 2026-11-28 下午关掉的（合并提交 `629f801`）
+
+只改注释、文档与测试覆盖，不改行为；全量 1189 passed / 0 failed、零残留进程、三个离线脚本 0。
+
+| 来源 | 条目 | 改法 |
+|---|---|---|
+| 第四份 #10 | ADR-0010 的 `criteria: 0` 说明漏了 quick 车道与空澄清 | 现在写明 quick 车道（不跑澄清、没有标准）、失败或空的澄清、抽取失败 |
+| 第四份 #9 | README 的 `分类升级` 行说「新记录不再计入」 | 改为只冻结分子，分母仍计每一份 `classification.json`，新看板显示 `0 / N` |
+| 第四份 #1 | 用法错误里引述的答复没有断言 | `lane-declared.test.ts` 断言 `("…" is not a lane)` |
+| 第四份 #3 | 没有测试断言 quick 车道不写 `classification.json` | `lanes.test.ts` 加断言 |
+| 第四份 #11 | 跳过测试的名字没提未知 type | 改名为「不解析、没有车道、或 type 未知的行走跳过」 |
+| 第三份 | `acceptanceOutputLines` 的注释仍说「空输出」 | 改为「空或只有空白」 |
+| 第二份 | `providerFailedFollows` 的注释描述已不存在的写日志形状 | 说明「判决 + provider-failed 成对」是旧 journal 的形状 |
 
 ## 6. 恢复入口
 
