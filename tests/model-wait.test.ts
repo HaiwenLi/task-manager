@@ -26,6 +26,7 @@ import {
   processRun,
   readModelWait,
   refusalReason,
+  servedAnywhere,
   servedSince,
   writeModelWait,
   type ModelRefusal,
@@ -155,6 +156,15 @@ describe("the run's evidence", () => {
     run.accepted.set("q/one", T0.getTime());          // the same millisecond as the first refusal
     run.accepted.set("r/nine", T0.getTime() + 5_000); // another chain
     expect(servedSince(run, ["q/one", "q/two"], T0.getTime())).toBeNull();
+  });
+
+  it("names an acceptance anywhere, including a model outside the chain", () => {
+    const run = newRunContext(T0);
+    run.accepted.set("q/one", T0.getTime() + 5_000);
+    run.accepted.set("r/nine", T0.getTime() + 6_000);
+    expect(servedAnywhere(run, T0.getTime())).toBe("q/one");
+    expect(servedAnywhere(run, T0.getTime() + 5_000)).toBe("r/nine");
+    expect(servedAnywhere(run, T0.getTime() + 6_000)).toBeNull();
   });
 
   it("keeps the latest acceptance of a model, so a later refusal cannot lose it", () => {

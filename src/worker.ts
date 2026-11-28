@@ -36,7 +36,7 @@ import { clearGuardRefusal, recordGuardRefusal } from "./guard-refusals.js";
 import type { StopNow } from "./stop.js";
 import {
   DEFAULT_MODEL_KEY, addRefusal, chainKeys, clearModelWait, coolingRefusals, formatDuration, mergeRefusals, modelCooldownMsOf, modelKey, modelRoundsOf,
-  modelWaitHolds, processRun, readModelWait, refusalReason, servedSince, writeModelWait, modelWaitHold,
+  modelWaitHolds, processRun, readModelWait, refusalReason, servedAnywhere, servedSince, writeModelWait, modelWaitHold,
   type ModelRefusal, type ModelWaitRecord, type ModelWaitStage, type RunContext,
 } from "./model-wait.js";
 import { withMutex } from "./mutex.js";
@@ -346,6 +346,22 @@ export async function settleExhausted(
       continue;
     }
     const said = record.refusals.map((refusal) => `${refusal.model}: ${refusal.reason}`).join(" | ");
+    // An acceptance elsewhere proves only that the backend is alive, never
+    // that this task's models work: no verdict, the task stays deferred with
+    // its rounds spent and waits for the owner, and the run continues
+    // (design §4.2, §6, step 5).
+    const elsewhere = servedAnywhere(run, since);
+    if (elsewhere !== null) {
+      await withMutex(join(cfg.tasksDir, id, ".mutation.lock"), () => appendJournal(cfg.tasksDir, id, {
+        stage: record.stage, event: "model-deferred",
+        detail: `rounds ${hold.rounds}/${modelRoundsOf(cfg)} over ${formatDuration(now.getTime() - since)} since ${record.firstRefusedAt ?? record.updatedAt}; ${elsewhere} served another task, none on this task's chain; no verdict, the task waits for the owner; ${said}`,
+      }));
+      deps.onEvent?.({
+        type: "model-deferred", taskId: id,
+        detail: `every model of this task's chain refused in ${hold.rounds} round(s), but ${elsewhere} served another task; the backend is alive, so there is no verdict — the task waits for the owner and the run continues`,
+      });
+      continue;
+    }
     await withMutex(join(cfg.tasksDir, id, ".mutation.lock"), () => appendJournal(cfg.tasksDir, id, {
       stage: record.stage, event: "model-outage",
       detail: `rounds ${hold.rounds}/${modelRoundsOf(cfg)} over ${formatDuration(now.getTime() - since)} since ${record.firstRefusedAt}; no task served on the chain; ${said}`,

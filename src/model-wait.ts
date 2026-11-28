@@ -101,6 +101,18 @@ export function servedSince(run: RunContext, chain: readonly string[], since: nu
   return null;
 }
 
+/**
+ * The first model any turn was accepted on strictly after `since`, whichever
+ * chain it belongs to: evidence that the backend is alive, and nothing about
+ * the task's own models (design §6, step 5, the second branch).
+ */
+export function servedAnywhere(run: RunContext, since: number): string | null {
+  for (const [key, acceptedAt] of run.accepted) {
+    if (acceptedAt > since) return key;
+  }
+  return null;
+}
+
 /** Whole seconds: below a minute `<s>s`, else `<m>m <ss>s` with the seconds padded to two. */
 export function formatDuration(ms: number): string {
   const seconds = Math.floor(ms / 1000);

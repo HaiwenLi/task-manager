@@ -147,9 +147,9 @@ The verdict is scoped to the task's own chain and to one controller:
 
 - **An acceptance elsewhere proves only that the backend is alive.** It does not prove that the
   models of this task's chain work, so it never turns the task into "its own problem": the task stays
-  deferred with its rounds spent and the run continues. *(Not built yet: today the scan covers this
-  task's chain only, so an acceptance elsewhere is not read at all and the controller declares a
-  false outage (§18, P4).)*
+  deferred with its rounds spent and the run continues. The controller reads an acceptance anywhere in
+  the run before it declares an outage, and only an acceptance on the task's own chain parks it
+  (`settleExhausted`, `src/worker.ts`).
 - **One controller decides.** `run` does not start while a live `watch` lock is held, so no second
   process can declare an outage from its own empty evidence while the first is serving work. *(Not
   built yet: `run` takes no lock; §18, finding P2.)*
@@ -244,8 +244,7 @@ The verdict is scoped to the task's own chain and to one controller:
      the run continues with the other tasks.
    - **A turn was accepted elsewhere, but not on this task's chain.** That proves only that the
      backend is alive. There is no verdict: the task stays deferred with its rounds spent and waits
-     for the owner, and the run continues. *(Not built yet: today the scan covers this task's chain
-     only, so this case is a false outage — the run stops (§18, P4).)*
+     for the owner, and the run continues (`servedAnywhere`, `src/model-wait.ts`).
    - **No turn was accepted anywhere since the first refusal.** This is an outage. The controller
      leaves the task as it is — `open`, retries untouched — and the whole `run` or `watch` stops with
      the report of §7.
@@ -516,7 +515,8 @@ reversed guard at a time, each killed by the test written for it.
 One per item of §14:
 
 - part 1: a refusal rotates the chain and spends no retry; a fully refused round defers the task and
-  leaves it `open`; the stuck list shows a deferral from its first round. A second controller's empty
+  leaves it `open`; the stuck list shows a deferral from its first round; an acceptance only off the
+  task's chain leaves the task deferred and does not stop the run. A second controller's empty
   evidence cannot declare an outage — *(not built yet, §18 P2)*.
 - part 1, the review stage: a refused reviewer round defers the task and writes
   `review-pending.json` while the task stays `open`; a timed-out reviewer keeps the park; a crashed
@@ -699,7 +699,6 @@ hold, and what the review removed was claims it could not carry.
 |---|---|---|
 | P2 | `run` does not start beside a live `watch` lock, so no second process declares an outage from its own empty evidence. | §4.2 |
 | P3 | The round count is anchored to the persisted first-refusal time instead of the run id, so a restart does not reset "three or four tries" to round 0. | §6, step 5, and `modelRounds` |
-| P4 | An acceptance on another chain proves only that the backend is alive; the task stays deferred with its rounds spent. Today the scan covers this task's chain only, so this case is a false outage — the run stops. | §4.2, §6, step 5 |
 | P5 | An ordered effective dispatch chain: owner authorization stays valid without a fresh catalogue; an unauthorized tail does not refuse a safe head. | §5 |
 | P6 | Remove the per-task rotation position in `tasks/<id>/models.json`; every round already starts at the head. | §6.1 |
 | P7 | Remove the unreachable quota branch: the hint list, the classifier, `quotaBackoffMs` and `quotaPause`. | §6 |
@@ -716,8 +715,11 @@ hold, and what the review removed was claims it could not carry.
 | P18 | A split child inherits its parent's declared lane, and the split path records an example. | §12 |
 | P19 | The cooldown/lease redesign the TRIZ lens asked for: per-(task, stage, model) refusal history, and a board-level epoch-fenced probe lease so one task's refusal cannot suppress an independent task's probe. Not in this round; the scoped evidence rule above removes the false verdict it was aimed at. | §4.2, §6 |
 
-Two corrections this review settled by reading the tree, rather than by deciding anything:
+**Landed since the review.** P4, on 2026-11-29: the controller reads an acceptance anywhere in the
+run before it declares an outage, so an acceptance off the task's chain leaves the task deferred
+instead of stopping the run. The markers in §4.2 and §6 are removed, and §13 carries the regression.
 
+Two corrections this review settled by reading the tree, rather than by deciding anything:
 - §9's and §16's acceptance-gate paragraphs said the gate's cancellation was confirmed by its output
   pipes and that making it confirmable was still to be built. The tree had already moved (`d8672d9`,
   `e637b29`): the gate is confirmed by the process tree, and the live check interrupted a real one.

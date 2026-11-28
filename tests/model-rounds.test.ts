@@ -321,6 +321,26 @@ describe("after modelRounds rounds", () => {
     expect(await journal()).toMatch(/worker model-outage rounds 4\/4 over \S+ since \S+; no task served on the chain; q\/one:/);
   });
 
+  it("with a turn accepted only off the task's chain, keeps the task deferred and the run going", async () => {
+    await seed("b", { model: "x/other" });
+    const context = newRunContext();
+    for (let i = 0; i < MODEL_ROUNDS_DEFAULT; i++) expect(await round(allRefuse().adapter, context)).toBe("open");
+    // b's head is a model outside a's chain: the backend is alive, and that
+    // acceptance says nothing about a's own models (design §6, step 5).
+    expect(await run(backend({ "x/other": "done" }).adapter, [], { run: context }, {}, "b")).toBe("done");
+
+    const { outcome, events } = await settle(config({ run: context }), ["a"]);
+
+    expect(outcome).toEqual({ held: [] });
+    expect(await store.get("a")).toMatchObject({ status: "open", retries: 0 });
+    expect(await latestNote(tasks, "a")).toBeNull();
+    expect(events.some((event) => event.type === "outage")).toBe(false);
+    expect(events.find((event) => event.type === "model-deferred")?.detail).toContain("x/other served another task");
+    expect(await journal())
+      .toMatch(/worker model-deferred rounds 4\/4 over \S+ since \S+; x\/other served another task, none on this task's chain; no verdict, the task waits for the owner; q\/one:/);
+    expect(await readModelWait(tasks, "a")).toMatchObject({ runId: context.id, rounds: 4 });
+  });
+
   it("honours a configured round budget", async () => {
     const context = newRunContext();
     expect(await round(allRefuse().adapter, context, { modelRounds: 2 })).toBe("open");
@@ -509,10 +529,15 @@ describe("a refused review", () => {
     const context = newRunContext();
     const reviewerOnly = { ...REVIEW, reviewerModelFallbacks: [] };
     for (let i = 0; i < MODEL_ROUNDS_DEFAULT; i++) expect(await run(refused().adapter, [], { ...reviewerOnly, run: context }, { review: undefined })).toBe("open");
-    // b's worker is served on w/one and needs no review: not evidence for r/one.
+    // b's worker is served on w/one and needs no review: an acceptance
+    // elsewhere, not evidence for r/one, so no verdict and no outage.
     expect(await run(backend({ turns: { "w/one": "done" } }).adapter, [], { ...reviewerOnly, run: context }, { review: undefined }, "b")).toBe("done");
 
-    expect(await settleReview(config({ ...reviewerOnly, run: context }), ["a"])).toEqual({ held: [], outage: { taskId: "a" } });
+    expect(await settleReview(config({ ...reviewerOnly, run: context }), ["a"])).toEqual({ held: [] });
+    expect(await store.get("a")).toMatchObject({ status: "open", retries: 0 });
+    expect(await readModelWait(tasks, "a")).toMatchObject({ stage: "review", rounds: 4 });
+    expect(await journal())
+      .toMatch(/review model-deferred rounds 4\/4 over \S+ since \S+; w\/one served another task, none on this task's chain; no verdict, the task waits for the owner; r\/one:/);
   });
 
   it("an open task that carries preserved evidence is never sent back through the worker, whoever wrote the record", async () => {
