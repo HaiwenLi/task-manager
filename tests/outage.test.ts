@@ -415,6 +415,45 @@ describe("taskctl run", () => {
     expect(lines.filter((line) => line.startsWith("[model-outage]"))).toHaveLength(5);
     expect(await store.get("001-paid")).toMatchObject({ status: "open", retries: 0 });
   });
+
+  it("refuses to start beside a live watch lock, and dispatches nothing", async () => {
+    await seedTaskFile(tasks, buildContinuousTask("001-a", { model: "q/one" }));
+    await mkdir(join(root, ".taskctl"), { recursive: true });
+    await writeFile(watchLockPath(tasks), JSON.stringify({ worker: "watch-42:generation", heartbeat: Date.now() }), "utf8");
+    const configPath = await writeConfig({ modelChain: ["q/one"] });
+    const lines: string[] = [];
+    let dispatched = 0;
+
+    const code = await runCli(["run", "--config", configPath], {
+      adapter: {
+        prompt: async () => { dispatched += 1; throw new Error("no dispatch beside a live watcher"); },
+        contextUsage: async () => 0, contextLimit: async () => 100,
+      },
+      acceptance: passAcceptance, log: (line) => { lines.push(line); }, err: (line) => { lines.push(line); },
+    });
+
+    expect(code).toBe(1);
+    expect(lines.join("\n")).toContain("live watch");
+    expect(lines.join("\n")).toContain("watch-42:generation");
+    expect(dispatched).toBe(0);
+    expect(await store.get("001-a")).toMatchObject({ status: "open", retries: 0 });
+  });
+
+  it("starts when the watch record is stale, since no live controller owns the board", async () => {
+    await seedTaskFile(tasks, buildContinuousTask("001-a", { model: "q/one" }));
+    await mkdir(join(root, ".taskctl"), { recursive: true });
+    await writeFile(watchLockPath(tasks), JSON.stringify({ worker: "watch-old:generation", heartbeat: Date.now() - 60_000 }), "utf8");
+    const configPath = await writeConfig({ modelChain: ["q/one"] });
+    const doneMarking: AgentAdapter = {
+      prompt: async (args) => { await markDoneTask(args.text, tasks); return { sessionId: "s", exitCode: 0, text: "done" }; },
+      contextUsage: async () => 0, contextLimit: async () => 100,
+    };
+
+    expect(await runCli(["run", "--config", configPath], {
+      adapter: doneMarking, acceptance: passAcceptance, log: () => {}, err: () => {},
+    })).toBe(0);
+    expect(await store.get("001-a")).toMatchObject({ status: "done" });
+  });
 });
 
 describe("taskctl run --batch", () => {

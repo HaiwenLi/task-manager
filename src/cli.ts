@@ -40,6 +40,7 @@ import { modelRoundsOf, modelWaitHold, newRunContext, readModelWait } from "./mo
 import { outageReport, renderOutageReport, statusLineFromNote, stuckLines } from "./stuck.js";
 import { createStopNow, processSignalSource, requestStop, type SignalSource, type StopNow, type StopSignal } from "./stop.js";
 import { watchQueue, type WatchEnd, type WatchOptions } from "./watch.js";
+import { liveWatchOwner } from "./watch-lock.js";
 import { createMempalaceBackend, runRecall, type MemoryBackend, type RecallInput, type RecallRecord } from "./memory.js";
 
 /** Injection seams for tests: adapter (for `add`/`run`), acceptance gate, clock, output. */
@@ -528,6 +529,12 @@ async function runCommand(flags: Map<string, string>, deps: CliDeps, log: (line:
   // decision read the same evidence, so a deferral this process wrote is one
   // this process decides (a new run, watch or retry process is a new run).
   const cfg = { ...(await configFor(flags)), run: newRunContext() };
+  // One controller decides (design §4.2): beside a live watcher, this run's
+  // empty evidence could declare an outage while the watcher is serving work.
+  const watcher = await liveWatchOwner(cfg.tasksDir, cfg.lockTtlMs);
+  if (watcher !== null) {
+    throw new Error(`a live watch owns this board (${watcher}); run does not start beside it — stop the watcher first`);
+  }
   const adapter = deps.adapter ?? controllerAdapter(cfg);
   const store = deps.store ?? new TaskStore(cfg.tasksDir);
   // Controller log: with --log every event line is teed to one operator-chosen

@@ -403,7 +403,7 @@ watch 用文件事件（250ms 去抖）和 30 秒兜底扫描发现新任务；�
 
 至少两个连续合格任务时自动成批，上限是 `batchMaxTasks`（默认 5）。自动成批只取 `ready()` 队首的**连续合格前缀**，不会让后面的任务越过更早的高风险、人工门禁或其它不合格任务；单个任务直接普通执行，`batchMaxTasks: 1` 关闭自动成批。批次进行中新到的任务等下一个调度边界，不会插进当前选择。被预算护栏拒绝的任务五分钟内不在候选里，之后重新判一次；这期间后面的任务照常调度。被推迟（等模型窗口）的任务不参与选择，排在它后面的任务照常调度；它的窗口一到，最晚 30 秒后自动再试。出现模型不可用时 watch 打印与 `run` 相同的报告并以退出码 `3` 退出；不会写下 stop 文件，所以下一次 `taskctl watch` 不需要 `--resume`。
 
-一个看板只有一个 watch 所有者，记录在 `.taskctl/watch.lock`，带完整 owner generation 和 heartbeat。第二个活跃 watcher 会直接拒绝；stale / 损坏记录只诊断，不自动接管，确认旧进程已消失后需人工清理。
+一个看板只有一个 watch 所有者，记录在 `.taskctl/watch.lock`，带完整 owner generation 和 heartbeat。第二个活跃 watcher 会直接拒绝；stale / 损坏记录只诊断，不自动接管，确认旧进程已消失后需人工清理。`taskctl run` 同样不并排启动：读到活跃的 watch 记录就报出它的 owner 并以退出码 1 拒绝开跑（stale / 损坏记录不算活跃，`run` 照常启动），这样一个控制器的空证据不可能在另一个控制器正在服务时宣布停机。
 
 `stop` 只写 `.taskctl/stop.requested`，不发送进程树终止信号。watch 不再领取新任务，让当前 worker attempt 安全结算并释放记录后退出；stop 文件保留，因此下次启动必须显式 `watch --resume`。恢复清 stop 的动作发生在取得 watch 锁之后，第二个 watcher 不能清掉正在运行者的停止请求。停止的粒度是整个 attempt（可能含多个回合），不是单个回合。
 

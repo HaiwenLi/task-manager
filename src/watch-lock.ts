@@ -59,6 +59,17 @@ export async function acquireWatchLock(
   });
 }
 
+/**
+ * The name of the live watch owner, or null. A missing, corrupt or stale
+ * record is no live controller: `run` may start then, and a stale record is
+ * the watch's own diagnosis to make, not this reader's to steal.
+ */
+export async function liveWatchOwner(tasksDir: string, ttlMs: number, now = Date.now()): Promise<string | null> {
+  const state = await readState(watchLockPath(tasksDir));
+  if (state.status !== "held") return null;
+  return now - state.lock.heartbeat <= ttlMs ? state.lock.worker : null;
+}
+
 /** Refresh only the complete owner generation that still holds the record. */
 export async function heartbeatWatchLock(tasksDir: string, owner: string): Promise<boolean> {
   const path = watchLockPath(tasksDir);

@@ -150,9 +150,10 @@ The verdict is scoped to the task's own chain and to one controller:
   deferred with its rounds spent and the run continues. The controller reads an acceptance anywhere in
   the run before it declares an outage, and only an acceptance on the task's own chain parks it
   (`settleExhausted`, `src/worker.ts`).
-- **One controller decides.** `run` does not start while a live `watch` lock is held, so no second
-  process can declare an outage from its own empty evidence while the first is serving work. *(Not
-  built yet: `run` takes no lock; §18, finding P2.)*
+- **One controller decides.** `run` does not start while a live `watch` lock is held (`liveWatchOwner`,
+  `src/watch-lock.ts`): it names the owner and exits 1, so no second process can declare an outage from
+  its own empty evidence while the first is serving work. A stale or corrupt record is not a live
+  controller and does not stop `run`; reconciling that record stays the watch's own diagnosis.
 
 ### 4.3 Stop
 
@@ -516,8 +517,8 @@ One per item of §14:
 
 - part 1: a refusal rotates the chain and spends no retry; a fully refused round defers the task and
   leaves it `open`; the stuck list shows a deferral from its first round; an acceptance only off the
-  task's chain leaves the task deferred and does not stop the run. A second controller's empty
-  evidence cannot declare an outage — *(not built yet, §18 P2)*.
+  task's chain leaves the task deferred and does not stop the run; `run` refuses to start beside a
+  live watch lock and starts beside a stale one.
 - part 1, the review stage: a refused reviewer round defers the task and writes
   `review-pending.json` while the task stays `open`; a timed-out reviewer keeps the park; a crashed
   one ends `awaiting-human`.
@@ -697,7 +698,6 @@ hold, and what the review removed was claims it could not carry.
 
 | # | What is still to build | Where the rule is written |
 |---|---|---|
-| P2 | `run` does not start beside a live `watch` lock, so no second process declares an outage from its own empty evidence. | §4.2 |
 | P3 | The round count is anchored to the persisted first-refusal time instead of the run id, so a restart does not reset "three or four tries" to round 0. | §6, step 5, and `modelRounds` |
 | P5 | An ordered effective dispatch chain: owner authorization stays valid without a fresh catalogue; an unauthorized tail does not refuse a safe head. | §5 |
 | P6 | Remove the per-task rotation position in `tasks/<id>/models.json`; every round already starts at the head. | §6.1 |
@@ -715,9 +715,10 @@ hold, and what the review removed was claims it could not carry.
 | P18 | A split child inherits its parent's declared lane, and the split path records an example. | §12 |
 | P19 | The cooldown/lease redesign the TRIZ lens asked for: per-(task, stage, model) refusal history, and a board-level epoch-fenced probe lease so one task's refusal cannot suppress an independent task's probe. Not in this round; the scoped evidence rule above removes the false verdict it was aimed at. | §4.2, §6 |
 
-**Landed since the review.** P4, on 2026-11-29: the controller reads an acceptance anywhere in the
-run before it declares an outage, so an acceptance off the task's chain leaves the task deferred
-instead of stopping the run. The markers in §4.2 and §6 are removed, and §13 carries the regression.
+**Landed since the review.** Two items, on 2026-11-29: P4, where the controller reads an acceptance
+anywhere in the run before it declares an outage, so an acceptance off the task's chain leaves the
+task deferred instead of stopping the run; and P2, where `run` refuses to start beside a live watch
+lock and names its owner. The markers in §4.2 and §6 are removed, and §13 carries both regressions.
 
 Two corrections this review settled by reading the tree, rather than by deciding anything:
 - §9's and §16's acceptance-gate paragraphs said the gate's cancellation was confirmed by its output

@@ -11,6 +11,7 @@ import { TaskStore } from "../src/task-store.js";
 import {
   acquireWatchLock,
   heartbeatWatchLock,
+  liveWatchOwner,
   releaseWatchLock,
   watchLockPath,
 } from "../src/watch-lock.js";
@@ -175,6 +176,17 @@ describe("watch ownership", () => {
     await writeFile(watchLockPath(tasks), "not json", "utf8");
     expect(await acquireWatchLock(tasks, "watch-new:generation", 1_000))
       .toMatchObject({ acquired: false, reason: "corrupt" });
+  });
+
+  it("names a live owner only, and reads absent, stale and corrupt records as no owner", async () => {
+    expect(await liveWatchOwner(tasks, 1_000)).toBeNull(); // absent
+    await mkdir(control, { recursive: true });
+    await writeFile(watchLockPath(tasks), JSON.stringify({ worker: "watch-old:generation", heartbeat: Date.now() - 60_000 }), "utf8");
+    expect(await liveWatchOwner(tasks, 1_000)).toBeNull(); // stale
+    await writeFile(watchLockPath(tasks), "not json", "utf8");
+    expect(await liveWatchOwner(tasks, 1_000)).toBeNull(); // corrupt
+    await writeFile(watchLockPath(tasks), JSON.stringify({ worker: "watch-live:generation", heartbeat: Date.now() }), "utf8");
+    expect(await liveWatchOwner(tasks, 1_000)).toBe("watch-live:generation");
   });
 });
 
