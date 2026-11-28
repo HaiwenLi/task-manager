@@ -6,6 +6,7 @@ import { TaskStore } from "../src/task-store.js";
 import { runWorker, type WorkerConfig } from "../src/worker.js";
 import type { AgentAdapter } from "../src/adapters/types.js";
 import { claim } from "../src/claim.js";
+import { withMutex } from "../src/mutex.js";
 import type { Execution } from "../src/execution.js";
 import { OpenCodeAdapter } from "../src/adapters/opencode.js";
 import { fileURLToPath } from "node:url";
@@ -83,7 +84,13 @@ describe("review lifecycle safety regressions", () => {
   it("T3: replacement owner during acceptance prevents Done and all stale mutations", async () => {
     await seed("check");
     const acceptance = async () => {
-      await writeFile(join(tasks, "a", "lock.json"), JSON.stringify({ worker: "successor", heartbeat: Date.now() }));
+      // A takeover writes the shared record under the mutation mutex, exactly
+      // as `claim` does. A bare write can land inside an in-flight heartbeat,
+      // which then writes its own pre-read record back over the successor and
+      // lets this attempt finish legitimately — a race the test, not the
+      // product, would be measuring.
+      await withMutex(join(tasks, "a", ".mutation.lock"), () =>
+        writeFile(join(tasks, "a", "lock.json"), JSON.stringify({ worker: "successor", heartbeat: Date.now() })));
       return pass();
     };
     expect(await run(config(), { store, adapter: adapter(done), acceptance })).toEqual({ done: [], blocked: [] });
