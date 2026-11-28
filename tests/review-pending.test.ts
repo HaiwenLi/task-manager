@@ -139,7 +139,11 @@ describe("review-pending recovery", () => {
     expect(metrics).toMatch(/只复核恢复\s+1/);
     expect(metrics).toMatch(/自动返工\s+0 个任务/);
     expect(metrics).toMatch(/首轮通过率\s+100%\s+\(1\/1\)/);
-  });
+    // One park and one recovery through the CLI, with a real worker turn, gate
+    // and review: the default 15 s bound is what fired, at 15.0 s, on the busy
+    // machine of 2026-11-28 (9 s alone there; 1.1 s idle). The bound exists to
+    // catch a hang, not to measure the machine.
+  }, 25_000);
 
   it("recovers a task that declares its own workdir without refusing it as changed", async () => {
     // 调度器、watch、批次都先把任务的 workdir 解析成实际目录；只复核的恢复也必须这样做，

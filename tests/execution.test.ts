@@ -145,6 +145,12 @@ it("an older service without the stop operation leaves OpenCode cancellation unc
 }, 15000);
 
 it("a backend stop that confirms keeps a cancel out of uncertain; one that fails does not", async () => {
+  // Four cancels, each bounded by the product at CANCEL_BUDGET_MS (9.5 s) and
+  // CANCEL_DEADLINE_MS (10 s), so a hang here is caught by 4 x 10 s + startup;
+  // the test's own bound only has to be larger than that, not a timing
+  // assertion. Measured 6.9-7.2 s idle, 22.7 s alone with the machine at ~1250
+  // processes (2026-11-28), and past the old 30 s bound with four cancels
+  // running under the suite's other process-tree files.
   const hang = (): Promise<boolean> => Promise.resolve(false);
   const live = (stop?: () => Promise<boolean>) => {
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd, stdio: "ignore" });
@@ -159,7 +165,7 @@ it("a backend stop that confirms keeps a cancel out of uncertain; one that fails
     await expect(execution.cancel()).resolves.toBe(false);
     expect(execution.inspect().state).toBe("uncertain");
   }
-}, 30000);
+}, 45_000);
 
 it("a client that exits by itself once the service stops the session counts as stopped", async () => {
   // The real shape of a cancelled turn: the service's interrupt ends the run,
