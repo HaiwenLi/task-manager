@@ -1,8 +1,8 @@
 # Model trouble and operator control — design
 
 Status: approved by the owner on 2026-11-25; **re-baselined on 2026-11-28 against the tree at
-`82d50f7`** and reviewed that evening (EGM panel; its record is §18). Parts 1–4 of §14 are built:
-the deferral record (`src/model-wait.ts`), the outage report and the stuck list (`src/stuck.ts`),
+`82d50f7`** and reviewed that evening (EGM panel; its record is §18). Parts 1–4 of §14 are built,
+except the code work §18 lists: the deferral record (`src/model-wait.ts`), the outage report and the stuck list (`src/stuck.ts`),
 `stop --now` and the signals (`src/stop.ts`), the rework document (`src/rework.ts`), the declared
 lane and its examples (`src/intake.ts`, `src/lanes.ts`), and the guard-refusal record
 (`src/guard-refusals.ts`). Where this text and the tree disagree, the tree is what runs; the
@@ -114,8 +114,8 @@ Anti-goals — each of these makes the design a failure even if every goal above
 - Behaviour before this design, for reference: any provider refusal wrote a board-wide entry for
   `modelCooldownMs` (900 000 ms, 15 minutes); a task whose models were all cooling was `blocked`
   before it was dispatched; `stop` let the current attempt finish; `SIGINT` and `SIGTERM` were not
-  handled. None of the four holds today (§6, §9). The review of 2026-11-28 found that the sentence
-  here used to claim otherwise; §18.
+  handled. The first, second and fourth no longer hold (§6, §9). The third still does for `taskctl
+  stop`, which keeps its meaning; only `stop --now` interrupts (§9).
 
 ## 4. Approaches considered
 
@@ -147,8 +147,9 @@ The verdict is scoped to the task's own chain and to one controller:
 
 - **An acceptance elsewhere proves only that the backend is alive.** It does not prove that the
   models of this task's chain work, so it never turns the task into "its own problem": the task stays
-  deferred with its rounds spent and the run continues. *(Not built yet: today such an acceptance is
-  read as "another task was served" and the task is blocked as its own problem; §18, finding P4.)*
+  deferred with its rounds spent and the run continues. *(Not built yet: today the scan covers this
+  task's chain only, so an acceptance elsewhere is not read at all and the controller declares a
+  false outage (§18, P4).)*
 - **One controller decides.** `run` does not start while a live `watch` lock is held, so no second
   process can declare an outage from its own empty evidence while the first is serving work. *(Not
   built yet: `run` takes no lock; §18, finding P2.)*
@@ -243,8 +244,8 @@ The verdict is scoped to the task's own chain and to one controller:
      the run continues with the other tasks.
    - **A turn was accepted elsewhere, but not on this task's chain.** That proves only that the
      backend is alive. There is no verdict: the task stays deferred with its rounds spent and waits
-     for the owner, and the run continues. *(Not built yet: today this case blocks the task as its
-     own problem; §18, P4.)*
+     for the owner, and the run continues. *(Not built yet: today the scan covers this task's chain
+     only, so this case is a false outage — the run stops (§18, P4).)*
    - **No turn was accepted anywhere since the first refusal.** This is an outage. The controller
      leaves the task as it is — `open`, retries untouched — and the whole `run` or `watch` stops with
      the report of §7.
@@ -331,9 +332,10 @@ a usage error. Nothing is `blocked` by an outage, so after the configuration is 
 `taskctl run`, or `taskctl watch`, resumes every waiting task without a `retry` per task. A task the
 budget guard refused is not part of this report: it keeps the guard's own line. *Call.* A run that
 stopped for an outage exits 3, whatever else happened in it, including a task the budget guard
-refused or a task `blocked` by a controller error. The exit code names why the run stopped; the
-guard's lines and the controller errors are printed beside the report. When several of these events
-fall in one run, §9 fixes the precedence.
+refused or a task `blocked` by a controller error — unless an interrupted attempt could not be
+confirmed, which is 1 and outranks the outage. The exit code names why the run stopped; the guard's
+lines and the controller errors are printed beside the report. §9 fixes the precedence among all of
+these.
 
 ## 8. The stuck list
 
@@ -377,8 +379,8 @@ answer is the output of `taskctl status --stuck`.
     with a kill the backend confirms. Nothing interrupted is judged. A step whose result was already
     recorded keeps that outcome: the stop can land while that result is written, so the attempt may
     spend a retry or a review round, and an attempt whose render acceptance had just passed
-    completes as `done`. *(Not fully built: the render check and the acceptance gate are outside the
-    contract today — §18, P14.)*
+    completes as `done`. *(Not fully built: the render check is outside the contract today — §18,
+    P14.)*
 - *New.* `SIGINT` on `run` and `watch` does what `stop --now` does. On Windows the controller also
   subscribes `SIGBREAK` (Ctrl-Break); `SIGTERM` is subscribed too, but a Windows `SIGTERM` handler
   does not fire, so it is a no-op there. *(SIGBREAK is not subscribed yet — §18, P13.)* Closing the
@@ -396,11 +398,13 @@ answer is the output of `taskctl status --stuck`.
 - What the interrupted task had already written stays in the workspace; nothing is rolled back. The
   owner has accepted running it again.
 - *Owner's decision (§10, decision 10).* The acceptance command is interrupted as well. A stop that
-  waited for a gate would not be a stop. The gate runs through the same process-tree execution as a
+  waited for a gate would not be a stop. The controller's own bound on a gate is
+  `acceptanceTimeoutMs`, 600 000 ms by default (`src/worker.ts`). The gate runs through the same
+  process-tree execution as a
   turn (`src/acceptance.ts`), and its cancellation is confirmed by the tree, not by its output pipes:
   the descendants are listed before the kill, the tree is killed, and every listed pid must be gone
   (`src/execution.ts`). A grandchild that holds the pipes open is what the listing is for; the pipes
-  are never evidence on their own. This was fixed on 2026-11-25 (`d8679d9`) and completed on a busy
+  are never evidence on their own. This was fixed on 2026-11-25 (`d8672d9`) and completed on a busy
   machine on 2026-11-27 (`e637b29`), and the live check interrupted a real gate with it. A gate that
   was cut is not judged: the task returns to `open` and the gate runs again with the task. The render
   check is not a cancellable execution: a stop ends the wait, not the check (`src/worker.ts`).
@@ -485,8 +489,11 @@ Each decision, and the section that implements it:
   `"operator"` — §18, P16.)*
 - `detectComplexity`, which reads the wording of an intent for "简单任务", is removed: no wording of
   an intent decides whether a task runs without a signature.
-- *Call.* A short ADR-0010 records this: the lane is declared by the operator, as ADR-0009 says, and
-  classification by a model is deferred until recorded per-lane examples exist (§10, decision 9).
+- *Call.* **This section amends ADR-0010** (banner dated 2026-11-28 in that file): the lane is
+  declared by the owner, as ADR-0009 says; the record carries the true source (the ADR's hard-coded
+  `"operator"` is replaced); a lane flag without a terminal is refused unless it is `complex`; the
+  split path inherits and records; and `taskctl lanes` goes. Classification by a model is deferred
+  until recorded per-lane examples exist (§10, decision 9).
 - Recording examples: every `taskctl add` appends one line to `.taskctl/lanes.jsonl` — id, time,
   lane, type, title, the intent (truncated to 500 characters; `LANE_INTENT_LIMIT` in
   `src/lanes.ts`), the number of criteria. This is the material the later classifier and the
@@ -504,19 +511,26 @@ Each decision, and the section that implements it:
 Each part of §14 begins with a failing regression test, and each part adds directed mutations, one
 reversed guard at a time, each killed by the test written for it.
 
-Behaviour regressions, one per part of §14:
+### Behaviour regressions
+
+One per item of §14:
 
 - part 1: a refusal rotates the chain and spends no retry; a fully refused round defers the task and
-  leaves it `open`; a second controller's empty evidence cannot declare an outage; the stuck list
-  shows a deferral from its first round.
+  leaves it `open`; the stuck list shows a deferral from its first round. A second controller's empty
+  evidence cannot declare an outage — *(not built yet, §18 P2)*.
+- part 1, the review stage: a refused reviewer round defers the task and writes
+  `review-pending.json` while the task stays `open`; a timed-out reviewer keeps the park; a crashed
+  one ends `awaiting-human`.
+- part 1b, the guard's direct sessions: the clarify session and the split planner are judged before
+  their session starts, and `add --quick` is not judged.
 - part 2: a confirmed cancel settles the attempt as stopped and leaves the task runnable; an
   unconfirmed one is `uncertain`; every operation outside the stop contract is bounded.
 - part 3: a rework turn is pointed at `rework.md` and the document carries the verdict; a carried
   document keeps its time; a lifecycle verdict writes no document.
-- part 4: a lane without a terminal cannot be `quick` or `simple`; the recorded source is true; a
-  split child inherits the parent's lane.
+- part 4: a lane without a terminal cannot be `quick` or `simple`, and the recorded source is true —
+  *(not built yet, §18 P16)*; a split child inherits the parent's lane — *(not built yet, §18 P18)*.
 
-Gates and live checks:
+### Gates and live checks
 
 - Offline gates: `npm test`, `npm run typecheck` (type-checks `tsconfig.test.json`), `npx tsc
   --noEmit` (type-checks `tsconfig.json`), `git diff --check`, and `scripts/smoke.ps1`,
@@ -535,8 +549,8 @@ Gates and live checks:
    of the same machinery (§16, first decision).
    1b. The guard's judgement of the `taskctl add` clarify session and the `taskctl split` planner
    (§16, second decision).
-2. Stop (§9), including making the cancellation of the acceptance gate — and of the render check,
-   which is not cancellable today — confirmable.
+2. Stop (§9), including bringing the render check, which is not cancellable today, inside the stop
+   contract.
 3. Escalation feedback (§11).
 4. The lane (§12).
 
@@ -564,9 +578,10 @@ first, because it carries the pain that motivated the work.
 ## 16. Added after the builder's check
 
 A reviewer with no part in the conversation read this document as the person who has to plan from
-it. Two questions were the author's to settle; the owner decided a third (§10, decision 10). They
-are answered where they belong: the review stage's machinery in this section, the guard's coverage
-in §5, and the stop in §9. What follows is the review stage's share of §14 part 1.
+it, and asked four questions. All four are settled: two by the author, one by the owner (§10,
+decision 10), and one by writing the answer into the rule it belongs to (§6, step 5). This section
+holds the review stage's share of §14 part 1 and the guard's coverage of the clarify and planner
+sessions; the stop answer is in §9.
 
 **The review stage.** A reviewer refusal takes the same path as a worker refusal. The chain is
 walked. A fully refused round defers the task, and no turn is run again: the worker's work and the
@@ -587,10 +602,11 @@ The rounds of the review stage are counted anew, so a task can spend its `modelR
 again as a reviewer; the review stage's count lives in `tasks/<id>/model-wait.json` beside the
 worker's.
 
-After `modelRounds` the evidence rule of §6, step 5 decides. If a turn was accepted on the reviewer
-chain, the task is parked for the owner. Otherwise the run stops for an outage, and the task keeps its
-preserved evidence for the rerun. An accepted reviewer turn is evidence that the model works only when
-that turn produced its own session (`src/worker.ts`).
+After `modelRounds` the evidence rule of §6, step 5 decides, with the same three branches: an
+acceptance on the reviewer chain parks the task for the owner; an acceptance elsewhere but not on
+that chain leaves it deferred with its rounds spent and the run continues; no acceptance anywhere is
+an outage stop, and the task keeps its preserved evidence for the rerun. An accepted reviewer turn is
+evidence that the model works only when that turn produced its own session (`src/worker.ts`).
 
 The provider's reason for refusing a reviewer model is kept for the report of §7: the review result
 carries the backend's text of a provider refusal (`ReviewResult.refusalText`, `src/review.ts`), as it
@@ -616,12 +632,9 @@ before it calls the planner. `add --quick` calls no model and is not judged (ADR
 `modelChain`. When `model` and `modelChain` are both unset, they keep the backend's default model;
 `modelFallbacks` never supplies their model. The guard judges that backend default before dispatch.
 
-**`stop --now` also interrupts the acceptance command** — the owner's decision (§9; §10, decision
-10). The controller's own bound on a gate is `acceptanceTimeoutMs`, 600 000 ms by default
-(`src/worker.ts`), so a stop will land inside one. The gate's cancellation is confirmed by the process
-tree: the descendants are listed before the kill, and every listed pid must be gone (`src/execution.ts`).
-Output-pipe closure is never evidence on its own. The render check is not a cancellable execution: a
-stop ends the wait, not the check (`src/worker.ts`).
+**`stop --now` also interrupts the acceptance command.** This is the owner's decision, and §9
+carries it as written: the gate's cancellation is confirmed by the process tree, and only the render
+check is still outside the contract (§9; §10, decision 10).
 
 ## 17. Revision notes (2026-11-25)
 
@@ -686,7 +699,7 @@ hold, and what the review removed was claims it could not carry.
 |---|---|---|
 | P2 | `run` does not start beside a live `watch` lock, so no second process declares an outage from its own empty evidence. | §4.2 |
 | P3 | The round count is anchored to the persisted first-refusal time instead of the run id, so a restart does not reset "three or four tries" to round 0. | §6, step 5, and `modelRounds` |
-| P4 | An acceptance on another chain proves only that the backend is alive; the task stays deferred with its rounds spent instead of being blocked as its own problem. | §4.2, §6, step 5 |
+| P4 | An acceptance on another chain proves only that the backend is alive; the task stays deferred with its rounds spent. Today the scan covers this task's chain only, so this case is a false outage — the run stops. | §4.2, §6, step 5 |
 | P5 | An ordered effective dispatch chain: owner authorization stays valid without a fresh catalogue; an unauthorized tail does not refuse a safe head. | §5 |
 | P6 | Remove the per-task rotation position in `tasks/<id>/models.json`; every round already starts at the head. | §6.1 |
 | P7 | Remove the unreachable quota branch: the hint list, the classifier, `quotaBackoffMs` and `quotaPause`. | §6 |
@@ -701,15 +714,19 @@ hold, and what the review removed was claims it could not carry.
 | P16 | A lane flag without a terminal may only be `complex`; `classification.json` records `terminal`, `flag` or `script`. | §12 |
 | P17 | Remove `taskctl lanes` until the deferred classifier exists. | §12 |
 | P18 | A split child inherits its parent's declared lane, and the split path records an example. | §12 |
+| P19 | The cooldown/lease redesign the TRIZ lens asked for: per-(task, stage, model) refusal history, and a board-level epoch-fenced probe lease so one task's refusal cannot suppress an independent task's probe. Not in this round; the scoped evidence rule above removes the false verdict it was aimed at. | §4.2, §6 |
 
 Two corrections this review settled by reading the tree, rather than by deciding anything:
 
 - §9's and §16's acceptance-gate paragraphs said the gate's cancellation was confirmed by its output
-  pipes and that making it confirmable was still to be built. The tree had already moved (`d8679d9`,
+  pipes and that making it confirmable was still to be built. The tree had already moved (`d8672d9`,
   `e637b29`): the gate is confirmed by the process tree, and the live check interrupted a real one.
   Both paragraphs now say so. The panel repeated the document's own stale claim back at it — which is
   the defect this section exists to stop: the text, not the reviewers, was wrong.
 - The acceptance gate's duration has a bound: `acceptanceTimeoutMs`, 600 000 ms by default
-  (`src/worker.ts`); §16 now names it, where the earlier text said "tens of minutes". §17's
-  "exits 3 whatever else happened" contradicted §9's precedence; it now yields to an unconfirmed
+  (`src/worker.ts`); §9 names it, where the earlier text said "tens of minutes". §17's "exits 3
+  whatever else happened" contradicted §9's precedence; it now yields to an unconfirmed
   interruption, which is 1.
+- The cancel budget this document names is `CANCEL_BUDGET_MS`, 9 500 ms, inside the attempt's
+  10 000 ms deadline (`src/execution.ts`); `README.md` said 8 seconds and was corrected with this
+  change. §12 amends ADR-0010, and that file carries the dated banner.

@@ -8,6 +8,20 @@ task runs without a signature. Design: [Model trouble and operator
 control](../superpowers/specs/2026-11-25-model-trouble-and-operator-control-design.md),
 §12.
 
+> **Amended 2026-11-28** by the design's re-baseline (§12, §18 P16–P18). Four of the
+> statements below are superseded; each is unbuilt code work and marked so in §18:
+> 1. `classification.json` does **not** record `source: "operator"`. It records the
+>    true source — `terminal` when the owner answered the question, `flag` when a
+>    flag was given, `script` when neither (P16).
+> 2. A lane flag from a caller without a terminal is refused unless it is
+>    `complex`, the lane that waits for the owner's signature (P16). The rule that
+>    a missing lane is a usage error stands.
+> 3. `taskctl lanes` is to be removed; the example log is the only store until the
+>    deferred classifier exists (P17).
+> 4. A split child inherits its parent's declared lane, and the split path records
+>    an example (P18). The Limits sentence saying `split` records none is
+>    superseded.
+
 ## Context
 
 - From 2026-11-24 the clarify session proposed the management lane
