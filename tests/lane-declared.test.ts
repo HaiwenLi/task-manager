@@ -49,6 +49,16 @@ describe("taskctl add requires the lane", () => {
     expect(calls).toEqual([]);
   });
 
+  it("takes the terminal's answer when no seam is injected: with no terminal that is no lane", async () => {
+    // The real `askOnTerminal` is the right side of the join; a test harness has
+    // no TTY, so it answers null and `add` fails loudly instead of guessing.
+    const errors: string[] = [];
+    const code = await runCli(["add", "重构登录模块", "--tasks-dir", dir], { ...silent, adapter: clarifier([]), err: (line) => errors.push(line) });
+    expect(code).toBe(2);
+    expect(errors[0]).toContain("add requires a lane");
+    expect(await readdir(root)).toEqual([]);
+  });
+
   // The eight intents the removed `detectComplexity` tests used, kept verbatim.
   it.each([
     "这是个简单任务：修一下 README 的错字", "这是一个简单任务", "simple: fix typo", "简单任务：改个错字",
