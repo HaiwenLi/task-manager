@@ -171,7 +171,7 @@ type ControllerStop = {
   /** Undefined when nothing asked this controller to stop. */
   exitCode(): number | undefined;
   /** One line on `log` saying what was interrupted, or what needs reconciliation. */
-  report(label: "scheduler" | "watch", log: (line: string) => void): void;
+  report(label: "scheduler" | "watch" | "recovery", log: (line: string) => void): void;
   close(): Promise<void>;
 };
 
@@ -1869,7 +1869,7 @@ async function retryCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
       // A claim lost to another owner, or an ownership generation that changed
       // under the attempt, is the ordinary refusal — said beside the stop, and
       // exiting 1, never answered with the stop's own code.
-      stop.report("scheduler", log);
+      stop.report("recovery", log);
       if (skippedFor !== "stop") {
         log("review-only recovery refused or still unavailable: skipped");
         return 1;
@@ -1881,7 +1881,7 @@ async function retryCommand(flags: Map<string, string>, deps: CliDeps, log: (lin
       // confirmed; any other block is a reason of the controller's own (say,
       // no valid parked review) and is reported as the ordinary refusal.
       const unconfirmed = stop.exitCode() === 1;
-      stop.report("scheduler", log);
+      stop.report("recovery", log);
       if (!unconfirmed) log(`review-only recovery refused or still unavailable: ${outcome}`);
       return 1;
     }

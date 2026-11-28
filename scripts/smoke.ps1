@@ -2,11 +2,19 @@
 #
 #   .\scripts\smoke.ps1              # 只准备临时项目并打印命令，不调用模型
 #   .\scripts\smoke.ps1 -Live        # 真跑一次（会消耗模型额度）
+#   .\scripts\smoke.ps1 -Live -Model zhipuai-coding-plan/glm-5.3-flash
+#                                    # 指定模型并放行给预算守卫；不给就用后端默认模型
+#
+# 不指定 -Model 时用后端默认模型。后端默认模型不可用的那天，`run` 会把尝试记成
+# uncertain（准确，但不是本脚本要验证的东西），所以真跑时给它一个模型更稳：
+# 脚本把 `model` 与 `allowedModels` 一起写进 taskctl.json，即预算守卫（ADR-0012）
+# 认可的最窄放行。模型是否免费、是否计费由目录判定，脚本不猜。
 #
 # 退出码：0 通过；1 任务没有注册或没有到 done；2 环境不满足（找不到 opencode 或 node）。
 param(
   [switch]$Live,
-  [string]$OpencodeExe = ""
+  [string]$OpencodeExe = "",
+  [string]$Model = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,7 +42,7 @@ if (-not (Test-Path $tsx)) { Write-Error "缺少 tsx：先在仓库里 npm ci"; 
 node "$tsx" "$entry" %*
 "@ | Set-Content (Join-Path $bin "taskctl.cmd") -Encoding ascii
 
-@{
+$config = @{
   tasksDir = "tasks"
   workdir = "work"
   opencodeBin = $OpencodeExe
@@ -44,7 +52,14 @@ node "$tsx" "$entry" %*
   maxTurnsPerSession = 3
   maxSessionsPerTask = 1
   retryLimit = 1
-} | ConvertTo-Json | Set-Content (Join-Path $root "taskctl.json") -Encoding utf8
+}
+# 给了模型才写这两键：`model` 让 worker 用它，`allowedModels` 是预算守卫认可的最窄
+# 放行。都不给时 taskctl.json 与本键出现之前逐字形相同，冒烟照旧跑后端默认模型。
+if ($Model) {
+  $config.model = $Model
+  $config.allowedModels = @($Model)
+}
+$config | ConvertTo-Json | Set-Content (Join-Path $root "taskctl.json") -Encoding utf8
 
 @'
 ---
@@ -71,6 +86,7 @@ Pop-Location
 
 Write-Host "临时项目：$root"
 Write-Host "opencode：$OpencodeExe"
+Write-Host ("模型：" + $(if ($Model) { $Model } else { "后端默认（要用别的就加 -Model）" }))
 Write-Host ""
 Write-Host $board
 if ($board -notmatch "001-hello\s+open") {
@@ -83,6 +99,15 @@ if (-not $Live) {
   Write-Host "  `$env:PATH = `"$bin;`$env:PATH`"; Push-Location '$root'; taskctl run --config taskctl.json; Pop-Location"
   exit 0
 }
+
+# 真跑之前先把预算护栏（ADR-0012）的判定打出来：只读模型目录，不启动会话、不花额度。
+# 它不拦路——目录偶尔读不到（2026-11-28 观察到 `model.list` 一次返回空、再试即好），而
+# `run` 会用自己的判定说清楚；这里只让操作者先看到原因，而不是在 uncertain 之后才猜。
+
+Push-Location $root
+$guard = (taskctl models --config taskctl.json 2>&1) -join "`n"
+Pop-Location
+Write-Host "`n$guard"
 
 Push-Location $root
 try {

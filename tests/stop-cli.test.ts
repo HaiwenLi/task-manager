@@ -327,7 +327,9 @@ it("retry --review-only: a stop that lands while the guard reads the catalogue a
   expect(await running).toBe(130);
   expect((await store.get("a")).status).toBe("blocked");
   expect(await readFile(join(tasks, "a", "review-pending.json"), "utf8")).toBe(pending);
-  expect(lines.join("\n")).toContain("stopped by the operator");
+  // The recovery's own label, not the scheduler's: this command runs no schedule.
+  expect(lines.join("\n")).toContain("[recovery] stopped by the operator; run again to continue");
+  expect(lines.join("\n")).not.toContain("[scheduler]");
   expect(lines.join("\n")).not.toContain("review-only recovery refused or still unavailable");
 }, 10_000);
 
@@ -346,7 +348,8 @@ it("retry --review-only: an unconfirmed stop during the recovery exits 1 and say
   expect(await running).toBe(1);
   expect((await store.get("a")).status).toBe("blocked");
   expect(await settledAttempt("a")).toMatchObject({ phase: "uncertain" });
-  expect(lines.join("\n")).toContain("could not be confirmed and need reconciliation: a");
+  expect(lines.join("\n")).toContain("[recovery] stopped by the operator, but 1 interrupted attempt(s) could not be confirmed and need reconciliation: a");
+  expect(lines.join("\n")).not.toContain("[scheduler]");
   expect(lines.join("\n")).not.toContain("review-only recovery refused or still unavailable");
   expect(await readFile(join(tasks, "a", "review-pending.json"), "utf8")).toBe(pending);
 }, 10_000);

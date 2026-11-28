@@ -73,7 +73,7 @@
 - `tests/execution.test.ts` 的 7000 毫秒断言：简报自己定下的数字。
 - 只在失败时留下临时目录的 stop-worker 与 watch 测试：绿跑不留，失败时留。
 - `scripts/live-phase2.ps1` 里不可达的 `exit 2`：**看起来是死代码，其实不是**——脚本开头把 `Write-Error` 设成终止错误后，删掉这行会让退出码从 2 变成 1，属行为改动，因此保留。
-- `ControllerStop.report` 只有两个标签，恢复的报告因此打在 `[scheduler]` 下：仅是面貌问题。
+- `ControllerStop.report` 只有两个标签，恢复的报告因此打在 `[scheduler]` 下：仅是面貌问题。**已关（2026-11-28 晚）**：标签加了 `recovery`，`retry --review-only` 的两处报告改用它；测试钉住 `[recovery] …` 且恢复的命令不出现 `[scheduler]`。
 - 三秒的夹具等待靠同族测试的先例和正常的绿跑，不靠探针本身。
 - 无法删除的探针会话：opencode 2.4.2 没有 `session.delete`，它留在所有者的存储里。
 - `scripts/live-stop.ps1` 每跑一次会在临时目录留下它自己建的替身项目（约 2 KB）。
@@ -91,7 +91,7 @@
 
 ### 5.3 验证与运维遗留
 
-- `scripts/smoke.ps1 -Live` 不指定模型，后端默认模型不可用的那天就失败。
+- ~~`scripts/smoke.ps1 -Live` 不指定模型，后端默认模型不可用的那天就失败~~ —— **已关（2026-11-28 晚）**：加了 `-Model`（不给仍是后端默认，`taskctl.json` 与从前逐字形相同）；给了就把 `model` 与 `allowedModels` 一起写进去，并先打印预算护栏的判定（只读目录，不花额度，不拦路）。当晚用 `-Model zhipuai-coding-plan/glm-5.3-flash` 真跑一次通过（`done`，worker + reviewer 都是它）。
 - `scripts/live-phase2.ps1 -Live` 还没有在 opencode 2.4.2 上重跑。
 - ~~`errorWords` 遇到按语言分开的 `data.message` 只取第一种语言~~ —— **已关（2026-11-28 晚）**：现在按后端自己的顺序引用它给出的**每一种**语言，用 ` | ` 连接；只有一种语言时输出与从前逐字节相同，空的语言连同分隔符一起丢掉。
 
