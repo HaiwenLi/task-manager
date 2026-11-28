@@ -61,4 +61,5 @@ The operator can still declare the wrong lane; escalation during the run
 The file is best-effort evidence, not a census: an `add` refused for a
 missing lane or by the budget guard records nothing, a crash between the
 task write and the append or a failed append loses that one example, and
-`criteria: 0` means either the clarify session failed or extraction did.
+`criteria: 0` means the quick lane (which runs no clarify session and has no
+criteria), a failed or empty clarify session, or failed extraction.

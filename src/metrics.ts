@@ -202,8 +202,10 @@ export function modelFirstPass(rows: readonly { model: string | null; journal: r
 
 /**
  * Whether `next`, the journal line right after a `review`/`verdict` line,
- * says that verdict was the degraded one of a turn the provider refused: the
- * worker journals the two together, the verdict first.
+ * says that verdict was the degraded one of a turn the provider refused.
+ * Older journals wrote the verdict and then the provider-failed line; since
+ * the deferral rounds only the provider-failed line is written, and this
+ * still recognises the older shape.
  */
 function providerFailedFollows(next: JournalLine | undefined): boolean {
   return next !== undefined && next.stage === "review" && next.event === "provider-failed";
