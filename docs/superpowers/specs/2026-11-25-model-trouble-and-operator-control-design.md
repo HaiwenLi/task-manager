@@ -339,7 +339,12 @@ the answer is this command's output.
 - *Call.* The controller writes `tasks/<id>/rework.md` before each rework turn. It says what was
   rejected and what has to change, from what the controller already holds: the acceptance output
   (bounded), the failed criteria with the reviewer's evidence and defects, a render failure, a turn
-  that ended without a completion request, or the worker's own `ESCALATE:` reason.
+  that ended without a completion request, or the worker's own `ESCALATE:` reason. An attempt that
+  settles before that turn writes the document at the settle instead: a `blocked` attempt leaves it
+  on disk for a `taskctl retry`, refreshed with the verdict that blocked it (rounds exhausted or
+  stalled, a render or acceptance check that spent the last retry), and an operator stop writes a
+  verdict judged before it while writing nothing for a step it interrupted. A document inherited
+  from an earlier attempt (`carried`) is never rewritten — its time is its own.
 - The worker prompt gains one line, not the content. *Call.* In the prompt's own language, Chinese,
   as the first bullet under `## 工作规则`: "- 上一回合没有通过。开始之前先读 `<path>`：里面写了原因，以及必须改什么。"
   That is "The previous turn did not pass. Before you start, read `<path>`: it says why, and what has

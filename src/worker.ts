@@ -686,6 +686,10 @@ async function stopAttempt(r: Run, label: string, inFlight: boolean): Promise<"s
       }, declaredExecution(r.task));
     }
     await r.deps.store.clearDoneMarker(r.task.id);
+    // A judgement made before the stop is not interrupted work: the document
+    // it owes is written now, so whichever attempt runs next is told what was
+    // decided instead of losing it with this one.
+    await settlePendingRework(r);
     await r.deps.store.setStatus(r.task.id, back);
     // The journal is a record, not state: a line that cannot be written is
     // lost, and the attempt still answers "stopped" — a failed write must not
@@ -1392,12 +1396,17 @@ async function writeRwork(r: Run): Promise<void> {
  * clears it — the record on `Run` and the file on disk — so a session opened
  * after a human `reject` is never pointed at a rejection that no longer
  * stands. Every other outcome keeps it: `open` hands it to the next attempt,
- * `blocked` keeps it for a `taskctl retry`, which does not archive it. A
- * removal that throws is journaled and never propagates: a document that
- * cannot be removed must not turn a finished task into a controller error.
+ * `blocked` keeps it for a `taskctl retry`, which does not archive it; and a
+ * rejection judged just before that outcome is written here, because it is
+ * what the next attempt's first turn must be told. A removal that throws is
+ * journaled and never propagates: a document that cannot be removed must not
+ * turn a finished task into a controller error.
  */
 async function settleRework(r: Run, outcome: TaskOutcome): Promise<void> {
-  if (outcome !== "done" && outcome !== "awaiting-human") return;
+  if (outcome !== "done" && outcome !== "awaiting-human") {
+    await settlePendingRework(r);
+    return;
+  }
   r.rework = null;
   try {
     await rm(reworkPathOf(r.cfg.tasksDir, r.task.id), { force: true });
@@ -1405,6 +1414,32 @@ async function settleRework(r: Run, outcome: TaskOutcome): Promise<void> {
     await owned(r, () => appendJournal(r.cfg.tasksDir, r.task.id, {
       stage: "worker", event: "rework-clear-failed", detail: err instanceof Error ? err.message : String(err),
     })).catch(() => {});
+  }
+}
+
+/**
+ * Write the rejection this attempt owes, when the attempt settles first.
+ *
+ * The document is normally written at the top of the next turn, so a verdict
+ * judged just before a `blocked` would otherwise leave with the attempt that
+ * made it: the next claim (a `taskctl retry` included) would be pointed at
+ * nothing, or at an older rejection. A stop settles on its own path
+ * ({@link stopAttempt}) and writes it there; a document already on disk
+ * (`carried`) is never rewritten — its time is its own.
+ *
+ * The caller holds the task lock. A write that fails is journaled and never
+ * propagates, like a document that cannot be removed: the verdict stands
+ * either way, and a failed write must not turn a settle into a controller
+ * error.
+ */
+async function settlePendingRework(r: Run): Promise<void> {
+  if (r.rework === null || r.rework.kind === "carried") return;
+  try {
+    await writeRwork(r);
+  } catch (err) {
+    await appendJournal(r.cfg.tasksDir, r.task.id, {
+      stage: "worker", event: "rework-write-failed", detail: err instanceof Error ? err.message : String(err),
+    }).catch(() => {});
   }
 }
 
@@ -1811,6 +1846,10 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
       }
       return "review";
     }
+    // The verdict is recorded before the budget and the streak are read: either
+    // may be what blocks the task, and the document a retry is pointed at must
+    // be this rejection, not the one before it.
+    r.rework = { kind: "acceptance", command, exitCode: result.exitCode, output: result.output ?? "" };
     const retries = await r.deps.store.incRetries(r.task.id);
     // The same failure, over and over, is not a retry problem: re-running it
     // rebuilds the same evidence for minutes and learns nothing. (A bio
@@ -1854,7 +1893,6 @@ async function accept(r: Run): Promise<"done" | "blocked" | "retry" | "open" | "
       event: "rework",
       detail: `acceptance failed (exit ${result.exitCode ?? "null"}); the worker resumes with the failure output`,
     });
-    r.rework = { kind: "acceptance", command, exitCode: result.exitCode, output: result.output ?? "" };
     return "retry";
   });
   if (outcome === "review") {
@@ -1956,11 +1994,15 @@ async function acceptRender(
     event: "acceptance",
     detail: `render failed: ${failures.join(" | ")}`,
   }));
+  // The verdict is this attempt's rejection, recorded before anything can
+  // settle on it: a stop landing here writes it (`stopAttempt`), and a retry
+  // budget already spent writes it (`fail`), so neither leaves the next
+  // attempt without the reason this one did not pass.
+  r.rework = { kind: "render", failures };
   // Checked once more at the judgement itself: a stop that landed between the
   // record above and this retry spends nothing.
   if (r.deps.stop?.isRequested()) throw new OperatorStoppedError("render check", false);
   if (await fail(r)) return "blocked";
-  r.rework = { kind: "render", failures };
   return "retry";
 }
 
@@ -2237,6 +2279,9 @@ async function judge(
   // same result — so it stops early instead of burning every allotted round.
   if (prevCriteria !== null && stalled(prevCriteria, result.criteria)) {
     const rounds = r.task.reviewRounds; // not yet incremented: the stall is its own outcome
+    // The verdict is this attempt's last word on the work; a block keeps it on
+    // disk so the retry after it is told what the reviewer said.
+    r.rework = reviewRework(rounds, result);
     await owned(r, async () => {
       await r.deps.store.setStatus(id, "blocked");
       await appendJournal(r.cfg.tasksDir, id, {
@@ -2254,6 +2299,9 @@ async function judge(
   const rounds = await owned(r, () => r.deps.store.incReviewRounds(id));
   const limit = r.cfg.maxReviewRounds ?? MAX_REVIEW_ROUNDS_DEFAULT;
   if (rounds > limit) {
+    // Rounds exhausted: the reviewer's verdict still stands, and the retry
+    // after this block is pointed at it.
+    r.rework = reviewRework(rounds, result);
     await owned(r, async () => {
       await r.deps.store.setStatus(id, "blocked");
       await appendJournal(r.cfg.tasksDir, id, { stage: "review", event: "blocked", detail: `${rounds}/${limit}` });
@@ -2261,7 +2309,7 @@ async function judge(
     emit(r, "blocked", `review rounds exhausted (${rounds}/${limit})`);
     return "blocked";
   }
-  r.rework = { kind: "review", round: rounds, summary: result.summary, failed: result.criteria.filter((criterion) => !criterion.pass), defects: [...result.defects] };
+  r.rework = reviewRework(rounds, result);
   const seq = ((await latestNote(r.cfg.tasksDir, id))?.seq ?? 0) + 1;
   await owned(r, async () => {
     await writeNote(r.cfg.tasksDir, reviewNote(r.task, seq, result));
@@ -2276,6 +2324,15 @@ async function judge(
   });
   emit(r, "rework", `round ${rounds}: ${result.defects.join("; ") || result.summary}`);
   return "retry";
+}
+
+/**
+ * The feedback a failed review round leaves: the failed criteria with the
+ * reviewer's evidence, and its defects. One shape for every verdict that
+ * becomes a rejection — sent back, stalled, or blocking at the last round.
+ */
+function reviewRework(rounds: number, result: ReviewResult): ReworkFeedback {
+  return { kind: "review", round: rounds, summary: result.summary, failed: result.criteria.filter((criterion) => !criterion.pass), defects: [...result.defects] };
 }
 
 /**
