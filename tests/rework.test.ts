@@ -8,7 +8,8 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskStore } from "../src/task-store.js";
-import { runTask, WRAP_UP_INSTRUCTION, type WorkerConfig } from "../src/worker.js"; // WRAP_UP_INSTRUCTION: T7
+import { runTask, WRAP_UP_INSTRUCTION, type WorkerConfig, type WorkerEvent } from "../src/worker.js"; // WRAP_UP_INSTRUCTION: T7
+import { manualStopNow } from "./helpers/stop-fixture.js";
 import type { AgentAdapter } from "../src/adapters/types.js";
 import type { AcceptanceResult } from "../src/acceptance.js";
 import type { ReviewResult } from "../src/review.js";
@@ -391,12 +392,21 @@ describe("a failed review", () => {
     expect(note?.markdown).toContain("🔴 宽度改为自适应");
   });
 
-  it("writes nothing for a verdict that blocks the task instead of sending it back", async () => {
+  it("is written for a verdict that blocks the task, so a retry is told the last one", async () => {
+    // A block is the end of the attempt, not the end of the rejection: the
+    // document a rework turn is pointed at is the only place the next attempt
+    // — a `taskctl retry` — learns what the reviewer said.
     await seed();
     const { turns, adapter } = recorder();
     expect(await runTask(config({ maxReviewRounds: 0 }), { store, adapter, acceptance: gate(passed), review: judge(failVerdict) }, await store.get("a"), "w1")).toBe("blocked");
     expect(turns).toHaveLength(1);
-    expect(await readRwork(tasks, "a")).toBeNull();
+    expect(await readRwork(tasks, "a")).toContain("独立复核没有通过（第 1 轮）：未达 C1");
+
+    expect(await retryTask(tasks, "a", { baseWorkdir: work })).toMatchObject({ ok: true });
+    const second = recorder();
+    expect(await runTask(config(), { store, adapter: second.adapter, acceptance: gate(passed), review: judge(passVerdict) }, await store.get("a"), "w2")).toBe("done");
+    expect(second.turns[0]!.text).toContain(pointer());
+    expect(second.turns[0]!.rework).toContain("独立复核没有通过（第 1 轮）：未达 C1");
   });
 });
 
@@ -424,14 +434,23 @@ describe("a failed render check", () => {
     expect(await latestNote(tasks, "a")).toBeNull();
   });
 
-  it("writes nothing when the retry budget, not the worker, ends the attempt", async () => {
-    // The document is tied to the rework turn that follows, not to the verdict.
+  it("is written when the retry budget, not the worker, ends the attempt, so a retry is told the verdict", async () => {
+    // The document is what the next attempt's first turn is pointed at; a
+    // block must not swallow the render verdict that caused it.
     await writeFile(join(tasks, "a.md"), serializeTaskFile(buildTaskFile({ id: "a", title: "任务 A", status: "open", verify: "render", renderTargets: ["index.html"] })), "utf8");
-    vi.mocked(checkRender).mockReset().mockResolvedValue({ ok: false, browser: "fake", at: "2026-11-25T10:00:00.000Z", views: [view("390x844", ["overflow"])] });
+    vi.mocked(checkRender).mockReset()
+      .mockResolvedValueOnce({ ok: false, browser: "fake", at: "2026-11-25T10:00:00.000Z", views: [view("390x844", ["overflow"])] })
+      .mockResolvedValue({ ok: true, browser: "fake", at: "2026-11-25T10:00:01.000Z", views: [view("1440x900", [])] });
     const { turns, adapter } = recorder();
     expect(await runTask(config({ retryLimit: 1 }), { store, adapter }, await store.get("a"), "w1")).toBe("blocked");
     expect(turns).toHaveLength(1);
-    expect(await readRwork(tasks, "a")).toBeNull();
+    expect(await readRwork(tasks, "a")).toContain("渲染验收失败");
+
+    expect(await retryTask(tasks, "a", { baseWorkdir: work })).toMatchObject({ ok: true });
+    const second = recorder();
+    expect(await runTask(config({ retryLimit: 1 }), { store, adapter: second.adapter }, await store.get("a"), "w2")).toBe("done");
+    expect(second.turns[0]!.text).toContain(pointer());
+    expect(second.turns[0]!.rework).toContain("渲染验收失败");
   });
 });
 
@@ -659,6 +678,55 @@ describe("a rework owed beyond the turn that follows", () => {
     expect(second.turns[0]!.text).toContain(pointer());
     expect(second.turns[0]!.rework).toContain("断言失败： expected 2, got 1");
     expect(await readRwork(tasks, "a")).toBeNull();
+  });
+
+  it("keeps the verdict that blocked, not the one before it", async () => {
+    await seed();
+    const second: AcceptanceResult = { passed: false, exitCode: 1, output: "第二次：还是差 1 像素", skipped: false };
+    const { adapter } = recorder();
+    expect(await runTask(config({ retryLimit: 2 }), { store, adapter, acceptance: gate(failed, second) }, await store.get("a"), "w1")).toBe("blocked");
+
+    const doc = await readRwork(tasks, "a");
+    expect(doc).toContain("第二次：还是差 1 像素");
+    expect(doc).not.toContain("断言失败： expected 2, got 1");
+  });
+
+  it("is written when a stop lands after the verdict and before the next turn", async () => {
+    // The turn was judged — the review said fail — and the operator stopped
+    // before the rework turn could be dispatched. That verdict is not
+    // interrupted work: the attempt settles with it on disk, so whichever
+    // attempt runs next is told what the reviewer said.
+    await seed();
+    const stop = manualStopNow();
+    const { turns, adapter } = recorder();
+    const events: WorkerEvent[] = [];
+    expect(await runTask(config(), {
+      store, adapter, stop, acceptance: gate(passed), review: judge(failVerdict),
+      onEvent: (event) => { events.push(event); if (event.type === "rework") stop.trigger(); },
+    }, await store.get("a"), "w1")).toBe("stopped");
+
+    expect(turns).toHaveLength(1);
+    expect(events.some((event) => event.type === "stopped")).toBe(true);
+    expect(await readRwork(tasks, "a")).toContain("独立复核没有通过（第 1 轮）：未达 C1");
+  });
+
+  it("does not rewrite a carried document when the attempt is stopped", async () => {
+    // The document was written by an earlier attempt; its time is its own. A
+    // stop in the first turn of this one settles the attempt without a
+    // judgement, so there is nothing to refresh.
+    await seed();
+    const earlier = renderRwork({ task: { id: "a", title: "任务 A" }, tasksDir: tasks, at: "2026-11-25T09:00:00.000Z", feedback: { kind: "acceptance", command: "npm test", exitCode: 1, output: "断言失败： expected 2, got 1" } });
+    await mkdir(join(tasks, "a"), { recursive: true });
+    await writeRuntimeText(tasks, "a", REWORK_FILE, earlier);
+    const stop = manualStopNow();
+    const { turns, adapter } = recorder();
+    expect(await runTask(config(), {
+      store, adapter, stop, acceptance: gate(passed),
+      onEvent: (event) => { if (event.type === "running") stop.trigger(); },
+    }, await store.get("a"), "w1")).toBe("stopped");
+
+    expect(turns).toHaveLength(0);
+    expect(await readRwork(tasks, "a")).toBe(earlier);
   });
 
   it("is removed when the work passes, so a session opened after a human reject is not pointed at a stale rejection", async () => {
