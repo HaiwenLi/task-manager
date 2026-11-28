@@ -47,6 +47,12 @@ describe("parseIntakeAssessment", () => {
     expect(parseIntakeAssessment(spec(null, "perhaps")).sufficiency).toBe("needs-information");
   });
 
+  it("a sufficiency section that is present but empty is missing information, not clear", () => {
+    expect(parseIntakeAssessment(spec("simple", "")).sufficiency).toBe("needs-information");
+    // An absent section is still clear: those specs were written before it existed.
+    expect(parseIntakeAssessment("## 目标\n交付").sufficiency).toBe("clear");
+  });
+
   it("keeps only three outcome-changing questions", () => {
     expect(parseIntakeAssessment(spec("simple", "needs-information", "- Q1\n- Q2\n- Q3\n- Q4")).questions).toEqual(["Q1", "Q2", "Q3"]);
   });
@@ -72,10 +78,12 @@ describe("buildClarifyPrompt", () => {
     expect(prompt).toContain("## 信息充分性");
   });
 
-  it("numbers its rules without a gap", () => {
-    const task = parseTaskFile("---\ntitle: x\nstatus: draft\nsessions: []\nretries: 0\n---\n正文", "001-a");
+  it("numbers its rules without a gap, and only inside the rules block", () => {
+    // The intent may itself carry `1.` lines; they must not be mistaken for rules.
+    const task = parseTaskFile("---\ntitle: x\nstatus: draft\nsessions: []\nretries: 0\n---\n1. 先改表头\n2. 再改表尾", "001-a");
     const prompt = buildClarifyPrompt({ task, type: "code", profile: null });
-    expect([...prompt.matchAll(/^(\d+)\. /gm)].map((match) => Number(match[1]))).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    const rules = prompt.slice(prompt.indexOf("## 硬规则"));
+    expect([...rules.matchAll(/^(\d+)\. /gm)].map((match) => Number(match[1]))).toEqual([1, 2, 3, 4, 5, 6, 7]);
   });
 
   it("injects the profile and bounded human feedback when present", () => {
