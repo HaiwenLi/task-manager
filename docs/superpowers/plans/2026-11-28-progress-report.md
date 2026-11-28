@@ -117,4 +117,3 @@
 4. `.superpowers/sdd/2026-11-25-lane-declared-by-operator/progress.md` — 第四份计划的账本（含 12 条缓期小项的上下文）。
 5. `.superpowers/sdd/2026-11-25-rework-feedback-file/progress.md` — 第三份计划的账本（含两个设计问题）。
 6. 四、五两份计划文件末尾分别有「Found while carrying out」与「Task 1 findings」，是当时的一手数字。
-5. 四、五两份计划文件末尾分别有「Found while carrying out」与「Task 1 findings」，是当时的一手数字。

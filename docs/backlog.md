@@ -126,11 +126,15 @@
 - 执行停止未确认（`attempt.phase ≠ settled`）的任务，`retry` 一律拒绝；把 `uncertain` 合法转成 `settled` 的受控流程仍未做
 - `reconcile` 只读，`retry` 只对 `blocked` + attempt 已 settled + 无活跃锁 + 无匹配预留的任务生效
 
-## 5. 测试套件的一个已知偶发
+## 5. 测试套件与真后端侧的已知偶发
 
 `tests/worker-review.test.ts` 在 285 条里有 **1 次**失败，出现在 `git checkout` 重写 90 个文件之后那一轮（TSD 重新加密 + 杀毒扫描导致 IO 变慢），单跑必过，之后连跑 7 次全量复现不出。
 
 判断：与之前修掉的 `scheduler` 竞态同类（时间断言撞上慢 IO），但**没有修**，因为无法稳定复现。如果再出现，把断言改成等事件而不是等时间。
+
+- **`tests/lanes.test.ts` 的真浏览器用例（2026-11-28）**：满载全量里失败一次，`RenderUnavailableError: browser exited during startup (code 0)`，该文件单独跑 19/19、4.0 s；同一提交的下一次全量绿。判断：Chrome 在满载启动时自行退出，不是产品断言；未修（要修就是给浏览器启动加一次重试，属产品改动，需所有者决定）。
+- **真后端 `model.list` 偶发空返回（2026-11-28）**：同一分钟内 `taskctl models` 先答「模型目录读不到（`opencode api model.list` answered no models）」、退出 1，再试即正常；预算护栏 fail-closed 因此拒绝、不启动会话，方向是对的。`scripts/smoke.ps1` 真跑前打印判定但**不拦路**，就是为这一次空返回留的余量。
+- **已修掉的一次（同日）**：`tests/lifecycle-safety.test.ts` 的 T3 用裸写替换 `lock.json`，飞行中的心跳会把旧 owner 写回；已改成与 `claim` 一样在 `.mutation.lock` 内替换（`acbb7b9`），仍能杀死 `withOwnership` 的产品变异。
 
 ## 6. 顺手可清的历史垃圾
 
