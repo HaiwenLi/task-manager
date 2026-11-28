@@ -56,12 +56,26 @@ function errorLine(event: RunEvent): string {
   return (line.length === 0 ? JSON.stringify(event.error) : line).slice(0, ERROR_LINE_MAX);
 }
 
-/** The message of an error record, wherever the backend keeps it; empty when it has none. */
+/**
+ * The message of an error record, wherever the backend keeps it; empty when it
+ * has none. A message kept by language under `data.message` is quoted in every
+ * language the backend sent, in its own order: reading only the first made the
+ * line depend on which key the backend happened to write first, and lost the
+ * reader's own language whenever another one came first. One language reads
+ * exactly as it always did.
+ */
 function errorWords(error: JsonObject | undefined): string {
   if (typeof error?.message === "string") return error.message.trim();
   const data = asObject(error?.data);
-  const byLanguage = Object.values(asObject(data?.message) ?? {}).find((value): value is string => typeof value === "string");
-  return typeof byLanguage === "string" ? byLanguage.trim() : typeof data?.message === "string" ? data.message.trim() : "";
+  const byLanguage = asObject(data?.message);
+  if (byLanguage !== undefined) {
+    const said = Object.values(byLanguage)
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+    if (said.length > 0) return said.join(" | ");
+  }
+  return typeof data?.message === "string" ? data.message.trim() : "";
 }
 
 /** A parsed `{"location":…,"data":…}` envelope from `opencode api`. */

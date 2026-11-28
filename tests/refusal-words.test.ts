@@ -59,6 +59,45 @@ describe("a turn the backend refused", () => {
     expect(result.text).toBe("provider.invalid-request: Upstream request failed: Model is unavailable.");
   });
 
+  it("says every language of a message the backend kept by language, not whichever came first", async () => {
+    // `data.message` is a map of one message per language on some builds. The
+    // line is read by a person looking for their own words, so dropping all but
+    // the first made it depend on which key the backend happened to write first.
+    process.env.FAKE_ERROR_EVENTS = JSON.stringify([{
+      type: "provider.invalid-request",
+      data: { message: { en: "Model is unavailable.", zh: "模型不可用。" } },
+    }]);
+
+    const result = await backend().prompt({ text: "hi", cwd: process.cwd() });
+
+    expect(result.failure).toBe("provider");
+    // Every language, in the backend's own order, one separator: the shape is
+    // pinned so a later preference cannot silently drop one again.
+    expect(result.text).toBe("provider.invalid-request: Model is unavailable. | 模型不可用。\nworking");
+  });
+
+  it("keeps a message it has in one language exactly as it is", async () => {
+    process.env.FAKE_ERROR_EVENTS = JSON.stringify([{
+      type: "provider.no-route",
+      data: { message: { zh: "该模型没有这个变体。" } },
+    }]);
+
+    const result = await backend().prompt({ text: "hi", cwd: process.cwd() });
+
+    expect(result.text).toBe("provider.no-route: 该模型没有这个变体。\nworking");
+  });
+
+  it("leaves out a language the backend left empty, separator and all", async () => {
+    process.env.FAKE_ERROR_EVENTS = JSON.stringify([{
+      type: "provider.no-route",
+      data: { message: { en: "  ", zh: "该模型没有这个变体。" } },
+    }]);
+
+    const result = await backend().prompt({ text: "hi", cwd: process.cwd() });
+
+    expect(result.text).toBe("provider.no-route: 该模型没有这个变体。\nworking");
+  });
+
   it("keeps the words of the last of several error events, ahead of what the model got out: they say how the turn ended", async () => {
     process.env.FAKE_ERROR_EVENTS = JSON.stringify([
       { type: "provider.rate-limit", message: "busy" },
