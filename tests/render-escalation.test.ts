@@ -135,6 +135,40 @@ it("a stop during the render check waits for the check, judges nothing, and retu
   expect(await readAttempt(tasks, "a")).toMatchObject({ phase: "settled", operation: "render check", reason: "stopped by operator" });
 }, 10_000);
 
+it("two render failures in a row spend two retries, then block, and both are journaled", async () => {
+  const task = buildTaskFile({
+    id: "a", status: "open", verify: "render", renderTargets: ["index.html"],
+    criteria: ["C1 page works"], execution: "continuous", complexity: "simple",
+  });
+  await writeFile(join(tasks, "a.md"), serializeTaskFile(task), "utf8");
+  await writeFile(join(work, "index.html"), "<h1>ok</h1>", "utf8");
+  vi.mocked(checkRender).mockResolvedValue({
+    ok: false, browser: "fake", at: new Date().toISOString(),
+    views: [{ target: join(work, "index.html"), viewport: "1440x900", ok: false, problems: ["overflow"], screenshot: "shot.png", measurements: { scrollWidth: 200, clientWidth: 100, textLength: 2, images: 0, brokenImages: 0 } }],
+  });
+  const store = new TaskStore(tasks);
+  const cfg: WorkerConfig = {
+    tasksDir: tasks, workdir: work, agent: "fixture", contextThreshold: 0.8,
+    retryLimit: 2, lockTtlMs: 5_000, heartbeatMs: 50,
+  };
+  const deps = {
+    store,
+    adapter: {
+      prompt: async (args: { text: string }) => { await markDoneTask(args.text, tasks); return { sessionId: "s", exitCode: 0, text: "done" }; },
+      contextUsage: async () => 0,
+      contextLimit: async () => 100,
+    },
+  };
+
+  expect(await runTask(cfg, deps, await store.get("a"), "w1")).toBe("blocked");
+  expect(await store.get("a")).toMatchObject({ status: "blocked", retries: 2 });
+  // Each failure was judged on its own: two lines, not one carried over.
+  const failures = (await readJournal(tasks, "a"))
+    .filter((line) => line.event === "acceptance" && String(line.detail).startsWith("render failed"));
+  expect(failures).toHaveLength(2);
+  expect(failures.every((line) => String(line.detail).length > "render failed: ".length)).toBe(true);
+});
+
 it("a stop after the render check returned judges nothing: no retry is spent on the verdict", async () => {
   const task = buildTaskFile({ id: "a", status: "open", verify: "render", renderTargets: ["index.html"], criteria: ["C1 page works"], execution: "continuous", complexity: "simple" });
   await writeFile(join(tasks, "a.md"), serializeTaskFile(task), "utf8");
