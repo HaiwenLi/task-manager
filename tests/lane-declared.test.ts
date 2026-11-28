@@ -106,6 +106,7 @@ describe("taskctl add requires the lane", () => {
     });
     expect(code).toBe(2);
     expect(errors[0]).toMatch(/add requires a lane: pass --quick, --simple or --complex/);
+    expect(errors[0]).toContain(`("${reply}" is not a lane)`);
     expect(calls).toEqual([]);
     expect(await readdir(root)).toEqual([]);
   });

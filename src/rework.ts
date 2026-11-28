@@ -37,7 +37,7 @@ function clip(text: string): string {
 /**
  * The lines that carry an acceptance output: `\r\n` and `\r` turned into `\n`,
  * nothing else changed; a long output keeps its tail and says where the whole
- * of it is, an empty one is said to be silent.
+ * of it is, an empty or whitespace-only one is said to be silent.
  */
 function acceptanceOutputLines(output: string, tasksDir: string, id: string): string[] {
   const normalized = output.replace(/\r\n/g, "\n").replace(/\r/g, "\n");

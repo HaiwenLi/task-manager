@@ -66,6 +66,7 @@ describe("taskctl add — quick lane", () => {
     expect(task.complexity).toBe("simple");
     expect(task.criteria).toEqual([]);
     expect(await readSpec(dir, "001-merge")).toBeNull();
+    expect(existsSync(join(dir, "001-merge", "classification.json"))).toBe(false);
     expect((await journalTail(dir, "001-merge", 5)).join("\n")).toMatch(/quick-lane/);
   });
 

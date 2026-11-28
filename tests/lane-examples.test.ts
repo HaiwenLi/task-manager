@@ -53,7 +53,7 @@ describe("lane examples on disk", () => {
     expect(await readLaneExamples(dir)).toEqual([]);
   });
 
-  it("a line that does not parse, or names no lane, is skipped", async () => {
+  it("a line that does not parse, names no lane, or names an unknown type, is skipped", async () => {
     await mkdir(join(root, ".taskctl"), { recursive: true });
     await writeFile(lanesPath(dir), [
       JSON.stringify(example()), "{ torn write",
