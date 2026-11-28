@@ -73,7 +73,7 @@ it("acceptance cancellation stops descendants and settles within a bound", async
     const started = Date.now();
     await expect(execution.cancel()).resolves.toBe(true);
     // a real cancel now lists the process table first (PowerShell) before it kills
-    expect(Date.now() - started).toBeLessThan(7000);
+    expect(Date.now() - started).toBeLessThan(CANCEL_BUDGET_MS);
     expect(() => process.kill(pid, 0)).toThrow();
     await expect(execution.result).resolves.toMatchObject({ passed: false });
     expect(execution.inspect().state).toBe("exited");

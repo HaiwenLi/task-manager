@@ -12,6 +12,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# 用 [Console]::Error 而不是 Write-Error：Stop 之下 Write-Error 是终止错误，
+# 它后面那行 exit 永远不会执行，文档写明的退出码会变成 1。
 $repo = Split-Path -Parent $PSScriptRoot
 
 if (-not $OpencodeExe) {
@@ -19,7 +21,7 @@ if (-not $OpencodeExe) {
   if (Test-Path $candidate) { $OpencodeExe = $candidate }
 }
 if (-not (Test-Path $OpencodeExe)) {
-  Write-Error "找不到 opencode 可执行文件（.cmd shim 不能被 shell:false 启动）。用 -OpencodeExe 指定真实 exe。"
+  [Console]::Error.WriteLine("找不到 opencode 可执行文件（.cmd shim 不能被 shell:false 启动）。用 -OpencodeExe 指定真实 exe。")
   exit 2
 }
 
@@ -32,8 +34,8 @@ New-Item -ItemType Directory -Force -Path $tasks, (Join-Path $root "work"), $bin
 # agent 要在自己的回合里调用 taskctl done，所以 PATH 上必须能找到一个 shim
 $tsx = Join-Path $repo "node_modules\tsx\dist\cli.mjs"
 $entry = Join-Path $repo "src\main.ts"
-if (-not (Test-Path $tsx)) { Write-Error "缺少 tsx：先在仓库里 npm ci"; exit 2 }
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Write-Error "找不到 node。"; exit 2 }
+if (-not (Test-Path $tsx)) { [Console]::Error.WriteLine("缺少 tsx：先在仓库里 npm ci"); exit 2 }
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) { [Console]::Error.WriteLine("找不到 node。"); exit 2 }
 Set-Content -Path (Join-Path $bin "taskctl.cmd") -Encoding ascii -Value "@echo off`r`nnode `"$tsx`" `"$entry`" %*`r`n"
 
 # 跨任务复用要求候选带有实际模型：不配置 model 时 worker 不记录它，批次会一律新开 session。
@@ -112,11 +114,11 @@ Write-Host "model：$Model"
 Write-Host ""
 Write-Host $board.Out
 if ($board.Out -notmatch "(?m)^\s*a\s+open" -or $board.Out -notmatch "(?m)^\s*b\s+open") {
-  Write-Error "任务 a / b 没有注册为 open（看板见上）。"
+  [Console]::Error.WriteLine("任务 a / b 没有注册为 open（看板见上）。")
   exit 1
 }
 if ($board.Out -match "ignored \(") {
-  Write-Error "看板里有被忽略的文件：$($board.Out)"
+  [Console]::Error.WriteLine("看板里有被忽略的文件：$($board.Out)")
   exit 1
 }
 if (-not $Live) {

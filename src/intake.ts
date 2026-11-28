@@ -15,7 +15,9 @@ export type IntakeAssessment = {
 export function parseIntakeAssessment(markdown: string): IntakeAssessment {
   const sufficiencyText = firstWord(section(markdown, "信息充分性"));
   // A spec written before the section existed was never judged: it reads as clear.
-  const assessed = sufficiencyText !== "";
+  // A section that is present but says nothing is a judgement we cannot read,
+  // which is not the same thing as a clear one.
+  const assessed = sufficiencyText !== "" || hasSection(markdown, "信息充分性");
   const sufficiency: InformationSufficiency = isSufficiency(sufficiencyText)
     ? sufficiencyText
     : assessed ? "needs-information" : "clear";
@@ -55,6 +57,11 @@ function section(markdown: string, title: string): string {
   const rest = lines.slice(start + 1);
   const end = rest.findIndex((line) => /^##\s/.test(line));
   return (end === -1 ? rest : rest.slice(0, end)).join("\n");
+}
+
+/** Whether the document carries the section at all; an empty one still does. */
+function hasSection(markdown: string, title: string): boolean {
+  return markdown.split(/\r?\n/).some((line) => line.trim() === `## ${title}`);
 }
 
 /**

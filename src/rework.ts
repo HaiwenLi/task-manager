@@ -141,7 +141,7 @@ function bodyLines(feedback: ReworkFeedback, id: string, tasksDir: string): stri
   // second such section.
   const whole = feedback.markdown.replace(/\n$/, "").split("\n");
   const start = whole.findIndex((line) => line.startsWith("## "));
-  return whole.slice(start);
+  return start === -1 ? whole : whole.slice(start);
 }
 
 export function renderRwork(args: {

@@ -265,6 +265,13 @@ describe("renderRwork", () => {
       .toBe(earlier.replace("写于 2026-11-25T09:00:00.000Z", "写于 2026-11-25T10:00:00.000Z"));
   });
 
+  it("carries a document with no heading whole, not just its last line", () => {
+    // Only a hand-edited rework.md can lack a `## ` heading; dropping all but
+    // the last line would silently lose the rest of it.
+    const rendered = renderRwork({ ...base, feedback: { kind: "carried", markdown: "第一行\n第二行\n" } });
+    expect(rendered).toContain("第一行\n第二行");
+  });
+
   it("adds the worker's own ESCALATE reason when it gave one, after everything else", () => {
     const doc = renderRwork({
       ...base, feedback: { kind: "no-completion", why: "没有请求完成。", previous: null }, escalation: "产物从一张表变成了三张",
